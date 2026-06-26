@@ -22,6 +22,8 @@ pub enum Probes {
     All,
     /// Radar (Tokyo) : seulement les flux CEX en amont.
     CexOnly,
+    /// Exécuteur (Dublin) : seulement le flux Polymarket.
+    PmOnly,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,10 +56,13 @@ pub async fn run(shared: SharedLatency, probes: Probes) {
     let mut interval = tokio::time::interval(Duration::from_secs(PROBE_INTERVAL_S));
     loop {
         interval.tick().await;
-        // CEX en parallèle, toujours ; Polymarket seulement en mode All.
-        let (b, o) = tokio::join!(probe(BINANCE_ADDR), probe(OKX_ADDR));
+        // CEX en parallèle, ou PM en parallèle
+        let (b, o) = match probes {
+            Probes::All | Probes::CexOnly => tokio::join!(probe(BINANCE_ADDR), probe(OKX_ADDR)),
+            Probes::PmOnly => (None, None),
+        };
         let p = match probes {
-            Probes::All => probe(PM_ADDR).await,
+            Probes::All | Probes::PmOnly => probe(PM_ADDR).await,
             Probes::CexOnly => None,
         };
         {

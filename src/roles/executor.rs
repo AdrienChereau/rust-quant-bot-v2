@@ -7,7 +7,7 @@
 //!      filtre `gap_min` + fin-de-fenêtre + cooldown, **dimensionne via Kelly** (autoritaire),
 //!      puis `paper.fire` (DRY_RUN : fill simulé, aucun ordre réel).
 //!
-//! Pas de sonde de latence ici (déjà mesurée manuellement, cf. plan).
+//! Sonde de latence côté Dublin : Polymarket uniquement (`Probes::PmOnly`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,6 +48,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     let pm = Arc::new(Mutex::new(PmShared::default()));
     spawn_pm_task(pm.clone());
+
+    let lat = crate::latency::shared();
+    {
+        let l = lat.clone();
+        tokio::spawn(async move { crate::latency::run(l, crate::latency::Probes::PmOnly).await; });
+    }
 
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash,
@@ -134,6 +140,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
 
         // Dashboard exécuteur (PM/position/PnL ; OBI laissé à 0).
+        let lat_snap = lat.lock().unwrap().clone();
         {
             let mut d = dash.write().await;
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
@@ -156,6 +163,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.breaker_tripped = controls.is_breaker_tripped();
             d.initial_capital = cfg.start_cash;
             d.max_drawdown = cfg.max_drawdown;
+            d.lat_polymarket_ms = lat_snap.polymarket_ms;
         }
 
         log_throttle += 1;
