@@ -71,6 +71,7 @@ pub struct DashState {
     pub breaker_tripped: bool,
     pub initial_capital: f64,
     pub max_drawdown: f64,
+    pub live_bankroll: Option<f64>, // vraie collatéral USDC (CLOB) — None si pas encore lue
 }
 
 pub type Shared = Arc<RwLock<DashState>>;

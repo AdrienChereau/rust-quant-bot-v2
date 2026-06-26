@@ -44,6 +44,7 @@ pub struct LiveCredentials {
     pub passphrase: String,
     pub funder: String,      // adresse maker (deposit wallet)
     pub private_key: String, // EOA qui signe l'EIP-712
+    pub sig_type: u8,        // POLY_SIG_TYPE (défaut 3, deposit wallet)
 }
 
 impl LiveCredentials {
@@ -56,6 +57,7 @@ impl LiveCredentials {
             passphrase: get("POLY_PASSPHRASE")?,
             funder: get("POLY_FUNDER_ADDRESS")?,
             private_key: get("POLY_PRIVATE_KEY")?,
+            sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })
     }
 }
@@ -111,7 +113,7 @@ impl OrderFields {
             nonce: 0,
             fee_rate_bps: 0,
             side,
-            signature_type: SIG_TYPE_DEPOSIT_WALLET,
+            signature_type: creds.sig_type,
         }
     }
 }
@@ -218,6 +220,32 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
         .unwrap_or_else(|| text.clone());
     tracing::warn!(order_id = %id, "✅ ordre LIVE accepté");
     Ok(PlaceResult::Placed(id))
+}
+
+/// Lit la **vraie collatéral USDC** du deposit wallet via le CLOB (auth L2, `signature_type`).
+/// Read-only : sert de pré-flight d'auth (mêmes en-têtes que le POST d'ordre) ET de bankroll live.
+/// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=N`.
+pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f64> {
+    let path = format!("/balance-allowance?asset_type=COLLATERAL&signature_type={}", creds.sig_type);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
+    let headers = build_l2_headers(creds, &ts, "GET", &path, "")?;
+    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{path}"));
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("CLOB /balance-allowance {status}: {text}");
+    }
+    // Réponse attendue : { "balance": "<base units>", ... }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("balance JSON '{text}': {e}"))?;
+    let raw = v.get("balance").and_then(|b| b.as_str())
+        .ok_or_else(|| anyhow::anyhow!("champ 'balance' absent: {text}"))?;
+    let base: f64 = raw.parse().map_err(|e| anyhow::anyhow!("balance '{raw}': {e}"))?;
+    Ok(base / BASE_UNITS)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -332,6 +360,7 @@ mod tests {
             funder: "0x0000000000000000000000000000000000000abc".into(),
             // clé de test connue (compte de dev Ethereum jamais utilisé en prod).
             private_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
+            sig_type: 3,
         }
     }
 

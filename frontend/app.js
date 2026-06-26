@@ -58,6 +58,9 @@ async function refresh() {
         const mode = s.mode || "—";
         const mb = $("mode"); mb.textContent = mode; mb.className = "badge mode " + mode.toLowerCase();
         $("ctl_mode").textContent = mode;
+        $("ctl_bankroll").innerHTML = s.live_bankroll != null
+          ? `<span class="ok">${fmt(s.live_bankroll, 2)} USDC</span>`
+          : '<span class="ko">— (non lue)</span>';
         $("ctl_armed").innerHTML = s.live_armed ? '<span class="ko">ARMÉ ⚠</span>' : '<span class="ok">non (sûr)</span>';
         const ddv = s.initial_capital != null ? (s.initial_capital - (s.equity ?? s.initial_capital)) : null;
         $("ctl_dd").textContent = ddv != null ? `${fmt(ddv, 2)} / ${fmt(s.max_drawdown, 0)} $` : "—";

@@ -81,17 +81,21 @@ impl PaperEngine {
         self.state.cash + pos_val
     }
 
-    /// Taille de Kelly : f* = edge/odds, bornée. `edge` = |fair − real| (avantage
-    /// probabiliste), `price` = prix d'entrée. Renvoie le nb de tokens (entier).
+    /// Taille de Kelly sur le cash paper interne (sizing paper).
     pub fn kelly_size(&self, edge: f64, price: f64) -> f64 {
-        if price <= 0.0 || price >= 1.0 {
+        self.kelly_size_for(edge, price, self.state.cash)
+    }
+
+    /// Taille de Kelly sur une `equity` explicite : `f* = edge/odds`, bornée. Utilisé en LIVE avec
+    /// la **vraie collatéral** CLOB (et non le cash paper). Renvoie le nb de tokens (entier).
+    pub fn kelly_size_for(&self, edge: f64, price: f64, equity: f64) -> f64 {
+        if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
             return 0.0;
         }
         // Pari binaire : gain net si on a raison ≈ (1−price)/price ; Kelly f = edge/odds.
         let odds = (1.0 - price) / price;
         let f_full = (edge / odds).clamp(0.0, 1.0);
         let f = f_full * self.params.kelly_fraction;
-        let equity = self.state.cash; // pas de position ouverte au moment du tir
         let budget = (equity * f).min(equity * self.params.max_size_pct);
         (budget / price).floor()
     }

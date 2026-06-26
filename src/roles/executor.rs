@@ -40,6 +40,23 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
     }
 
+    // Vraie collatéral USDC (CLOB) — lue toutes les 30 s ; sert de bankroll pour le sizing LIVE.
+    let live_bankroll = Arc::new(Mutex::new(None::<f64>));
+    if let Some(creds) = live_creds.clone() {
+        let bk = live_bankroll.clone();
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                poll.tick().await;
+                match live_executor::get_collateral_balance(&creds).await {
+                    Ok(usdc) => { *bk.lock().unwrap() = Some(usdc);
+                        tracing::info!(usdc = format!("{usdc:.2}"), "💰 bankroll réelle CLOB"); }
+                    Err(e) => tracing::warn!(error = %e, "lecture bankroll CLOB échouée"),
+                }
+            }
+        });
+    }
+
     let dash = dashboard::shared(cfg.dry_run);
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
@@ -122,12 +139,20 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let edge = (fair - real_up).abs();
                         // Aiguillage live → paper.
                         if controls.live_active() {
-                            let size_k = paper.kelly_size(edge, real_up.max(0.01));
-                            if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
-                                let order_price = book.best_ask().unwrap_or(real_up);
-                                let args = OrderArgs { side, price: order_price, size };
-                                let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
-                                last_fire_ms = now_ms;
+                            // Sizing sur la VRAIE collatéral CLOB. Tant qu'elle n'est pas lue, on
+                            // s'abstient (jamais sizer un ordre réel sur le cash paper fictif).
+                            let real_bk = *live_bankroll.lock().unwrap();
+                            match real_bk {
+                                None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
+                                Some(bk) => {
+                                    let order_price = book.best_ask().unwrap_or(real_up);
+                                    let size_k = paper.kelly_size_for(edge, order_price, bk);
+                                    if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                        let args = OrderArgs { side, price: order_price, size };
+                                        let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                                        last_fire_ms = now_ms;
+                                    }
+                                }
                             }
                         } else if !controls.is_paper_paused()
                             && paper.fire(side, token, edge, book, m.tick_size, m.min_order_size, now_ms)
@@ -164,6 +189,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.initial_capital = cfg.start_cash;
             d.max_drawdown = cfg.max_drawdown;
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
+            d.live_bankroll = *live_bankroll.lock().unwrap();
         }
 
         log_throttle += 1;

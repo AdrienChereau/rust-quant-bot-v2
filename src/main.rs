@@ -101,6 +101,23 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
     }
 
+    // Vraie collatéral USDC (CLOB) — bankroll pour le sizing LIVE (jamais le cash paper).
+    let live_bankroll = Arc::new(Mutex::new(None::<f64>));
+    if let Some(creds) = live_creds.clone() {
+        let bk = live_bankroll.clone();
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                poll.tick().await;
+                match live_executor::get_collateral_balance(&creds).await {
+                    Ok(usdc) => { *bk.lock().unwrap() = Some(usdc);
+                        tracing::info!(usdc = format!("{usdc:.2}"), "💰 bankroll réelle CLOB"); }
+                    Err(e) => tracing::warn!(error = %e, "lecture bankroll CLOB échouée"),
+                }
+            }
+        });
+    }
+
     let dash = dashboard::shared(cfg.dry_run);
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
@@ -198,11 +215,17 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     if controls.is_breaker_tripped() {
                         // exécution coupée
                     } else if controls.live_active() {
-                        let size_k = paper.kelly_size(gap.abs(), real_up.max(0.01));
-                        if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
-                            let price = book.best_ask().unwrap_or(real_up);
-                            let args = OrderArgs { side, price, size };
-                            let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                        // Sizing sur la VRAIE collatéral CLOB (jamais le cash paper). Pas encore lue → abstention.
+                        match *live_bankroll.lock().unwrap() {
+                            None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
+                            Some(bk) => {
+                                let price = book.best_ask().unwrap_or(real_up);
+                                let size_k = paper.kelly_size_for(gap.abs(), price, bk);
+                                if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                    let args = OrderArgs { side, price, size };
+                                    let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                                }
+                            }
                         }
                     } else if !controls.is_paper_paused() {
                         paper.fire(side, token, gap.abs(), book, m.tick_size, m.min_order_size, now_ms);
@@ -268,6 +291,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             d.breaker_tripped = controls.is_breaker_tripped();
             d.initial_capital = cfg.start_cash;
             d.max_drawdown = cfg.max_drawdown;
+            d.live_bankroll = *live_bankroll.lock().unwrap();
         }
 
         log_throttle += 1;
