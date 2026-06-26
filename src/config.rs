@@ -41,6 +41,10 @@ pub struct Config {
     pub take_profit_cents: f64,
     pub stop_loss_cents: f64,
     pub max_hold_secs: i64,
+
+    // Live testing (passage paper → réel)
+    pub max_drawdown: f64,     // circuit breaker sur l'equity (en $)
+    pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
 }
 
 impl Config {
@@ -76,6 +80,9 @@ impl Config {
             take_profit_cents: env_or("TAKE_PROFIT_CENTS", 4.0),
             stop_loss_cents: env_or("STOP_LOSS_CENTS", 3.0),
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
+
+            max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
+            live_armed: env_or("LIVE_ARMED", false),
         }
     }
 }

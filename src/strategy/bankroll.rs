@@ -194,6 +194,26 @@ impl PaperEngine {
     }
 }
 
+/// Circuit breaker drawdown (basé sur l'**equity**, pas le cash).
+/// Renvoie `true` s'il faut couper : `initial_capital − current_equity ≥ max_dd`.
+pub fn check_drawdown_breaker(current_equity: f64, initial_capital: f64, max_dd: f64) -> bool {
+    initial_capital - current_equity >= max_dd
+}
+
+/// Ajuste la taille Kelly au minimum Polymarket.
+/// - taille ≥ `min_tokens` → inchangée ;
+/// - `min_tokens/2 ≤ taille < min_tokens` → arrondie au minimum (signal correct) ;
+/// - taille < `min_tokens/2` → `None` (signal trop faible, on ignore le trade).
+pub fn adjust_size_to_min(size_from_kelly: f64, min_tokens: f64) -> Option<f64> {
+    if size_from_kelly >= min_tokens {
+        Some(size_from_kelly)
+    } else if size_from_kelly >= min_tokens * 0.5 {
+        Some(min_tokens)
+    } else {
+        None
+    }
+}
+
 /// Prix moyen pondéré (VWAP) d'un achat taker qui consomme `size` en parcourant les asks.
 fn vwap_buy(book: &PolyBook, size: f64) -> (f64, f64) {
     let mut asks = book.asks.clone();
@@ -258,5 +278,24 @@ mod tests {
         let closed = e.manage(Some(0.40), 1000, 200); // sous le SL (~0.42)
         assert!(closed);
         assert_eq!(e.state.losses, 1);
+    }
+
+    #[test]
+    fn breaker_trips_at_max_drawdown() {
+        // capital 200, max_dd 20 → coupe à equity ≤ 180.
+        assert!(!check_drawdown_breaker(185.0, 200.0, 20.0));
+        assert!(check_drawdown_breaker(180.0, 200.0, 20.0));
+        assert!(check_drawdown_breaker(175.0, 200.0, 20.0));
+    }
+
+    #[test]
+    fn size_min_adjustment() {
+        // ≥ min → inchangé
+        assert_eq!(adjust_size_to_min(8.0, 5.0), Some(8.0));
+        // entre min/2 et min → arrondi au minimum
+        assert_eq!(adjust_size_to_min(3.0, 5.0), Some(5.0));
+        assert_eq!(adjust_size_to_min(2.5, 5.0), Some(5.0));
+        // < min/2 → ignoré
+        assert_eq!(adjust_size_to_min(2.0, 5.0), None);
     }
 }

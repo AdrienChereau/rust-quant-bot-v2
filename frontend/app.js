@@ -1,5 +1,15 @@
 const $ = (id) => document.getElementById(id);
 function fmt(n, d = 2) { return (n == null || Number.isNaN(n)) ? "—" : Number(n).toFixed(d); }
+
+// Endpoint de contrôle (POST) → feedback immédiat via le mode renvoyé, puis refresh complet.
+async function ctl(path) {
+  try {
+    const r = await (await fetch(path, { method: "POST" })).json();
+    if (r && r.mode) { const mb = $("mode"); mb.textContent = r.mode; mb.className = "badge mode " + r.mode.toLowerCase(); }
+  } catch (e) {}
+  refresh();
+}
+window.ctl = ctl;
 function signed(el, n, d = 2) { el.textContent = fmt(n, d); el.classList.toggle("pos", n > 0); el.classList.toggle("neg", n < 0); }
 function obi(el, v) { el.textContent = (v >= 0 ? "+" : "") + fmt(v, 3); el.classList.toggle("pos", v > 0); el.classList.toggle("neg", v < 0); }
 
@@ -9,6 +19,17 @@ async function refresh() {
     $("status").textContent = "✓ connecté"; $("status").className = "ok";
 
     const dry = $("dry"); dry.textContent = s.dry_run ? "PAPER" : "LIVE"; dry.className = "badge " + (s.dry_run ? "paper" : "live");
+
+    // Contrôle d'exécution + circuit breaker
+    const mode = s.mode || "—";
+    const mb = $("mode"); mb.textContent = mode; mb.className = "badge mode " + mode.toLowerCase();
+    $("ctl_mode").textContent = mode;
+    $("ctl_armed").innerHTML = s.live_armed ? '<span class="ko">ARMÉ ⚠</span>' : '<span class="ok">non (sûr)</span>';
+    const dd = s.initial_capital != null ? (s.initial_capital - (s.equity ?? s.initial_capital)) : null;
+    $("ctl_dd").textContent = dd != null ? `${fmt(dd, 2)} / ${fmt(s.max_drawdown, 0)} $` : "—";
+    const banner = $("breaker-banner");
+    if (s.breaker_tripped) { banner.hidden = false; banner.classList.add("pulse"); }
+    else { banner.hidden = true; banner.classList.remove("pulse"); }
 
     $("binance").innerHTML = s.binance_connected ? '<span class="ok">connecté</span>' : '<span class="ko">—</span>';
     $("okx").innerHTML = s.okx_connected ? '<span class="ok">connecté</span>' : '<span class="ko">—</span>';

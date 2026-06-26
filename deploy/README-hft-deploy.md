@@ -87,3 +87,41 @@ PORT=8769 cargo run --release -- radar --target-ip 127.0.0.1 --target-port 8080
 
 `cargo run --release` (ou `... -- mono`) lance radar+exécuteur dans un seul processus — c'est le
 déploiement actuel sur cloudy, non impacté par ce refactor.
+
+---
+
+# Live testing (paper → réel) — handoff
+
+> ⚠️ **Deux verrous indépendants, plus le breaker.** Aucun ordre réel ne part sans les DEUX :
+> 1. **feature `live`** à la compilation (sinon `sign_order_eip712` renvoie une erreur) ;
+> 2. **`LIVE_ARMED=true`** au runtime (sinon l'ordre est signé + loggé mais **non envoyé**).
+> Le circuit breaker (`MAX_DRAWDOWN`) coupe toute exécution si `equity ≤ START_CASH − MAX_DRAWDOWN`.
+
+### Pré-requis toolchain
+`alloy 2.1` exige **rustc ≥ 1.91**. Utiliser rustup (`rustup update stable`), pas un rust Homebrew
+ancien. Le build **paper par défaut** n'a pas cette contrainte.
+
+### Build + vérification du signing (sur box rustup à jour)
+```bash
+cargo test  --features live          # round-trip signature (hash→sign→recover == signer)
+cargo build --release --features live
+```
+
+### Étapes de validation (ordre strict, cf. spec)
+1. **Dry-Run Live** : `--features live`, `LIVE_ARMED=false`, credentials `POLY_*` dans `.env`.
+   Activer le mode live au dashboard (Live ON + ▶ Live). Vérifier dans les logs la ligne
+   `LIVE order signé` contenant `"orderType":"FAK"` — **rien n'est envoyé**.
+2. **Test breaker** : mettre `MAX_DRAWDOWN=1`, forcer une perte (ou POST `/breaker/trip`).
+   Vérifier l'arrêt de toute exécution + la bannière rouge clignotante au dashboard.
+3. **Micro-Test Live** : `LIVE_ARMED=true`, taille minimale (≥ `min_order_size`). UN seul ordre
+   réel pour valider le workflow L2 + la **parité** de la signature (le code seul ne la prouve pas).
+
+### ⚠️ À faire AVANT d'armer le live
+Le dashboard (et ses endpoints POST `/live/enable`…) écoute sur `0.0.0.0`. **Le binder sur
+localhost/Tailscale ou le protéger** avant `LIVE_ARMED=true` — sinon n'importe qui sur le réseau
+peut basculer les modes. Confirmer aussi l'`EXCHANGE_CTF` (neg-risk = adresse différente) et le
+`signatureType` (3) pour ton compte.
+
+### Credentials
+`POLY_API_KEY/SECRET/PASSPHRASE/FUNDER_ADDRESS/PRIVATE_KEY` générés EN AMONT (flow L1 hors bot),
+dans `.env` (jamais commité). Voir `.env.example`.

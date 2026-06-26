@@ -17,6 +17,7 @@ mod polymarket;
 mod pricing;
 mod roles;
 mod signal;
+mod state;
 mod strategy;
 
 use std::sync::{Arc, Mutex};
@@ -30,8 +31,10 @@ use config::Config;
 use polymarket::relayer::{btc_price_at_window_open, Market, PolyBook, PolymarketClient};
 use pricing::black_scholes::{fair_up_probability, years_from_secs};
 use pricing::volatility::VolatilityTracker;
+use polymarket::live_executor::{self, LiveCredentials, OrderArgs};
 use signal::consolidated_obi::ConsolidatedObi;
-use strategy::bankroll::{KellyParams, PaperEngine};
+use state::RuntimeControls;
+use strategy::bankroll::{self, KellyParams, PaperEngine};
 use strategy::sniper::{Action, Sniper, TickInput};
 
 #[derive(Parser)]
@@ -91,10 +94,17 @@ struct PmShared {
 async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(dry_run = cfg.dry_run, "🎯 rust-quant-bot (sniper, mono) démarré");
 
+    // Contrôle d'exécution lock-free (pause/live/breaker), partagé avec le dashboard.
+    let controls = Arc::new(RuntimeControls::new());
+    let live_creds = LiveCredentials::from_env();
+    if cfg.live_armed {
+        tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
+    }
+
     let dash = dashboard::shared(cfg.dry_run);
     {
-        let (port, st) = (cfg.dashboard_port, dash.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st).await; });
+        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
     }
 
     // Sonde de latence TCP (toutes les 5 s, hors hot-loop) — mono = les trois cibles.
@@ -166,6 +176,16 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
 
+        // Circuit breaker (drawdown sur l'equity) — déclenché une fois, coupe toute exécution.
+        let equity_now = paper.equity(mark_bid);
+        if !controls.is_breaker_tripped()
+            && bankroll::check_drawdown_breaker(equity_now, cfg.start_cash, cfg.max_drawdown)
+            && controls.trip_breaker()
+        {
+            tracing::error!(equity = format!("{:.2}", equity_now), capital = cfg.start_cash,
+                max_dd = cfg.max_drawdown, "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+        }
+
         // FSM sniper.
         let input = TickInput { now_ms, decision, fair_up, real_up, velocity, liquidity_vacuum, blocked };
         match sniper.step(&input) {
@@ -174,7 +194,19 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     let (book, token) = if side == concurrency::bus::Side::Up {
                         (&up_book, &m.up_token_id)
                     } else { (&down_book, &m.down_token_id) };
-                    paper.fire(side, token, gap.abs(), book, m.tick_size, m.min_order_size, now_ms);
+                    // Aiguillage breaker → live → paper.
+                    if controls.is_breaker_tripped() {
+                        // exécution coupée
+                    } else if controls.live_active() {
+                        let size_k = paper.kelly_size(gap.abs(), real_up.max(0.01));
+                        if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                            let price = book.best_ask().unwrap_or(real_up);
+                            let args = OrderArgs { side, price, size };
+                            let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                        }
+                    } else if !controls.is_paper_paused() {
+                        paper.fire(side, token, gap.abs(), book, m.tick_size, m.min_order_size, now_ms);
+                    }
                 }
             }
             Action::Kill => tracing::warn!("⚡ KILL (liquidity vacuum) — abstention"),
@@ -228,6 +260,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             d.lat_binance_ms    = lat_snap.binance_ms;
             d.lat_okx_ms        = lat_snap.okx_ms;
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
+            d.mode = controls.mode_label().into();
+            d.paper_paused = controls.is_paper_paused();
+            d.live_enabled = controls.is_live_enabled();
+            d.live_paused = controls.is_live_paused();
+            d.live_armed = cfg.live_armed;
+            d.breaker_tripped = controls.is_breaker_tripped();
+            d.initial_capital = cfg.start_cash;
+            d.max_drawdown = cfg.max_drawdown;
         }
 
         log_throttle += 1;

@@ -20,6 +20,7 @@ use crate::pricing::black_scholes::{fair_up_probability, years_from_secs};
 use crate::pricing::volatility::VolatilityTracker;
 use crate::signal::consolidated_obi::ConsolidatedObi;
 use crate::strategy::sniper::{Action, Sniper, TickInput};
+use crate::state::RuntimeControls;
 use crate::{binance, dashboard, latency, okx};
 use binance::local_book::OrderBookL2;
 use binance::math_engine::VelocityTracker;
@@ -35,10 +36,12 @@ struct StrikeState {
 pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Result<()> {
     tracing::info!(%target_ip, target_port, "🛰️  RADAR (Tokyo) démarré");
 
+    // Le radar n'exécute pas : contrôles présents seulement pour servir le dashboard.
+    let controls = Arc::new(RuntimeControls::new());
     let dash = dashboard::shared(cfg.dry_run);
     {
-        let (port, st) = (cfg.dashboard_port, dash.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st).await; });
+        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
     }
 
     // Sonde latence CEX uniquement (Binance/OKX).

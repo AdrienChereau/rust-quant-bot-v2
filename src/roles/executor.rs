@@ -17,8 +17,10 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::net::udp;
 use crate::net::wire::WireSignal;
+use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs};
 use crate::polymarket::relayer::{Market, PolyBook, PolymarketClient};
-use crate::strategy::bankroll::{KellyParams, PaperEngine};
+use crate::state::RuntimeControls;
+use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
 
 #[derive(Default)]
 struct PmShared {
@@ -32,10 +34,16 @@ struct PmShared {
 pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     tracing::info!(listen_port, dry_run = cfg.dry_run, "🎯 EXÉCUTEUR (Dublin) démarré");
 
+    let controls = Arc::new(RuntimeControls::new());
+    let live_creds = LiveCredentials::from_env();
+    if cfg.live_armed {
+        tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
+    }
+
     let dash = dashboard::shared(cfg.dry_run);
     {
-        let (port, st) = (cfg.dashboard_port, dash.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st).await; });
+        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
     }
 
     let pm = Arc::new(Mutex::new(PmShared::default()));
@@ -73,6 +81,16 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
 
+        // Circuit breaker (drawdown equity).
+        let equity_now = paper.equity(mark_bid);
+        if !controls.is_breaker_tripped()
+            && bankroll::check_drawdown_breaker(equity_now, cfg.start_cash, cfg.max_drawdown)
+            && controls.trip_breaker()
+        {
+            tracing::error!(equity = format!("{:.2}", equity_now), capital = cfg.start_cash,
+                max_dd = cfg.max_drawdown, "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+        }
+
         // 2. Drain des signaux UDP reçus du radar.
         while let Ok(sig) = rx.try_recv() {
             match sig {
@@ -86,7 +104,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         Side::Up => fair - real_up >= cfg.gap_min,
                         Side::Down => real_up - fair >= cfg.gap_min,
                     };
-                    if blocked || cooling || !gap_ok {
+                    if controls.is_breaker_tripped() || blocked || cooling || !gap_ok {
                         continue;
                     }
                     if let Some(m) = &market {
@@ -96,7 +114,18 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             (&down_book, &m.down_token_id)
                         };
                         let edge = (fair - real_up).abs();
-                        if paper.fire(side, token, edge, book, m.tick_size, m.min_order_size, now_ms) {
+                        // Aiguillage live → paper.
+                        if controls.live_active() {
+                            let size_k = paper.kelly_size(edge, real_up.max(0.01));
+                            if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                let order_price = book.best_ask().unwrap_or(real_up);
+                                let args = OrderArgs { side, price: order_price, size };
+                                let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                                last_fire_ms = now_ms;
+                            }
+                        } else if !controls.is_paper_paused()
+                            && paper.fire(side, token, edge, book, m.tick_size, m.min_order_size, now_ms)
+                        {
                             last_fire_ms = now_ms;
                         }
                     }
@@ -119,6 +148,14 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
             d.shots = paper.state.shots; d.wins = paper.state.wins; d.losses = paper.state.losses;
             d.hit_rate = paper.hit_rate();
+            d.mode = controls.mode_label().into();
+            d.paper_paused = controls.is_paper_paused();
+            d.live_enabled = controls.is_live_enabled();
+            d.live_paused = controls.is_live_paused();
+            d.live_armed = cfg.live_armed;
+            d.breaker_tripped = controls.is_breaker_tripped();
+            d.initial_capital = cfg.start_cash;
+            d.max_drawdown = cfg.max_drawdown;
         }
 
         log_throttle += 1;

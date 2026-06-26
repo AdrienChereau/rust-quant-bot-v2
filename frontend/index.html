@@ -8,9 +8,29 @@
 </head>
 <body>
   <header>
-    <h1>🎯 Sniper Bot <span id="dry" class="badge">—</span></h1>
+    <h1>🎯 Sniper Bot <span id="dry" class="badge">—</span> <span id="mode" class="badge mode">—</span></h1>
     <span id="clock" class="muted"></span>
   </header>
+
+  <div id="breaker-banner" class="breaker-banner" hidden>🛑 CIRCUIT BREAKER DÉCLENCHÉ — exécution coupée</div>
+
+  <section class="card control-panel">
+    <h2>🎛️ Contrôle d'exécution</h2>
+    <div class="row"><span>Mode courant</span><b id="ctl_mode">—</b></div>
+    <div class="row"><span>Live armé (LIVE_ARMED)</span><b id="ctl_armed">—</b></div>
+    <div class="row"><span>Drawdown / max</span><b id="ctl_dd">—</b></div>
+    <div class="btn-grid">
+      <button class="btn ok" onclick="ctl('/paper/play')">▶ Paper</button>
+      <button class="btn warn" onclick="ctl('/paper/pause')">⏸ Paper</button>
+      <button class="btn" onclick="ctl('/live/enable')">Live ON</button>
+      <button class="btn" onclick="ctl('/live/disable')">Live OFF</button>
+      <button class="btn warn" onclick="ctl('/live/pause')">⏸ Live</button>
+      <button class="btn ok" onclick="ctl('/live/resume')">▶ Live</button>
+      <button class="btn danger" onclick="ctl('/breaker/trip')">🛑 Trip</button>
+      <button class="btn" onclick="ctl('/breaker/reset')">↺ Reset</button>
+    </div>
+    <p class="muted" style="margin:.5rem 0 0">Note : « Live ON » sélectionne le mode mais reste en <b>dry-run</b> tant que <code>LIVE_ARMED</code> + signature EIP-712 vérifiée.</p>
+  </section>
 
   <section class="grid">
     <div class="card">

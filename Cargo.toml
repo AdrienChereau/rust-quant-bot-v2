@@ -21,8 +21,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 
-# Signing EIP-712 (Phase 7) — activé plus tard.
-# alloy = { version = "0.8", features = ["providers", "signers", "signer-local", "sol-types"] }
+# Auth L2 Polymarket (HMAC-SHA256 des en-têtes /order).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Signing EIP-712 (live) — derrière la feature `live` pour ne pas alourdir le build par défaut.
+# Meta-crate alloy en features minimales (signing seul, sans le stack RPC/providers).
+# ⚠️ alloy 2.1 requiert rustc ≥ 1.91. La feature `live` ne compile donc QUE sur un toolchain récent
+# (les nœuds AWS via rustup l'ont ; le build paper par défaut, lui, reste sur n'importe quel rustc).
+alloy = { version = "2.1", default-features = false, features = ["signer-local", "sol-types"], optional = true }
+
+[features]
+default = []
+# `cargo build --features live` : compile la signature EIP-712 réelle (alloy).
+live = ["dep:alloy"]
 
 [profile.release]
 opt-level = 3

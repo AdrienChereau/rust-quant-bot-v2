@@ -2,12 +2,15 @@
 //! Tourne sur une tâche séparée lisant un snapshot partagé → **zéro impact** sur
 //! le hot-loop (OBI 50 ms + FSM).
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+
+use crate::state::RuntimeControls;
 
 const INDEX_HTML: &str = include_str!("../frontend/index.html");
 const STYLE_CSS: &str = include_str!("../frontend/style.css");
@@ -59,6 +62,15 @@ pub struct DashState {
     pub lat_binance_ms:    Option<f64>,
     pub lat_okx_ms:        Option<f64>,
     pub lat_polymarket_ms: Option<f64>,
+    // Contrôle d'exécution (reflète RuntimeControls + config) — live testing
+    pub mode: String,           // PAPER / PAUSE / LIVE / BREAKER
+    pub paper_paused: bool,
+    pub live_enabled: bool,
+    pub live_paused: bool,
+    pub live_armed: bool,       // verrou matériel d'envoi réel (env LIVE_ARMED)
+    pub breaker_tripped: bool,
+    pub initial_capital: f64,
+    pub max_drawdown: f64,
 }
 
 pub type Shared = Arc<RwLock<DashState>>;
@@ -67,17 +79,30 @@ pub fn shared(dry_run: bool) -> Shared {
     Arc::new(RwLock::new(DashState { dry_run, ..Default::default() }))
 }
 
-pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
+pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "Dashboard sur http://0.0.0.0:{port}");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let state = state.clone();
+        let controls = controls.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let Ok(n) = sock.read(&mut buf).await else { return };
             let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/");
+            let mut tokens = req.split_whitespace();
+            let method = tokens.next().unwrap_or("GET");
+            let path = tokens.next().unwrap_or("/").split('?').next().unwrap_or("/");
+
+            // Endpoints de contrôle (POST) — mutent les atomics lock-free.
+            if method == "POST" {
+                let ok = handle_control(path, &controls);
+                let body = format!("{{\"ok\":{ok},\"mode\":\"{}\"}}", controls.mode_label());
+                let _ = sock.write_all(http_resp("application/json", &body).as_bytes()).await;
+                let _ = sock.flush().await;
+                return;
+            }
+
             let (ctype, body) = match path {
                 "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML.to_string()),
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
@@ -85,12 +110,37 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 "/state" => ("application/json", serde_json::to_string(&*state.read().await).unwrap_or_else(|_| "{}".into())),
                 _ => ("text/plain", "not found".to_string()),
             };
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.write_all(http_resp(ctype, &body).as_bytes()).await;
             let _ = sock.flush().await;
         });
     }
+}
+
+/// Applique un endpoint de contrôle. Renvoie `true` si l'action est reconnue.
+/// ⚠️ Ces endpoints ne déclenchent JAMAIS d'envoi réel : le verrou `LIVE_ARMED` (env) reste requis
+/// dans la boucle de trading. `live/enable` ne fait que *sélectionner* le mode (toujours dry-run
+/// tant que la signature n'est pas vérifiée).
+fn handle_control(path: &str, c: &RuntimeControls) -> bool {
+    match path {
+        "/paper/pause" => { c.paper_paused.store(true, Ordering::Relaxed); true }
+        "/paper/play"  => { c.paper_paused.store(false, Ordering::Relaxed); true }
+        "/live/enable" => { c.live_enabled.store(true, Ordering::Relaxed); true }
+        "/live/disable" => {
+            c.live_enabled.store(false, Ordering::Relaxed);
+            c.live_paused.store(true, Ordering::Relaxed); // sécurité : on repasse en pause
+            true
+        }
+        "/live/pause"  => { c.live_paused.store(true, Ordering::Relaxed); true }
+        "/live/resume" => { c.live_paused.store(false, Ordering::Relaxed); true }
+        "/breaker/reset" => { c.breaker_tripped.store(false, Ordering::Relaxed); true }
+        "/breaker/trip"  => { c.breaker_tripped.store(true, Ordering::Relaxed); true } // test manuel
+        _ => false,
+    }
+}
+
+fn http_resp(ctype: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }

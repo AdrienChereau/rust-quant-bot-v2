@@ -28,3 +28,24 @@ footer { margin-top: 1rem; }
 .lat-bar-row { padding: 0.1rem 0; border-bottom: none !important; }
 .lat-bar-wrap { width: 100%; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
 .lat-bar { height: 100%; border-radius: 3px; transition: width 0.5s ease, background 0.5s ease; width: 0%; }
+
+/* Contrôle d'exécution */
+.badge.mode { background: var(--accent); color: #000; }
+.badge.mode.paper { background: var(--green); color: #000; }
+.badge.mode.live { background: var(--red); color: #fff; }
+.badge.mode.pause { background: var(--muted); color: #000; }
+.badge.mode.breaker { background: var(--red); color: #fff; }
+.control-panel { margin-bottom: 1rem; }
+.btn-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; margin-top: 0.6rem; }
+.btn { font: inherit; font-size: 0.8rem; padding: 0.4rem 0.3rem; border: 1px solid var(--line);
+  background: #21262d; color: var(--txt); border-radius: 0.4rem; cursor: pointer; }
+.btn:hover { border-color: var(--accent); }
+.btn.ok { border-color: var(--green); } .btn.warn { border-color: var(--amber); }
+.btn.danger { border-color: var(--red); color: var(--red); }
+code { background: #21262d; padding: 0 0.2rem; border-radius: 0.2rem; }
+
+/* Bannière circuit breaker */
+.breaker-banner { background: var(--red); color: #fff; text-align: center; font-weight: bold;
+  padding: 0.6rem; border-radius: 0.5rem; margin-bottom: 1rem; }
+.breaker-banner.pulse { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
