@@ -1,0 +1,32 @@
+[package]
+name = "rust-quant-bot"
+version = "2.0.0"
+edition = "2021"
+authors = ["Engineering Team <quant@internal.com>"]
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+crossbeam-channel = "0.5"
+statrs = "0.16"           # CDF normale (Black-Scholes)
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
+
+# Signing EIP-712 (Phase 7) — activé plus tard.
+# alloy = { version = "0.8", features = ["providers", "signers", "signer-local", "sol-types"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sniper — Monitoring</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>🎯 Sniper Bot <span id="dry" class="badge">—</span></h1>
+    <span id="clock" class="muted"></span>
+  </header>
+
+  <section class="grid">
+    <div class="card">
+      <h2>🧠 Radar (Binance + OKX)</h2>
+      <div class="row"><span>Binance</span><b id="binance">—</b></div>
+      <div class="row"><span>OKX</span><b id="okx">—</b></div>
+      <div class="row"><span>BTC spot</span><b id="spot">—</b></div>
+      <div class="row"><span>OBI Binance</span><b id="obib">—</b></div>
+      <div class="row"><span>OBI OKX</span><b id="obio">—</b></div>
+      <div class="row"><span>OBI consolidé</span><b id="obic">—</b></div>
+      <div class="row"><span>Accord cross-exchange</span><b id="agree">—</b></div>
+      <div class="row"><span>Vélocité ΔP_1s</span><b id="vel">—</b></div>
+    </div>
+
+    <div class="card">
+      <h2>🔫 Sniper</h2>
+      <div class="row"><span>État FSM</span><b id="fsm">—</b></div>
+      <div class="row"><span>Marché</span><b id="slug">—</b></div>
+      <div class="row"><span>Temps restant</span><b id="rem">—</b></div>
+      <div class="row"><span>Fair Up (B&S)</span><b id="fair">—</b></div>
+      <div class="row"><span>Real Up (PM)</span><b id="real">—</b></div>
+      <div class="row"><span>Gap (fair − real)</span><b id="gap">—</b></div>
+      <div class="row"><span>Liquidity Vacuum</span><b id="vacuum">—</b></div>
+      <div class="row"><span>Taille Kelly</span><b id="kelly">—</b></div>
+    </div>
+
+    <div class="card" id="card-cond">
+      <h2>✅ Conditions de tir (AND)</h2>
+      <div class="row"><span>1. Accord OBI (Binance+OKX)</span><b id="c_agree">—</b></div>
+      <div class="row"><span>2. Persistance (dwell 200ms)</span><b id="c_persist">—</b></div>
+      <div class="row"><span>3. Vélocité confirme</span><b id="c_vel">—</b></div>
+      <div class="row"><span>4. Gap fair/real suffisant</span><b id="c_gap">—</b></div>
+      <div class="row"><span>5. Prêt (pas cooldown/vacuum/fin)</span><b id="c_ready">—</b></div>
+      <div class="row"><span><b>→ TIR</b></span><b id="c_all">—</b></div>
+    </div>
+
+    <div class="card" id="card-lat">
+      <h2>📡 Latences TCP (cloudy → exchange)</h2>
+      <div class="row"><span>Binance WS (Tokyo)</span><b id="lat_b">—</b></div>
+      <div class="row lat-bar-row"><div class="lat-bar-wrap"><div id="latbar_b" class="lat-bar"></div></div></div>
+      <div class="row"><span>OKX WS (Cloudflare)</span><b id="lat_o">—</b></div>
+      <div class="row lat-bar-row"><div class="lat-bar-wrap"><div id="latbar_o" class="lat-bar"></div></div></div>
+      <div class="row"><span>Polymarket WS (Cloudflare)</span><b id="lat_p">—</b></div>
+      <div class="row lat-bar-row"><div class="lat-bar-wrap"><div id="latbar_p" class="lat-bar"></div></div></div>
+      <div class="row" style="margin-top:0.4rem"><span class="muted">Binance avance / OKX avance</span><b id="lat_adv">—</b></div>
+      <div class="row"><span class="muted">Sonde toutes les 5 s</span><span class="muted" id="lat_age">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>💰 Position & PnL (paper)</h2>
+      <div class="row"><span>Position</span><b id="pos">—</b></div>
+      <div class="row"><span>Entrée / TP / SL</span><b id="ets">—</b></div>
+      <div class="row"><span>Cash USDC</span><b id="cash">—</b></div>
+      <div class="row"><span>Equity</span><b id="equity">—</b></div>
+      <div class="row"><span>PnL réalisé</span><b id="pnl">—</b></div>
+      <div class="row"><span>Drawdown</span><b id="dd">—</b></div>
+      <div class="row"><span>Tirs (W/L)</span><b id="shots">—</b></div>
+      <div class="row"><span>Hit-rate</span><b id="hr">—</b></div>
+    </div>
+  </section>
+
+  <footer class="muted">Connexion : <span id="status">…</span></footer>
+  <script src="/app.js"></script>
+</body>
+</html>

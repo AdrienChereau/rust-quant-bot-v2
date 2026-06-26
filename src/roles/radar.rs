@@ -1,0 +1,163 @@
+//! Nœud **Radar (Tokyo)** — émetteur.
+//!
+//! Possède toute la chaîne 100 % CEX : WS Binance + OKX, carnets L2, OBI consolidé, vélocité,
+//! FSM de persistance OBI, et le `fair_up` B&S (strike CEX-dérivé via klines). Quand la FSM sort
+//! d'ARMING avec vélocité confirmée, on **tire un paquet UDP de 6 octets** vers l'exécuteur ;
+//! sur vide de liquidité, on émet un KILL.
+//!
+//! Le **gap fair/real n'est PAS jugé ici** (le radar n'a pas le carnet Polymarket) : on construit
+//! la FSM avec `gap_min = 0` pour neutraliser ce test, et l'exécuteur tranchera le gap à réception.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::concurrency::bus::Side;
+use crate::config::Config;
+use crate::net::udp::UdpSender;
+use crate::net::wire::WireSignal;
+use crate::polymarket::relayer::btc_price_at_window_open;
+use crate::pricing::black_scholes::{fair_up_probability, years_from_secs};
+use crate::pricing::volatility::VolatilityTracker;
+use crate::signal::consolidated_obi::ConsolidatedObi;
+use crate::strategy::sniper::{Action, Sniper, TickInput};
+use crate::{binance, dashboard, latency, okx};
+use binance::local_book::OrderBookL2;
+use binance::math_engine::VelocityTracker;
+
+const WINDOW_SEC: i64 = 300;
+
+#[derive(Default)]
+struct StrikeState {
+    window_ts: i64,
+    strike: Option<f64>,
+}
+
+pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Result<()> {
+    tracing::info!(%target_ip, target_port, "🛰️  RADAR (Tokyo) démarré");
+
+    let dash = dashboard::shared(cfg.dry_run);
+    {
+        let (port, st) = (cfg.dashboard_port, dash.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st).await; });
+    }
+
+    // Sonde latence CEX uniquement (Binance/OKX).
+    let lat = latency::shared();
+    { let l = lat.clone(); tokio::spawn(async move { latency::run(l, latency::Probes::CexOnly).await; }); }
+
+    let binance_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
+    let okx_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
+    tokio::spawn(binance::websocket::run(cfg.binance_ws_url.clone(), binance_book.clone()));
+    tokio::spawn(okx::websocket::run(cfg.okx_ws_url.clone(), okx_book.clone()));
+
+    // Strike (prix BTC à l'ouverture de la fenêtre) — via klines Binance, dérivable côté CEX.
+    let strike = Arc::new(Mutex::new(StrikeState::default()));
+    spawn_strike_task(strike.clone());
+
+    let sender = UdpSender::new(&target_ip, target_port).await?;
+
+    let consolidated = ConsolidatedObi::new(
+        cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
+    // FSM radar : gap_min=0 → seul l'accord OBI soutenu + la vélocité gardent le tir ici.
+    let mut sniper = Sniper::new(cfg.obi_dwell_ms, cfg.cooldown_ms, 0.0, cfg.velocity_confirm);
+    let mut vel = VelocityTracker::new(1000);
+    let mut vol = VolatilityTracker::new(2000, 0.80);
+
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let mut log_throttle: u32 = 0;
+    loop {
+        tick.tick().await;
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+        let n = cfg.obi_top_n;
+        let (obi_b, spot) = { let b = binance_book.lock().unwrap(); (b.calculate_obi_topn(n), b.mid_price()) };
+        let obi_o = { okx_book.lock().unwrap().calculate_obi_topn(n) };
+        let Some(spot) = spot else { continue };
+        vel.update(now_ms, spot);
+        vol.update(now_ms, spot);
+        let velocity = vel.velocity();
+        let decision = consolidated.evaluate(obi_b, obi_o);
+
+        // Fenêtre 5 min déterministe + strike → fair_up B&S.
+        let now_s = (now_ms / 1000) as i64;
+        let window_ts = (now_s / WINDOW_SEC) * WINDOW_SEC;
+        let remaining_s = window_ts + WINDOW_SEC - now_s;
+        let strike_opt = { let s = strike.lock().unwrap(); if s.window_ts == window_ts { s.strike } else { None } };
+        let mut fair_up = 0.5;
+        if let Some(strk) = strike_opt {
+            let t_years = years_from_secs(remaining_s.max(0) as f64);
+            fair_up = fair_up_probability(spot, strk, vol.annualized_sigma(), t_years);
+        }
+
+        let liquidity_vacuum = velocity <= cfg.vacuum_velocity && obi_b <= cfg.vacuum_obi;
+        let blocked = remaining_s <= cfg.end_window_block_secs;
+
+        // FSM : real_up = fair_up → gap nul, mais gap_min=0 ⇒ test neutralisé (jugé à l'exécuteur).
+        let input = TickInput { now_ms, decision, fair_up, real_up: fair_up, velocity, liquidity_vacuum, blocked };
+        match sniper.step(&input) {
+            Action::Fire { side, strength } => {
+                sender.send(WireSignal::Attack { side, size: strength_to_size(strength), price: fair_up as f32 }).await;
+            }
+            Action::Kill => sender.send(WireSignal::Kill).await,
+            Action::None => {}
+        }
+
+        // Dashboard radar (champs CEX uniquement).
+        let fsm = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
+        let lat_snap = lat.lock().unwrap().clone();
+        {
+            let mut d = dash.write().await;
+            d.binance_connected = spot > 0.0;
+            d.okx_connected = obi_o != 0.0 || { okx_book.lock().unwrap().mid_price().is_some() };
+            d.btc_spot = spot;
+            d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = decision.strength;
+            d.agreement = decision.fire; d.velocity = velocity;
+            d.fsm_state = fsm.into();
+            d.remaining_s = remaining_s;
+            d.fair_up = fair_up;
+            d.liquidity_vacuum = liquidity_vacuum;
+            d.cond_agreement = decision.fire;
+            d.cond_persist = sniper.is_armed();
+            d.cond_velocity = match decision.side {
+                Some(Side::Up) => velocity >= cfg.velocity_confirm,
+                Some(Side::Down) => velocity <= -cfg.velocity_confirm,
+                None => false,
+            };
+            d.cond_ready = !blocked && !liquidity_vacuum && !sniper.in_cooldown();
+            d.lat_binance_ms = lat_snap.binance_ms;
+            d.lat_okx_ms = lat_snap.okx_ms;
+        }
+
+        log_throttle += 1;
+        if log_throttle % 100 == 0 {
+            tracing::info!(obi_b = format!("{:+.2}", obi_b), obi_o = format!("{:+.2}", obi_o),
+                fair = format!("{:.3}", fair_up), fsm, "radar");
+        }
+    }
+}
+
+/// Met à jour le strike au rollover de fenêtre (kline 1m Binance).
+fn spawn_strike_task(strike: Arc<Mutex<StrikeState>>) {
+    tokio::spawn(async move {
+        let mut poll = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            poll.tick().await;
+            let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let window_ts = (now_s / WINDOW_SEC) * WINDOW_SEC;
+            let need = { let s = strike.lock().unwrap(); s.window_ts != window_ts || s.strike.is_none() };
+            if need {
+                if let Ok(px) = btc_price_at_window_open(window_ts).await {
+                    let mut s = strike.lock().unwrap();
+                    s.window_ts = window_ts; s.strike = Some(px);
+                    tracing::info!(window_ts, strike = px, "=== strike fenêtre (radar) ===");
+                }
+            }
+        }
+    });
+}
+
+/// Taille indicative (u8) dérivée de la force du signal ∈ [0,1] → 1..=255.
+/// L'exécuteur recalcule le sizing Kelly autoritaire ; ce champ n'est qu'un repère.
+fn strength_to_size(strength: f64) -> u8 {
+    (strength.abs() * 50.0).round().clamp(1.0, 255.0) as u8
+}

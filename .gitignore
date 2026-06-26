@@ -1,0 +1,16 @@
+# Rust
+/target
+
+# Secrets — NE JAMAIS committer
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# État runtime + logs paper (state/log JSON : règle de sécurité — jamais commités)
+/data/*
+!/data/.gitkeep
+
+# OS
+.DS_Store
