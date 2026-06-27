@@ -72,6 +72,8 @@ pub struct DashState {
     pub initial_capital: f64,
     pub max_drawdown: f64,
     pub live_bankroll: Option<f64>, // vraie collatéral USDC (CLOB) — None si pas encore lue
+    pub live_pnl: Option<f64>,      // PnL réalisé live (Δ bankroll depuis activation) — None hors live
+    pub live_shots: u64,            // ordres live acceptés cette session
 }
 
 pub type Shared = Arc<RwLock<DashState>>;

@@ -87,6 +87,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
     let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
+    let mut live_pnl = bankroll::LivePnl::default();     // PnL réalisé live (Δ bankroll)
+    let mut was_live = false;                            // détection de transition paper→live
+    let mut live_shots: u64 = 0;                         // ordres live acceptés cette session
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -124,6 +127,14 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
         }
 
+        // PnL live = Δ bankroll réelle depuis l'activation du live ; référence reposée à la bascule.
+        let is_live = controls.live_active();
+        if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
+        was_live = is_live;
+        let live_pnl_val = if is_live {
+            live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
+        } else { None };
+
         // 2. Drain des signaux UDP reçus du radar.
         while let Ok(sig) = rx.try_recv() {
             match sig {
@@ -131,13 +142,29 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 WireSignal::Attack { side, price, .. } => {
                     let fair = price as f64;
                     last_fair = fair;
-                    let blocked = market.is_none() || remaining_s <= cfg.end_window_block_secs;
-                    let cooling = now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms;
-                    let gap_ok = match side {
-                        Side::Up => fair - real_up >= cfg.gap_min,
-                        Side::Down => real_up - fair >= cfg.gap_min,
+                    // gap = edge orienté selon le sens (toujours « fair en faveur du token visé »).
+                    let gap = match side {
+                        Side::Up => fair - real_up,
+                        Side::Down => real_up - fair,
                     };
-                    if controls.is_breaker_tripped() || blocked || cooling || !gap_ok {
+                    // Raison de rejet unique (loggée) — sinon `None` = on tente l'exécution.
+                    let reject = if controls.is_breaker_tripped() {
+                        Some("breaker déclenché")
+                    } else if market.is_none() {
+                        Some("pas de marché")
+                    } else if remaining_s <= cfg.end_window_block_secs {
+                        Some("fin de fenêtre")
+                    } else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms {
+                        Some("cooldown")
+                    } else if gap < cfg.gap_min {
+                        Some("gap insuffisant")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reject {
+                        tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
+                            real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
+                            gap_min = cfg.gap_min, "✗ signal rejeté");
                         continue;
                     }
                     if let Some(m) = &market {
@@ -146,21 +173,36 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         } else {
                             (&down_book, &m.down_token_id)
                         };
-                        let edge = (fair - real_up).abs();
+                        let edge = gap; // gap ≥ gap_min > 0 ici
                         // Aiguillage live → paper.
-                        if controls.live_active() {
+                        if is_live {
                             // Sizing sur la VRAIE collatéral CLOB. Tant qu'elle n'est pas lue, on
                             // s'abstient (jamais sizer un ordre réel sur le cash paper fictif).
-                            let real_bk = *live_bankroll.lock().unwrap();
-                            match real_bk {
+                            match *live_bankroll.lock().unwrap() {
                                 None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
                                 Some(bk) => {
                                     let order_price = book.best_ask().unwrap_or(real_up);
                                     let size_k = paper.kelly_size_for(edge, order_price, bk);
-                                    if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
-                                        let args = OrderArgs { side, price: order_price, size };
-                                        let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await;
-                                        last_fire_ms = now_ms;
+                                    match bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                        None => tracing::info!(reason = "taille sous le minimum",
+                                            kelly = format!("{size_k:.1}"), min = m.min_order_size,
+                                            "✗ ordre live ignoré"),
+                                        Some(size) => {
+                                            let args = OrderArgs { side, price: order_price, size };
+                                            match live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await {
+                                                Ok(live_executor::PlaceResult::Placed(id)) => {
+                                                    live_shots += 1;
+                                                    tracing::warn!(side = side.as_str(), order_id = %id,
+                                                        price = format!("{order_price:.3}"), size,
+                                                        "✅ ORDRE LIVE accepté");
+                                                }
+                                                Ok(live_executor::PlaceResult::DryRun) => tracing::warn!(
+                                                    side = side.as_str(), price = format!("{order_price:.3}"), size,
+                                                    "🔸 ordre live signé mais NON envoyé (LIVE_ARMED=false)"),
+                                                Err(e) => tracing::error!(error = %e, "❌ ordre live échoué"),
+                                            }
+                                            last_fire_ms = now_ms;
+                                        }
                                     }
                                 }
                             }
@@ -200,6 +242,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.max_drawdown = cfg.max_drawdown;
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
             d.live_bankroll = *live_bankroll.lock().unwrap();
+            d.live_pnl = live_pnl_val;
+            d.live_shots = live_shots;
         }
 
         log_throttle += 1;

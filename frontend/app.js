@@ -88,6 +88,11 @@ async function refresh() {
           ? `<span class="ok">${fmt(s.live_bankroll, 2)} USDC</span>`
           : '<span class="ko">— (non lue)</span>';
         $("ctl_paper_bk").innerHTML = `<span class="muted">${fmt(s.equity, 2)} $ fictif</span>`;
+        const isLive = mode === "LIVE";
+        $("ctl_live_pnl").innerHTML = (isLive && s.live_pnl != null)
+          ? `<span class="${s.live_pnl >= 0 ? "pos" : "neg"}">${s.live_pnl >= 0 ? "+" : ""}${fmt(s.live_pnl, 2)} USDC</span>`
+          : '<span class="muted">— (live off)</span>';
+        $("ctl_live_shots").textContent = isLive ? (s.live_shots ?? 0) : "—";
         $("ctl_armed").innerHTML = s.live_armed ? '<span class="ko">ARMÉ ⚠</span>' : '<span class="ok">non (sûr)</span>';
         const ddv = s.initial_capital != null ? (s.initial_capital - (s.equity ?? s.initial_capital)) : null;
         $("ctl_dd").textContent = ddv != null ? `${fmt(ddv, 2)} / ${fmt(s.max_drawdown, 0)} $` : "—";
@@ -115,10 +120,13 @@ async function refresh() {
         $("shots").textContent = `${s.shots ?? 0} (${s.wins ?? 0}/${s.losses ?? 0})`;
         $("hr").textContent = ((s.hit_rate ?? 0) * 100).toFixed(1) + "%";
         
-        // Giant PNL
+        // Giant PNL — en LIVE, le PnL réel (Δ bankroll) ; sinon le PnL paper.
+        const liveActive = mode === "LIVE" && s.live_pnl != null;
+        const pnlVal = liveActive ? s.live_pnl : s.realized_pnl;
+        $("pnl-label").textContent = liveActive ? "REALIZED PNL — LIVE (réel, USDC)" : "REALIZED PNL — PAPER (USDC)";
         const giantPnl = $("giant-pnl");
-        giantPnl.textContent = fmt(s.realized_pnl, 2);
-        giantPnl.className = "giant-pnl " + (s.realized_pnl > 0 ? "pos" : (s.realized_pnl < 0 ? "neg" : ""));
+        giantPnl.textContent = (pnlVal >= 0 ? "+" : "") + fmt(pnlVal, 2);
+        giantPnl.className = "giant-pnl " + (pnlVal > 0 ? "pos" : (pnlVal < 0 ? "neg" : ""));
     }
 
     // Latences TCP — max affiché = 500 ms (Binance dépasse souvent, on sature la barre)

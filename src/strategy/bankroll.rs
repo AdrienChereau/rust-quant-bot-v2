@@ -227,6 +227,27 @@ impl LiveDrawdown {
     }
 }
 
+/// PnL réalisé **live** = variation de la vraie bankroll CLOB depuis l'activation du mode live.
+/// C'est l'argent réel (fills + frais + résolutions), pas une reconstruction depuis les ordres.
+/// La référence est posée à la 1re lecture après passage en live ; `reset()` à chaque (ré)activation.
+#[derive(Default)]
+pub struct LivePnl {
+    baseline: Option<f64>,
+}
+
+impl LivePnl {
+    /// Repose la référence (à l'activation du live) — le PnL repart de 0.
+    pub fn reset(&mut self) {
+        self.baseline = None;
+    }
+
+    /// Met à jour avec la bankroll réelle courante ; renvoie le PnL réalisé live (courante − référence).
+    pub fn update(&mut self, current_bankroll: f64) -> f64 {
+        let base = *self.baseline.get_or_insert(current_bankroll);
+        current_bankroll - base
+    }
+}
+
 /// Ajuste la taille Kelly au minimum Polymarket.
 /// - taille ≥ `min_tokens` → inchangée ;
 /// - `min_tokens/2 ≤ taille < min_tokens` → arrondie au minimum (signal correct) ;
@@ -323,6 +344,16 @@ mod tests {
         assert!(!dd.breached(20.00, 5.0)); // pic monte à 20.00
         assert!(!dd.breached(16.00, 5.0)); // -4.00 depuis le pic → ok
         assert!(dd.breached(15.00, 5.0));  // -5.00 depuis le pic → coupe
+    }
+
+    #[test]
+    fn live_pnl_is_delta_from_baseline() {
+        let mut p = LivePnl::default();
+        assert_eq!(p.update(18.44), 0.0);                 // référence posée
+        assert!((p.update(20.44) - 2.0).abs() < 1e-9);    // +2.00
+        assert!((p.update(17.44) + 1.0).abs() < 1e-9);    // -1.00
+        p.reset();
+        assert_eq!(p.update(17.44), 0.0);                 // nouvelle référence
     }
 
     #[test]

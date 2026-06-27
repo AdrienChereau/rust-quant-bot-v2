@@ -160,6 +160,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
     let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
+    let mut live_pnl = bankroll::LivePnl::default();     // PnL réalisé live (Δ bankroll)
+    let mut was_live = false;                            // détection de transition paper→live
+    let mut live_shots: u64 = 0;                         // ordres live acceptés cette session
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -221,6 +224,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
         }
 
+        // PnL live = Δ bankroll réelle depuis l'activation du live ; référence reposée à la bascule.
+        let is_live = controls.live_active();
+        if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
+        was_live = is_live;
+        let live_pnl_val = if is_live {
+            live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
+        } else { None };
+
         // FSM sniper.
         let input = TickInput { now_ms, decision, fair_up, real_up, velocity, liquidity_vacuum, blocked };
         match sniper.step(&input) {
@@ -232,16 +243,30 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     // Aiguillage breaker → live → paper.
                     if controls.is_breaker_tripped() {
                         // exécution coupée
-                    } else if controls.live_active() {
+                    } else if is_live {
                         // Sizing sur la VRAIE collatéral CLOB (jamais le cash paper). Pas encore lue → abstention.
                         match *live_bankroll.lock().unwrap() {
                             None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
                             Some(bk) => {
                                 let price = book.best_ask().unwrap_or(real_up);
                                 let size_k = paper.kelly_size_for(gap.abs(), price, bk);
-                                if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
-                                    let args = OrderArgs { side, price, size };
-                                    let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await;
+                                match bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                    None => tracing::info!(reason = "taille sous le minimum",
+                                        kelly = format!("{size_k:.1}"), min = m.min_order_size, "✗ ordre live ignoré"),
+                                    Some(size) => {
+                                        let args = OrderArgs { side, price, size };
+                                        match live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await {
+                                            Ok(live_executor::PlaceResult::Placed(id)) => {
+                                                live_shots += 1;
+                                                tracing::warn!(side = side.as_str(), order_id = %id,
+                                                    price = format!("{price:.3}"), size, "✅ ORDRE LIVE accepté");
+                                            }
+                                            Ok(live_executor::PlaceResult::DryRun) => tracing::warn!(
+                                                side = side.as_str(), price = format!("{price:.3}"), size,
+                                                "🔸 ordre live signé mais NON envoyé (LIVE_ARMED=false)"),
+                                            Err(e) => tracing::error!(error = %e, "❌ ordre live échoué"),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -310,6 +335,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             d.initial_capital = cfg.start_cash;
             d.max_drawdown = cfg.max_drawdown;
             d.live_bankroll = *live_bankroll.lock().unwrap();
+            d.live_pnl = live_pnl_val;
+            d.live_shots = live_shots;
         }
 
         log_throttle += 1;
