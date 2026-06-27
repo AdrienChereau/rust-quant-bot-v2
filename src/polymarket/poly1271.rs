@@ -39,12 +39,14 @@ pub async fn place_order_poly1271(
     let client = authenticated_client(creds, &signer).await?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
 
-    // Lookup neg-risk (cache SDK) — requis pour le bon contrat V2 sur marchés sniper.
+    // Lookup neg-risk + tick size (cache SDK) — requis pour contrat V2 et arrondi prix.
     let neg = client.neg_risk(token).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::debug!(token_id, neg_risk = neg.neg_risk, "neg-risk résolu");
+    let tick = client.tick_size(token).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let price_dp = tick.minimum_tick_size.as_decimal().scale();
 
-    let price = decimal_from_f64(args.price, "price")?;
-    let size = decimal_from_f64(args.size, "size")?;
+    let price = decimal_from_f64(args.price, price_dp, "price")?;
+    let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
     let side = match args.side {
         BotSide::Up | BotSide::Down => Side::Buy,
     };
@@ -114,7 +116,12 @@ fn map_signature_type(sig_type: u8) -> SignatureType {
     }
 }
 
-fn decimal_from_f64(v: f64, field: &str) -> anyhow::Result<Decimal> {
-    Decimal::from_f64_retain(v)
-        .ok_or_else(|| anyhow::anyhow!("{field} invalide: {v}"))
+fn decimal_from_f64(v: f64, decimal_places: u32, field: &str) -> anyhow::Result<Decimal> {
+    if !v.is_finite() || v <= 0.0 {
+        anyhow::bail!("{field} invalide: {v}");
+    }
+    // Évite les artefacts f64 (0.01 → 28 décimales) — le SDK rejette vs tick size.
+    let d = Decimal::from_f64_retain(v)
+        .ok_or_else(|| anyhow::anyhow!("{field} invalide: {v}"))?;
+    Ok(d.round_dp(decimal_places))
 }
