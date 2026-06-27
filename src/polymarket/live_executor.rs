@@ -24,7 +24,6 @@ use crate::concurrency::bus::Side;
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — JAMAIS FOK.
-const SIG_TYPE_DEPOSIT_WALLET: u8 = 3; // sig_type 3 (deposit wallet) — à confirmer pour l'ordre.
 
 // EIP-712 domain Polymarket (Polygon, chainId 137). ⚠️ verifyingContract = CTF Exchange standard ;
 // DIFFÉRENT pour les marchés "neg-risk" (0xC5d563A36AE78145C45a50134d48A1215220f80a) — à confirmer.
@@ -42,10 +41,10 @@ pub struct LiveCredentials {
     pub api_key: String,
     pub api_secret: String, // base64 url-safe
     pub passphrase: String,
-    pub funder: String,         // adresse maker (deposit wallet) — utilisée dans l'ORDRE
-    pub signer_address: String, // adresse EOA (signataire) — utilisée dans l'AUTH L2 (POLY_ADDRESS)
-    pub private_key: String,    // EOA qui signe l'EIP-712
-    pub sig_type: u8,           // POLY_SIG_TYPE (défaut 3, deposit wallet)
+    pub funder: String,         // adresse maker (proxy ou EOA) — collatéral de trading
+    pub signer_address: String, // adresse EOA — auth L2 (POLY_ADDRESS) et signer EIP-712 si proxy
+    pub private_key: String,    // clé EOA qui signe l'EIP-712
+    pub sig_type: u8,           // POLY_SIG_TYPE : 0=EOA, 1=Magic proxy, 2=Gnosis Safe (3 non supporté)
 }
 
 impl LiveCredentials {
@@ -55,14 +54,18 @@ impl LiveCredentials {
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let funder = get("POLY_FUNDER_ADDRESS")?;
+        let mut private_key = get("POLY_PRIVATE_KEY")?;
+        if !private_key.starts_with("0x") && !private_key.starts_with("0X") {
+            private_key = format!("0x{private_key}");
+        }
         Some(Self {
             api_key: get("POLY_API_KEY")?,
             api_secret: get("POLY_API_SECRET")?,
             passphrase: get("POLY_PASSPHRASE")?,
             signer_address: get("POLY_SIGNER_ADDRESS").unwrap_or_else(|| funder.clone()),
             funder,
-            private_key: get("POLY_PRIVATE_KEY")?,
-            sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            private_key,
+            sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
         })
     }
 }
@@ -109,7 +112,13 @@ impl OrderFields {
         OrderFields {
             salt: rand_salt(),
             maker: creds.funder.clone(),
-            signer: creds.funder.clone(), // sig_type 3 : maker == signer
+            // sig_type 0 (EOA) : maker == signer == funder
+            // sig_type 1/2 (proxy) : maker = funder (proxy), signer = EOA
+            signer: if creds.sig_type == 0 {
+                creds.funder.clone()
+            } else {
+                creds.signer_address.clone()
+            },
             taker: "0x0000000000000000000000000000000000000000".into(),
             token_id: token_id.to_string(),
             maker_amount: usdc,
@@ -227,7 +236,7 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
     Ok(PlaceResult::Placed(id))
 }
 
-/// Lit la **vraie collatéral USDC** du deposit wallet via le CLOB (auth L2, `signature_type`).
+/// Lit la **vraie collatéral USDC** du compte via le CLOB (auth L2, `signature_type`).
 /// Read-only : sert de pré-flight d'auth (mêmes en-têtes que le POST d'ordre) ET de bankroll live.
 /// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=N`.
 pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f64> {
@@ -368,8 +377,24 @@ mod tests {
             signer_address: "0x0000000000000000000000000000000000000abc".into(),
             // clé de test connue (compte de dev Ethereum jamais utilisé en prod).
             private_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
-            sig_type: 3,
+            sig_type: 2,
         }
+    }
+
+    #[test]
+    fn order_signer_follows_sig_type() {
+        let mut c = creds();
+        c.sig_type = 0;
+        c.funder = "0x00000000000000000000000000000000000000f0".into();
+        c.signer_address = "0x00000000000000000000000000000000000000e0".into();
+        let f0 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0 }, &c);
+        assert_eq!(f0.maker, c.funder);
+        assert_eq!(f0.signer, c.funder); // EOA : signer == funder
+
+        c.sig_type = 2;
+        let f2 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0 }, &c);
+        assert_eq!(f2.maker, c.funder);
+        assert_eq!(f2.signer, c.signer_address); // proxy : signer = EOA
     }
 
     #[test]
@@ -385,7 +410,7 @@ mod tests {
         assert!(!json.contains("FOK"));
         assert_eq!(req.order.maker_amount, "5000000"); // 0.50*10*1e6
         assert_eq!(req.order.taker_amount, "10000000");
-        assert_eq!(req.order.signature_type, 3);
+        assert_eq!(req.order.signature_type, 2);
     }
 
     #[test]
@@ -401,7 +426,7 @@ mod tests {
     #[test]
     fn l2_get_includes_query_in_path() {
         let c = creds();
-        let path = "/balance-allowance?asset_type=COLLATERAL&signature_type=3";
+        let path = "/balance-allowance?asset_type=COLLATERAL&signature_type=2";
         let sig = l2_signature(&c.api_secret, "1700000000", "GET", path, "").unwrap();
         assert_ne!(
             sig,

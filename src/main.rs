@@ -67,7 +67,9 @@ enum Mode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // .env puis .env.local (local écrase) — sur AWS, un seul `.env` suffit.
     dotenvy::dotenv().ok();
+    dotenvy::from_filename_override(".env.local").ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();

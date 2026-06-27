@@ -120,8 +120,8 @@ cargo build --release --features live
 Le dashboard (et ses endpoints POST `/live/enable`…) écoute sur `0.0.0.0`. **Le binder sur
 localhost/Tailscale ou le protéger** avant `LIVE_ARMED=true` — sinon n'importe qui sur le réseau
 peut basculer les modes. Confirmer aussi l'`EXCHANGE_CTF` (neg-risk = adresse différente) et le
-`signatureType` (3) pour ton compte.
+`POLY_SIG_TYPE` (0 ou 2) pour ton compte MetaMask.
 
 ### Credentials
-`POLY_API_KEY/SECRET/PASSPHRASE/FUNDER_ADDRESS/PRIVATE_KEY` générés EN AMONT (flow L1 hors bot),
-dans `.env` (jamais commité). Voir `.env.example`.
+`POLY_*` générés via `scripts/derive_poly_creds.py` (flow L1 hors bot), dans `.env` sur AWS
+(jamais commité). Voir `.env.example` et `docs/METAMASK-SETUP.md`.

@@ -8,6 +8,9 @@
 *.pem
 *.key
 
+# Python (scripts/derive_poly_creds.py)
+.venv/
+
 # État runtime + logs paper (state/log JSON : règle de sécurité — jamais commités)
 /data/*
 !/data/.gitkeep
