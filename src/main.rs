@@ -28,11 +28,11 @@ use clap::{Parser, Subcommand};
 use binance::local_book::OrderBookL2;
 use binance::math_engine::VelocityTracker;
 use config::Config;
-use polymarket::relayer::{btc_price_at_window_open, Market, PolyBook, PolymarketClient};
 use pricing::black_scholes::{fair_up_probability, years_from_secs};
 use pricing::volatility::VolatilityTracker;
 use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials, OrderArgs};
+use polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use signal::consolidated_obi::ConsolidatedObi;
 use state::RuntimeControls;
 use strategy::bankroll::{self, KellyParams, PaperEngine};
@@ -89,16 +89,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[derive(Default)]
-struct PmShared {
-    market: Option<Market>,
-    strike: Option<f64>,
-    real_up: f64,
-    up_book: PolyBook,
-    down_book: PolyBook,
-    remaining_s: i64,
-}
-
 /// Mode mono-processus historique : radar + exécuteur dans la même boucle 50 ms.
 async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(dry_run = cfg.dry_run, "🎯 rust-quant-bot (sniper, mono) démarré");
@@ -107,7 +97,10 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let controls = Arc::new(RuntimeControls::new());
     let live_creds = LiveCredentials::from_env();
     if let Some(ref c) = live_creds {
-        live_executor::startup_poly(c).await;
+        if let Err(e) = live_executor::startup_poly(c).await {
+            tracing::error!(error = %e, "🛑 startup Polymarket échoué — arrêt");
+            return Err(e);
+        }
     }
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
@@ -146,9 +139,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     tokio::spawn(binance::websocket::run(cfg.binance_ws_url.clone(), binance_book.clone()));
     tokio::spawn(okx::websocket::run(cfg.okx_ws_url.clone(), okx_book.clone()));
 
-    // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop).
+    // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop). `true` = on a besoin du strike.
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_task(pm.clone());
+    spawn_pm_poller(pm.clone(), true);
 
     // Moteurs.
     let consolidated = ConsolidatedObi::new(cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
@@ -166,8 +159,16 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // ── HOT LOOP : 50 ms (20 Hz) ── (lectures de carnets = locks brefs, aucun await réseau)
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
+    let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // Arrêt propre : l'état paper est déjà persisté à chaque clôture de position.
+                tracing::info!("SIGINT reçu — arrêt propre (mono)");
+                break Ok(());
+            }
+            _ = tick.tick() => {}
+        }
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
         let n = cfg.obi_top_n;
@@ -205,14 +206,19 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
 
-        // Circuit breaker (drawdown sur l'equity) — déclenché une fois, coupe toute exécution.
-        let equity_now = paper.equity(mark_bid);
-        if !controls.is_breaker_tripped()
-            && bankroll::check_drawdown_breaker(equity_now, cfg.start_cash, cfg.max_drawdown)
-            && controls.trip_breaker()
-        {
-            tracing::error!(equity = format!("{:.2}", equity_now), capital = cfg.start_cash,
-                max_dd = cfg.max_drawdown, "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+        // Circuit breaker (drawdown) — déclenché une fois, coupe toute exécution.
+        // LIVE : drawdown sur la VRAIE bankroll CLOB ; PAPER : equity fictive vs START_CASH.
+        let breaker_hit = if controls.live_active() {
+            match *live_bankroll.lock().unwrap() {
+                Some(real) => live_dd.breached(real, cfg.max_drawdown),
+                None => false, // bankroll réelle pas encore lue
+            }
+        } else {
+            bankroll::check_drawdown_breaker(paper.equity(mark_bid), cfg.start_cash, cfg.max_drawdown)
+        };
+        if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
+            tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
+                "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
         }
 
         // FSM sniper.
@@ -235,7 +241,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                                 let size_k = paper.kelly_size_for(gap.abs(), price, bk);
                                 if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
                                     let args = OrderArgs { side, price, size };
-                                    let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                                    let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await;
                                 }
                             }
                         }
@@ -313,36 +319,4 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 gap = format!("{:+.3}", gap), fsm, shots = paper.state.shots, "radar");
         }
     }
-}
-
-/// Tâche Polymarket : (re)résout le marché 5 min, capture le strike, polle les carnets Up/Down.
-fn spawn_pm_task(pm: Arc<Mutex<PmShared>>) {
-    tokio::spawn(async move {
-        let client = PolymarketClient::new();
-        let mut poll = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            poll.tick().await;
-            let need = { let g = pm.lock().unwrap(); g.market.as_ref().map_or(true, |m| m.time_remaining_sec() <= 0) };
-            if need {
-                if let Ok(Some(m)) = client.get_current_btc_5m_market().await {
-                    let strike = btc_price_at_window_open(m.window_ts).await.ok();
-                    tracing::info!(slug = %m.slug, strike = ?strike, neg_risk = m.neg_risk, "=== nouveau marché ===");
-                    let mut g = pm.lock().unwrap();
-                    g.market = Some(m); g.strike = strike;
-                }
-            }
-            let (up_tok, dn_tok, win) = { let g = pm.lock().unwrap();
-                match &g.market { Some(m) => (m.up_token_id.clone(), m.down_token_id.clone(), m.window_ts), None => continue } };
-            // Retry strike si manquant.
-            if pm.lock().unwrap().strike.is_none() {
-                if let Ok(s) = btc_price_at_window_open(win).await { pm.lock().unwrap().strike = Some(s); }
-            }
-            let up = client.get_book(&up_tok).await.ok();
-            let dn = client.get_book(&dn_tok).await.ok();
-            let mut g = pm.lock().unwrap();
-            if let Some(up) = up { g.real_up = up.mid().unwrap_or(g.real_up); g.up_book = up; }
-            if let Some(dn) = dn { g.down_book = dn; }
-            g.remaining_s = g.market.as_ref().map(|m| m.time_remaining_sec()).unwrap_or(0);
-        }
-    });
 }

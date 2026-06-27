@@ -20,6 +20,9 @@ pub enum PolyCmd {
         price: f64,
         #[arg(long, default_value = "1")]
         size: f64,
+        /// Marché neg-risk → contrat de vérification EIP-712 différent (sig_type 0/1/2).
+        #[arg(long, default_value = "false")]
+        neg_risk: bool,
     },
 }
 
@@ -27,18 +30,18 @@ pub async fn run(cmd: PolyCmd, _cfg: Config) -> anyhow::Result<()> {
     match cmd {
         PolyCmd::Verify => verify().await,
         PolyCmd::DeriveCreds => derive_creds().await,
-        PolyCmd::DryOrder { token_id, price, size } => {
-            dry_order(&token_id, price, size).await
+        PolyCmd::DryOrder { token_id, price, size, neg_risk } => {
+            dry_order(&token_id, price, size, neg_risk).await
         }
     }
 }
 
 async fn verify() -> anyhow::Result<()> {
     let creds = LiveCredentials::from_env()
-        .ok_or_else(|| anyhow::anyhow!("credentials POLY_* incomplètes dans .env"))?;
-    live_executor::startup_poly(&creds).await;
+        .ok_or_else(|| anyhow::anyhow!("identifiants POLY_* incomplets dans .env"))?;
+    live_executor::startup_poly(&creds).await?;
     let usdc = live_executor::get_collateral_balance(&creds).await?;
-    println!("OK — balance CLOB : {usdc:.2} USDC");
+    println!("OK — solde CLOB : {usdc:.2} USDC");
     Ok(())
 }
 
@@ -62,11 +65,11 @@ async fn derive_creds() -> anyhow::Result<()> {
     }
 }
 
-async fn dry_order(token_id: &str, price: f64, size: f64) -> anyhow::Result<()> {
+async fn dry_order(token_id: &str, price: f64, size: f64, neg_risk: bool) -> anyhow::Result<()> {
     let creds = LiveCredentials::from_env()
-        .ok_or_else(|| anyhow::anyhow!("credentials POLY_* incomplètes"))?;
+        .ok_or_else(|| anyhow::anyhow!("identifiants POLY_* incomplets"))?;
     let args = OrderArgs { side: Side::Up, price, size };
-    let result = live_executor::place_order(false, Some(&creds), token_id, args).await?;
+    let result = live_executor::place_order(false, Some(&creds), token_id, neg_risk, args).await?;
     match result {
         live_executor::PlaceResult::DryRun => println!("Dry-run OK — ordre signé, non POSTé"),
         live_executor::PlaceResult::Placed(id) => println!("Ordre accepté : {id}"),

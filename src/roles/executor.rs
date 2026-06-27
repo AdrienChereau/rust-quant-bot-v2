@@ -18,18 +18,9 @@ use crate::dashboard;
 use crate::net::udp;
 use crate::net::wire::WireSignal;
 use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs};
-use crate::polymarket::relayer::{Market, PolyBook, PolymarketClient};
+use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
-
-#[derive(Default)]
-struct PmShared {
-    market: Option<Market>,
-    real_up: f64,
-    up_book: PolyBook,
-    down_book: PolyBook,
-    remaining_s: i64,
-}
 
 pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     tracing::info!(listen_port, dry_run = cfg.dry_run, "🎯 EXÉCUTEUR (Dublin) démarré");
@@ -37,7 +28,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let controls = Arc::new(RuntimeControls::new());
     let live_creds = LiveCredentials::from_env();
     if let Some(ref c) = live_creds {
-        live_executor::startup_poly(c).await;
+        if let Err(e) = live_executor::startup_poly(c).await {
+            tracing::error!(error = %e, "🛑 startup Polymarket échoué — arrêt");
+            return Err(e);
+        }
     }
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
@@ -66,8 +60,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
     }
 
+    // `false` = l'exécuteur n'a pas besoin du strike (le fair arrive dans le paquet radar).
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_task(pm.clone());
+    spawn_pm_poller(pm.clone(), false);
 
     let lat = crate::latency::shared();
     {
@@ -91,8 +86,16 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut last_fair: f64 = 0.5; // dernier fair reçu (affichage gap)
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
+    let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // Arrêt propre : l'état paper est déjà persisté à chaque clôture de position.
+                tracing::info!("SIGINT reçu — arrêt propre (exécuteur)");
+                break Ok(());
+            }
+            _ = tick.tick() => {}
+        }
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
         let (market, real_up, up_book, down_book, remaining_s) = {
@@ -107,14 +110,18 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
 
-        // Circuit breaker (drawdown equity).
-        let equity_now = paper.equity(mark_bid);
-        if !controls.is_breaker_tripped()
-            && bankroll::check_drawdown_breaker(equity_now, cfg.start_cash, cfg.max_drawdown)
-            && controls.trip_breaker()
-        {
-            tracing::error!(equity = format!("{:.2}", equity_now), capital = cfg.start_cash,
-                max_dd = cfg.max_drawdown, "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+        // Circuit breaker (drawdown) — LIVE : vraie bankroll CLOB ; PAPER : equity fictive.
+        let breaker_hit = if controls.live_active() {
+            match *live_bankroll.lock().unwrap() {
+                Some(real) => live_dd.breached(real, cfg.max_drawdown),
+                None => false, // bankroll réelle pas encore lue
+            }
+        } else {
+            bankroll::check_drawdown_breaker(paper.equity(mark_bid), cfg.start_cash, cfg.max_drawdown)
+        };
+        if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
+            tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
+                "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
         }
 
         // 2. Drain des signaux UDP reçus du radar.
@@ -152,7 +159,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                     let size_k = paper.kelly_size_for(edge, order_price, bk);
                                     if let Some(size) = bankroll::adjust_size_to_min(size_k, m.min_order_size) {
                                         let args = OrderArgs { side, price: order_price, size };
-                                        let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, args).await;
+                                        let _ = live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await;
                                         last_fire_ms = now_ms;
                                     }
                                 }
@@ -201,31 +208,4 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 cash = format!("{:.2}", paper.state.cash), "executor");
         }
     }
-}
-
-/// Tâche Polymarket : (re)résout le marché 5 min et polle les carnets Up/Down (1 s).
-/// L'exécuteur n'a pas besoin du strike (le `fair_up` arrive dans le paquet radar).
-fn spawn_pm_task(pm: Arc<Mutex<PmShared>>) {
-    tokio::spawn(async move {
-        let client = PolymarketClient::new();
-        let mut poll = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            poll.tick().await;
-            let need = { let g = pm.lock().unwrap(); g.market.as_ref().map_or(true, |m| m.time_remaining_sec() <= 0) };
-            if need {
-                if let Ok(Some(m)) = client.get_current_btc_5m_market().await {
-                    tracing::info!(slug = %m.slug, "=== nouveau marché (exécuteur) ===");
-                    pm.lock().unwrap().market = Some(m);
-                }
-            }
-            let (up_tok, dn_tok) = { let g = pm.lock().unwrap();
-                match &g.market { Some(m) => (m.up_token_id.clone(), m.down_token_id.clone()), None => continue } };
-            let up = client.get_book(&up_tok).await.ok();
-            let dn = client.get_book(&dn_tok).await.ok();
-            let mut g = pm.lock().unwrap();
-            if let Some(up) = up { g.real_up = up.mid().unwrap_or(g.real_up); g.up_book = up; }
-            if let Some(dn) = dn { g.down_book = dn; }
-            g.remaining_s = g.market.as_ref().map(|m| m.time_remaining_sec()).unwrap_or(0);
-        }
-    });
 }

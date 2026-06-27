@@ -1,6 +1,9 @@
 const $ = (id) => document.getElementById(id);
 function fmt(n, d = 2) { return (n == null || Number.isNaN(n)) ? "—" : Number(n).toFixed(d); }
 
+// Mode courant (dernier /state) — pilote la bascule PAPER ⇄ LIVE.
+let currentMode = "PAPER";
+
 // Endpoint de contrôle (POST) → feedback immédiat via le mode renvoyé, puis refresh complet.
 async function ctl(path) {
   try {
@@ -10,6 +13,27 @@ async function ctl(path) {
   refresh();
 }
 window.ctl = ctl;
+
+// Interrupteur unique : si on est en LIVE → repasse en PAPER, sinon → passe en LIVE.
+function toggleMode() {
+  const goingLive = (currentMode !== "LIVE");
+  if (goingLive && !confirm("Passer en LIVE ? Le sizing utilisera la bankroll réelle (CLOB).")) return;
+  ctl(goingLive ? "/mode/live" : "/mode/paper");
+}
+window.toggleMode = toggleMode;
+
+// Met à jour le libellé/style du bouton bascule selon le mode courant.
+function renderToggle(mode) {
+  const btn = $("mode-toggle");
+  if (!btn) return;
+  if (mode === "LIVE") {
+    btn.textContent = "↩ Revenir en PAPER";
+    btn.className = "mode-toggle live";
+  } else {
+    btn.textContent = "▶ Passer en LIVE";
+    btn.className = "mode-toggle paper";
+  }
+}
 
 function signed(el, n, d = 2) { el.textContent = fmt(n, d); el.classList.toggle("pos", n > 0); el.classList.toggle("neg", n < 0); }
 function obi(el, v) { el.textContent = (v >= 0 ? "+" : "") + fmt(v, 3); el.classList.toggle("pos", v > 0); el.classList.toggle("neg", v < 0); }
@@ -56,11 +80,14 @@ async function refresh() {
     if (isKiller) {
         // Contrôle d'exécution + circuit breaker
         const mode = s.mode || "—";
+        currentMode = mode;
         const mb = $("mode"); mb.textContent = mode; mb.className = "badge mode " + mode.toLowerCase();
         $("ctl_mode").textContent = mode;
+        renderToggle(mode);
         $("ctl_bankroll").innerHTML = s.live_bankroll != null
           ? `<span class="ok">${fmt(s.live_bankroll, 2)} USDC</span>`
           : '<span class="ko">— (non lue)</span>';
+        $("ctl_paper_bk").innerHTML = `<span class="muted">${fmt(s.equity, 2)} $ fictif</span>`;
         $("ctl_armed").innerHTML = s.live_armed ? '<span class="ko">ARMÉ ⚠</span>' : '<span class="ok">non (sûr)</span>';
         const ddv = s.initial_capital != null ? (s.initial_capital - (s.equity ?? s.initial_capital)) : null;
         $("ctl_dd").textContent = ddv != null ? `${fmt(ddv, 2)} / ${fmt(s.max_drawdown, 0)} $` : "—";

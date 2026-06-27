@@ -118,23 +118,25 @@ pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> 
 }
 
 /// Applique un endpoint de contrôle. Renvoie `true` si l'action est reconnue.
-/// ⚠️ Ces endpoints ne déclenchent JAMAIS d'envoi réel : le verrou `LIVE_ARMED` (env) reste requis
-/// dans la boucle de trading. `live/enable` ne fait que *sélectionner* le mode (toujours dry-run
-/// tant que la signature n'est pas vérifiée).
+/// ⚠️ Passer en LIVE ne déclenche PAS l'envoi réel : le verrou `LIVE_ARMED` (env) reste requis
+/// dans la boucle de trading (sinon dry-run). Modèle simplifié = un seul interrupteur PAPER ⇄ LIVE.
 fn handle_control(path: &str, c: &RuntimeControls) -> bool {
     match path {
-        "/paper/pause" => { c.paper_paused.store(true, Ordering::Relaxed); true }
-        "/paper/play"  => { c.paper_paused.store(false, Ordering::Relaxed); true }
-        "/live/enable" => { c.live_enabled.store(true, Ordering::Relaxed); true }
-        "/live/disable" => {
+        // PAPER : sizing sur le cash fictif, aucun ordre réel.
+        "/mode/paper" => {
             c.live_enabled.store(false, Ordering::Relaxed);
-            c.live_paused.store(true, Ordering::Relaxed); // sécurité : on repasse en pause
+            c.live_paused.store(true, Ordering::Relaxed);
+            c.paper_paused.store(false, Ordering::Relaxed);
             true
         }
-        "/live/pause"  => { c.live_paused.store(true, Ordering::Relaxed); true }
-        "/live/resume" => { c.live_paused.store(false, Ordering::Relaxed); true }
+        // LIVE : sizing sur la vraie collatéral CLOB (le paper ne tire plus, cf. hot-loop).
+        "/mode/live" => {
+            c.live_enabled.store(true, Ordering::Relaxed);
+            c.live_paused.store(false, Ordering::Relaxed);
+            true
+        }
+        // Réarme après un déclenchement du circuit breaker (drawdown).
         "/breaker/reset" => { c.breaker_tripped.store(false, Ordering::Relaxed); true }
-        "/breaker/trip"  => { c.breaker_tripped.store(true, Ordering::Relaxed); true } // test manuel
         _ => false,
     }
 }

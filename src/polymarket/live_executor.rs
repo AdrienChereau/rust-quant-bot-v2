@@ -25,10 +25,16 @@ use crate::concurrency::bus::Side;
 pub(crate) const CLOB_BASE: &str = "https://clob.polymarket.com";
 const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — JAMAIS FOK.
 
-// EIP-712 domain Polymarket (Polygon, chainId 137). ⚠️ verifyingContract = CTF Exchange standard ;
-// DIFFÉRENT pour les marchés "neg-risk" (0xC5d563A36AE78145C45a50134d48A1215220f80a) — à confirmer.
+// EIP-712 domain Polymarket (Polygon, chainId 137). verifyingContract dépend du type de marché :
+// CTF Exchange standard vs. NegRisk CTF Exchange. Le mauvais contrat → signature invalide (rejet).
 const EXCHANGE_CTF: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const EXCHANGE_CTF_NEG: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
 const CHAIN_ID: u64 = 137;
+
+/// Adresse du contrat de vérification EIP-712 selon le type de marché.
+fn exchange_for(neg_risk: bool) -> &'static str {
+    if neg_risk { EXCHANGE_CTF_NEG } else { EXCHANGE_CTF }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -254,6 +260,7 @@ pub async fn place_order(
     live_armed: bool,
     creds: Option<&LiveCredentials>,
     token_id: &str,
+    neg_risk: bool,
     args: OrderArgs,
 ) -> anyhow::Result<PlaceResult> {
     let Some(creds) = creds else {
@@ -262,6 +269,7 @@ pub async fn place_order(
     };
 
     if creds.sig_type == 3 {
+        // POLY_1271 : le SDK V2 résout neg-risk en interne (cf. poly1271.rs).
         #[cfg(feature = "live")]
         return crate::polymarket::poly1271::place_order_poly1271(live_armed, creds, token_id, args).await;
         #[cfg(not(feature = "live"))]
@@ -269,7 +277,7 @@ pub async fn place_order(
     }
 
     let fields = OrderFields::build(token_id, args, creds);
-    let signature = sign_order_eip712(&fields, &creds.private_key)?;
+    let signature = sign_order_eip712(&fields, neg_risk, &creds.private_key)?;
     let req = PlaceRequest {
         order: OrderJson::from_fields(&fields, signature),
         owner: creds.api_key.clone(),
@@ -357,13 +365,15 @@ pub async fn sync_balance_allowance(creds: &LiveCredentials) -> anyhow::Result<(
 }
 
 /// Appelé au démarrage mono/executor : vérifie creds + sync cache si deposit wallet.
-pub async fn startup_poly(creds: &LiveCredentials) {
+/// Propage l'échec de la sync (deposit wallet sig_type=3) pour que l'appelant décide d'arrêter
+/// plutôt que de trader avec un cache de balance potentiellement périmé.
+pub async fn startup_poly(creds: &LiveCredentials) -> anyhow::Result<()> {
     creds.log_config_check();
     if creds.sig_type == 3 {
-        if let Err(e) = sync_balance_allowance(creds).await {
-            tracing::warn!(error = %e, "sync balance-allowance échouée (deposit wallet)");
-        }
+        sync_balance_allowance(creds).await
+            .map_err(|e| anyhow::anyhow!("sync balance-allowance échouée (deposit wallet): {e}"))?;
     }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -371,7 +381,7 @@ pub async fn startup_poly(creds: &LiveCredentials) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "live")]
-fn sign_order_eip712(f: &OrderFields, private_key: &str) -> anyhow::Result<String> {
+fn sign_order_eip712(f: &OrderFields, neg_risk: bool, private_key: &str) -> anyhow::Result<String> {
     use alloy::primitives::{Address, U256};
     use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
@@ -414,7 +424,7 @@ fn sign_order_eip712(f: &OrderFields, private_key: &str) -> anyhow::Result<Strin
         name: "Polymarket CTF Exchange",
         version: "1",
         chain_id: CHAIN_ID,
-        verifying_contract: parse_addr(EXCHANGE_CTF)?,
+        verifying_contract: parse_addr(exchange_for(neg_risk))?,
     };
     let hash = order.eip712_signing_hash(&domain);
 
@@ -424,7 +434,7 @@ fn sign_order_eip712(f: &OrderFields, private_key: &str) -> anyhow::Result<Strin
 }
 
 #[cfg(not(feature = "live"))]
-fn sign_order_eip712(_f: &OrderFields, _private_key: &str) -> anyhow::Result<String> {
+fn sign_order_eip712(_f: &OrderFields, _neg_risk: bool, _private_key: &str) -> anyhow::Result<String> {
     anyhow::bail!("signature EIP-712 non compilée — rebuild avec `--features live`")
 }
 
@@ -460,11 +470,10 @@ fn l2_signature(secret_b64: &str, ts: &str, method: &str, path: &str, body: &str
     Ok(base64::engine::general_purpose::URL_SAFE.encode(mac.finalize().into_bytes()))
 }
 
-/// Salt pseudo-aléatoire.
+/// Salt aléatoire (CSPRNG) — nonce unique par ordre, sans dépendre de la résolution d'horloge.
 fn rand_salt() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    nanos ^ (nanos.rotate_left(17).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    use rand::RngCore as _;
+    rand::thread_rng().next_u64()
 }
 
 #[cfg(test)]
@@ -547,7 +556,7 @@ mod tests {
     #[test]
     fn sign_refuses_without_feature() {
         let f = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 5.0 }, &creds());
-        assert!(sign_order_eip712(&f, &creds().private_key).is_err());
+        assert!(sign_order_eip712(&f, false, &creds().private_key).is_err());
     }
 
     // Sous `--features live` : la signature doit être un secp256k1 valide récupérable vers le signer
@@ -562,7 +571,7 @@ mod tests {
 
         let c = creds();
         let f = OrderFields::build("12345", OrderArgs { side: Side::Up, price: 0.5, size: 5.0 }, &c);
-        let sig_hex = sign_order_eip712(&f, &c.private_key).unwrap();
+        let sig_hex = sign_order_eip712(&f, false, &c.private_key).unwrap();
         assert!(sig_hex.starts_with("0x") && sig_hex.len() == 132); // 65 octets
 
         // Reconstruit le hash et vérifie la récupération d'adresse.

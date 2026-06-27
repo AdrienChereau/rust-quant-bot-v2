@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Engineering Team <quant@internal.com>"]
 
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,6 +24,7 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 hex = "0.4"
+rand = "0.8"              # salt CSPRNG des ordres (nonce)
 
 # Signing EIP-712 (live) — derrière la feature `live` pour ne pas alourdir le build par défaut.
 # Meta-crate alloy en features minimales (signing seul, sans le stack RPC/providers).

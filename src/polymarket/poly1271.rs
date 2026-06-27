@@ -39,10 +39,11 @@ pub async fn place_order_poly1271(
     let client = authenticated_client(creds, &signer).await?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
 
-    // Lookup neg-risk + tick size (cache SDK) — requis pour contrat V2 et arrondi prix.
-    let neg = client.neg_risk(token).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Lookup neg-risk + tick size (cache SDK) en parallèle — requis pour contrat V2 et arrondi prix.
+    let (neg, tick) = tokio::join!(client.neg_risk(token), client.tick_size(token));
+    let neg = neg.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tick = tick.map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::debug!(token_id, neg_risk = neg.neg_risk, "neg-risk résolu");
-    let tick = client.tick_size(token).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let price_dp = tick.minimum_tick_size.as_decimal().scale();
 
     let price = decimal_from_f64(args.price, price_dp, "price")?;

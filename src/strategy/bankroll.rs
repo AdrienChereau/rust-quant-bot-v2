@@ -138,15 +138,18 @@ impl PaperEngine {
 
     /// Gère la position ouverte : TP atteint, stop-loss, max-hold. Renvoie true si fermée.
     pub fn manage(&mut self, mark_bid: Option<f64>, now_ms: u64, remaining_s: i64) -> bool {
-        let Some(p) = self.position.clone() else { return false };
+        // Lecture par référence (pas de clone de la position à chaque tick) ; on extrait les
+        // primitives Copy nécessaires avant d'appeler close_position (qui emprunte &mut self).
+        let Some(p) = self.position.as_ref() else { return false };
         let Some(bid) = mark_bid else { return false };
-        let held_s = (now_ms.saturating_sub(p.opened_ms) / 1000) as i64;
+        let (tp_price, sl_price, opened_ms) = (p.tp_price, p.sl_price, p.opened_ms);
+        let held_s = (now_ms.saturating_sub(opened_ms) / 1000) as i64;
 
-        if bid >= p.tp_price {
-            self.close_position(p.tp_price, "take_profit");
+        if bid >= tp_price {
+            self.close_position(tp_price, "take_profit");
             true
-        } else if bid <= p.sl_price {
-            self.close_position(p.sl_price, "stop_loss");
+        } else if bid <= sl_price {
+            self.close_position(sl_price, "stop_loss");
             true
         } else if held_s >= self.params.max_hold_secs || remaining_s <= 30 {
             self.close_position(bid, "max_hold"); // liquidation au marché
@@ -200,8 +203,28 @@ impl PaperEngine {
 
 /// Circuit breaker drawdown (basé sur l'**equity**, pas le cash).
 /// Renvoie `true` s'il faut couper : `initial_capital − current_equity ≥ max_dd`.
+/// Utilisé en mode **paper** (equity fictive vs START_CASH).
 pub fn check_drawdown_breaker(current_equity: f64, initial_capital: f64, max_dd: f64) -> bool {
     initial_capital - current_equity >= max_dd
+}
+
+/// Suivi du drawdown sur la **bankroll réelle** (mode live) via high-water mark.
+/// La bankroll réelle est lue périodiquement sur le CLOB ; on coupe quand la perte depuis
+/// le pic atteint `max_dd`. ⚠️ `max_dd` (MAX_DRAWDOWN) doit être < bankroll, sinon jamais déclenché.
+#[derive(Default)]
+pub struct LiveDrawdown {
+    peak: Option<f64>,
+}
+
+impl LiveDrawdown {
+    /// Met à jour le pic avec la bankroll courante et renvoie `true` si `pic − courante ≥ max_dd`.
+    pub fn breached(&mut self, current_bankroll: f64, max_dd: f64) -> bool {
+        let peak = self.peak.get_or_insert(current_bankroll);
+        if current_bankroll > *peak {
+            *peak = current_bankroll;
+        }
+        *peak - current_bankroll >= max_dd
+    }
 }
 
 /// Ajuste la taille Kelly au minimum Polymarket.
@@ -290,6 +313,16 @@ mod tests {
         assert!(!check_drawdown_breaker(185.0, 200.0, 20.0));
         assert!(check_drawdown_breaker(180.0, 200.0, 20.0));
         assert!(check_drawdown_breaker(175.0, 200.0, 20.0));
+    }
+
+    #[test]
+    fn live_drawdown_uses_high_water_mark() {
+        // bankroll réelle 18.44, max_dd 5 → coupe quand pic − courante ≥ 5.
+        let mut dd = LiveDrawdown::default();
+        assert!(!dd.breached(18.44, 5.0)); // 1er pic = 18.44
+        assert!(!dd.breached(20.00, 5.0)); // pic monte à 20.00
+        assert!(!dd.breached(16.00, 5.0)); // -4.00 depuis le pic → ok
+        assert!(dd.breached(15.00, 5.0));  // -5.00 depuis le pic → coupe
     }
 
     #[test]

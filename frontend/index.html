@@ -12,7 +12,7 @@
     <span id="clock" class="muted"></span>
   </header>
 
-  <div id="breaker-banner" class="breaker-banner" hidden>🛑 CIRCUIT BREAKER DÉCLENCHÉ — exécution coupée</div>
+  <div id="breaker-banner" class="breaker-banner" hidden>🛑 CIRCUIT BREAKER DÉCLENCHÉ — exécution coupée <button class="btn-reset" onclick="ctl('/breaker/reset')">↺ Réinitialiser</button></div>
 
   <!-- ORDER TERMINAL (TOKYO) -->
   <section id="order-terminal" class="grid" style="display: none;">
@@ -61,19 +61,13 @@
           <h2>🎛️ Contrôle d'exécution</h2>
           <div class="row"><span>Mode courant</span><b id="ctl_mode">—</b></div>
           <div class="row"><span>Bankroll réelle (CLOB)</span><b id="ctl_bankroll">—</b></div>
+          <div class="row"><span>Bankroll paper (test)</span><b id="ctl_paper_bk">—</b></div>
           <div class="row"><span>Live armé (LIVE_ARMED)</span><b id="ctl_armed">—</b></div>
           <div class="row"><span>Drawdown / max</span><b id="ctl_dd">—</b></div>
-          <div class="btn-grid">
-            <button class="btn ok" onclick="ctl('/paper/play')">▶ Paper</button>
-            <button class="btn warn" onclick="ctl('/paper/pause')">⏸ Paper</button>
-            <button class="btn" onclick="ctl('/live/enable')">Live ON</button>
-            <button class="btn" onclick="ctl('/live/disable')">Live OFF</button>
-            <button class="btn warn" onclick="ctl('/live/pause')">⏸ Live</button>
-            <button class="btn ok" onclick="ctl('/live/resume')">▶ Live</button>
-            <button class="btn danger" onclick="ctl('/breaker/trip')">🛑 Trip</button>
-            <button class="btn" onclick="ctl('/breaker/reset')">↺ Reset</button>
+          <div class="toggle-wrap">
+            <button id="mode-toggle" class="mode-toggle" onclick="toggleMode()">—</button>
           </div>
-          <p class="muted" style="margin:.5rem 0 0">« Live ON » sélectionne le mode mais reste <b>dry-run</b> tant que <code>LIVE_ARMED</code> + signature vérifiée.</p>
+          <p class="muted" style="margin:.5rem 0 0">Bascule <b>PAPER ⇄ LIVE</b>. En LIVE, le sizing s'appuie sur la bankroll réelle ; reste <b>dry-run</b> tant que <code>LIVE_ARMED=true</code> + signature vérifiée.</p>
         </div>
 
         <div class="card">
