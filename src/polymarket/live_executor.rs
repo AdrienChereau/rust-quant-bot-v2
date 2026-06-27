@@ -53,7 +53,9 @@ impl LiveCredentials {
     /// (correct seulement en sig_type 0 où EOA == funder).
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| trim_env(k);
-        let funder = get("POLY_FUNDER_ADDRESS")?;
+        // Accepte les deux conventions de nommage (Rust bot ET scripts py-clob-client).
+        let get2 = |a: &str, b: &str| get(a).or_else(|| get(b));
+        let funder = get2("POLY_FUNDER_ADDRESS", "POLY_FUNDER")?;
         let mut private_key = get("POLY_PRIVATE_KEY")?;
         if !private_key.starts_with("0x") && !private_key.starts_with("0X") {
             private_key = format!("0x{private_key}");
@@ -61,7 +63,7 @@ impl LiveCredentials {
         Some(Self {
             api_key: get("POLY_API_KEY")?,
             api_secret: get("POLY_API_SECRET")?,
-            passphrase: get("POLY_PASSPHRASE")?,
+            passphrase: get2("POLY_PASSPHRASE", "POLY_API_PASSPHRASE")?,
             signer_address: get("POLY_SIGNER_ADDRESS").unwrap_or_else(|| funder.clone()),
             funder,
             private_key,
