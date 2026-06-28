@@ -1,13 +1,17 @@
-//! Connecteur WebSocket Binance — flux **diff-depth complet** `@depth@100ms`
+//! Connecteur WebSocket Binance — flux **diff-depth complet** `@depth`
 //! (P2b). Maintient un `OrderBookL2` complet (snapshot REST + diffs séquencés),
 //! seule façon de couvrir la bande OBI 0.15 % (±~$90 sur BTC). Partagé via
 //! `Arc<Mutex<OrderBookL2>>` ; le hot-loop lit sans bloquer le réseau.
+//!
+//! **Event-driven OBI (Bloc L)** : chaque update livre un `(obi_b, spot)` via
+//! `watch::Sender` → le signal task évalue immédiatement (zéro attente tick).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
+use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -42,10 +46,15 @@ fn apply_levels(book: &mut OrderBookL2, is_bid: bool, levels: &[[String; 2]]) {
     }
 }
 
-pub async fn run(url: String, shared: Arc<Mutex<OrderBookL2>>) -> anyhow::Result<()> {
+pub async fn run(
+    url: String,
+    shared: Arc<Mutex<OrderBookL2>>,
+    obi_tx: watch::Sender<(f64, Option<f64>)>,
+    obi_n: usize,
+) -> anyhow::Result<()> {
     let mut backoff = Duration::from_millis(500);
     loop {
-        match connect_and_stream(&url, &shared).await {
+        match connect_and_stream(&url, &shared, &obi_tx, obi_n).await {
             Ok(()) => backoff = Duration::from_millis(500),
             Err(e) => tracing::error!(error = %e, "Binance WS, reconnexion"),
         }
@@ -54,7 +63,12 @@ pub async fn run(url: String, shared: Arc<Mutex<OrderBookL2>>) -> anyhow::Result
     }
 }
 
-async fn connect_and_stream(url: &str, shared: &Arc<Mutex<OrderBookL2>>) -> anyhow::Result<()> {
+async fn connect_and_stream(
+    url: &str,
+    shared: &Arc<Mutex<OrderBookL2>>,
+    obi_tx: &watch::Sender<(f64, Option<f64>)>,
+    obi_n: usize,
+) -> anyhow::Result<()> {
     let (ws, _) = connect_async(url).await?;
     tracing::info!(%url, "Binance WS connecté");
     let (_w, mut read) = ws.split();
@@ -94,13 +108,17 @@ async fn connect_and_stream(url: &str, shared: &Arc<Mutex<OrderBookL2>>) -> anyh
             buffer.push(ev);
             // Le premier event valide doit chevaucher last_id+1.
             if buffer.first().map_or(false, |e| e.first_id <= last_id + 1) {
-                let mut book = shared.lock().unwrap();
-                for e in buffer.drain(..) {
-                    apply_levels(&mut book, true, &e.bids);
-                    apply_levels(&mut book, false, &e.asks);
-                    last_id = e.final_id;
-                }
+                let (obi_b, spot_opt) = {
+                    let mut book = shared.lock().unwrap();
+                    for e in buffer.drain(..) {
+                        apply_levels(&mut book, true, &e.bids);
+                        apply_levels(&mut book, false, &e.asks);
+                        last_id = e.final_id;
+                    }
+                    (book.calculate_obi_topn(obi_n), book.mid_price())
+                };
                 synced = true;
+                let _ = obi_tx.send((obi_b, spot_opt));
             }
             continue;
         }
@@ -109,10 +127,14 @@ async fn connect_and_stream(url: &str, shared: &Arc<Mutex<OrderBookL2>>) -> anyh
         if ev.final_id <= last_id {
             continue;
         }
-        let mut book = shared.lock().unwrap();
-        apply_levels(&mut book, true, &ev.bids);
-        apply_levels(&mut book, false, &ev.asks);
-        last_id = ev.final_id;
+        let (obi_b, spot_opt) = {
+            let mut book = shared.lock().unwrap();
+            apply_levels(&mut book, true, &ev.bids);
+            apply_levels(&mut book, false, &ev.asks);
+            last_id = ev.final_id;
+            (book.calculate_obi_topn(obi_n), book.mid_price())
+        };
+        let _ = obi_tx.send((obi_b, spot_opt));
     }
     Ok(())
 }

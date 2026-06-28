@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use tokio::sync::watch;
 
 use binance::local_book::OrderBookL2;
 use binance::math_engine::VelocityTracker;
@@ -91,7 +92,9 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Mode mono-processus historique : radar + exécuteur dans la même boucle 50 ms.
+/// Mode mono-processus historique : radar + exécuteur event-driven.
+/// Le FSM sniper se déclenche sur chaque update WS Binance/OKX (Bloc L).
+/// La gestion de position (TP/SL/max-hold) et le dashboard tournent sur un tick 50ms séparé.
 async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(dry_run = cfg.dry_run, "🎯 rust-quant-bot (sniper, mono) démarré");
 
@@ -115,8 +118,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let live_bankroll = Arc::new(Mutex::new(None::<f64>));
     if let Some(creds) = live_creds.clone() {
         let bk = live_bankroll.clone();
+        let poll_secs = cfg.bankroll_poll_secs;
         tokio::spawn(async move {
-            let mut poll = tokio::time::interval(Duration::from_secs(30));
+            let mut poll = tokio::time::interval(Duration::from_secs(poll_secs));
             loop {
                 poll.tick().await;
                 match live_executor::get_collateral_balance(&creds).await {
@@ -138,16 +142,20 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let lat = latency::shared();
     { let l = lat.clone(); tokio::spawn(async move { latency::run(l, latency::Probes::All).await; }); }
 
-    // Carnets CEX partagés, alimentés par les tâches WS.
+    // Watch channels OBI — les WS tasks envoient après chaque apply_levels().
+    let (bin_tx, mut bin_rx) = watch::channel::<(f64, Option<f64>)>((0.0, None));
+    let (okx_tx, mut okx_rx) = watch::channel::<f64>(0.0);
+
+    let obi_n = cfg.obi_top_n;
     let binance_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
     let okx_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
-    tokio::spawn(binance::websocket::run(cfg.binance_ws_url.clone(), binance_book.clone()));
-    tokio::spawn(okx::websocket::run(cfg.okx_ws_url.clone(), okx_book.clone()));
+    tokio::spawn(binance::websocket::run(cfg.binance_ws_url.clone(), binance_book.clone(), bin_tx, obi_n));
+    tokio::spawn(okx::websocket::run(cfg.okx_ws_url.clone(), okx_book.clone(), okx_tx, obi_n));
 
     // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop). `true` = on a besoin du strike.
     let pm = Arc::new(Mutex::new(PmShared::default()));
     let ws_market_tx = pm_websocket::init_market_ws(pm.clone());
-    spawn_pm_poller(pm.clone(), true, Some(ws_market_tx), live_creds.clone());
+    spawn_pm_poller(pm.clone(), true, Some(ws_market_tx), live_creds.clone(), cfg.pm_ws_stale_threshold_ms);
 
     // Moteurs.
     let consolidated = ConsolidatedObi::new(cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
@@ -168,28 +176,38 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         std::env::var("LIVE_TRADES_PATH").unwrap_or_else(|_| "data/live_trades.jsonl".into()),
     );
 
-    // ── HOT LOOP : 50 ms (20 Hz) ── (lectures de carnets = locks brefs, aucun await réseau)
+    // ── EVENT LOOP (Bloc L) ──
+    // - Bras OBI (bin_rx / okx_rx) : signal immédiat à chaque update WS → FSM sniper + fire
+    // - Bras tick 50ms             : gestion position, dashboard, circuit breaker
+    enum LoopEvent { Obi, Tick }
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
-    let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
-    let mut live_pnl = bankroll::LivePnl::default();     // PnL réalisé live (Δ bankroll)
-    let mut was_live = false;                            // détection de transition paper→live
-    let mut live_shots: u64 = 0;                         // ordres live acceptés cette session
+    let mut live_dd = bankroll::LiveDrawdown::default();
+    let mut live_pnl = bankroll::LivePnl::default();
+    let mut was_live = false;
+    let mut live_shots: u64 = 0;
+    // État de gestion gardé entre les OBI events pour que le bras Tick y accède.
+    let mut last_mark_bid: Option<f64> = None;
+    let mut last_live_pnl_val: Option<f64> = None;
+
     loop {
-        tokio::select! {
+        let event = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                // Arrêt propre : l'état paper est déjà persisté à chaque clôture de position.
                 tracing::info!("SIGINT reçu — arrêt propre (mono)");
                 break Ok(());
             }
-            _ = tick.tick() => {}
-        }
+            Ok(()) = bin_rx.changed() => LoopEvent::Obi,
+            Ok(()) = okx_rx.changed() => LoopEvent::Obi,
+            _ = tick.tick() => LoopEvent::Tick,
+        };
+
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-        let n = cfg.obi_top_n;
-        let (obi_b, spot) = { let b = binance_book.lock().unwrap(); (b.calculate_obi_topn(n), b.mid_price()) };
-        let obi_o = { okx_book.lock().unwrap().calculate_obi_topn(n) };
-        let Some(spot) = spot else { continue };
+        // OBI depuis les receivers (valeur la plus récente, quel que soit l'événement).
+        let (obi_b, spot_opt) = *bin_rx.borrow();
+        let obi_o = *okx_rx.borrow();
+        let Some(spot) = spot_opt else { continue };
+
         vel.update(now_ms, spot);
         vol.update(now_ms, spot);
         let velocity = vel.velocity();
@@ -210,53 +228,11 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             gap = fair_up - real_up;
         }
 
-        // Vide de liquidité (règle PDF) + blocage fin de fenêtre.
         let liquidity_vacuum = velocity <= cfg.vacuum_velocity && obi_b <= cfg.vacuum_obi;
         let blocked = market.is_none() || strike.is_none() || remaining_s <= cfg.end_window_block_secs;
 
-        // Gestion de la position ouverte (TP/SL/max-hold) à chaque tick — paper.
-        let mark_bid = if let Some(p) = &paper.position {
-            let bk = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
-            bk.best_bid()
-        } else { None };
-        paper.manage(mark_bid, now_ms, remaining_s);
-
-        // Gestion de la position LIVE (symétrique).
-        if let (Some(p), Some(creds), Some(m)) =
-            (live_mgr.position(), live_creds.as_ref(), market.as_ref())
-        {
-            let live_book = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
-            let live_mark = live_book.best_bid();
-            live_mgr.manage(
-                creds, cfg.live_armed, live_mark, live_book,
-                m.min_order_size, m.tick_size, now_ms, remaining_s,
-            ).await;
-        }
-
-        // Circuit breaker (drawdown) — déclenché une fois, coupe toute exécution.
-        // LIVE : drawdown sur la VRAIE bankroll CLOB ; PAPER : equity fictive vs START_CASH.
-        let breaker_hit = if controls.live_active() {
-            match *live_bankroll.lock().unwrap() {
-                Some(real) => live_dd.breached(real, cfg.max_drawdown),
-                None => false, // bankroll réelle pas encore lue
-            }
-        } else {
-            bankroll::check_drawdown_breaker(paper.equity(mark_bid), cfg.start_cash, cfg.max_drawdown)
-        };
-        if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
-            tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
-                "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
-        }
-
-        // PnL live = Δ bankroll réelle depuis l'activation du live ; référence reposée à la bascule.
+        // ── FSM sniper : se déclenche sur chaque event OBI et Tick ──
         let is_live = controls.live_active();
-        if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
-        was_live = is_live;
-        let live_pnl_val = if is_live {
-            live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
-        } else { None };
-
-        // FSM sniper.
         let input = TickInput { now_ms, decision, fair_up, real_up, velocity, liquidity_vacuum, blocked };
         match sniper.step(&input) {
             Action::Fire { side, .. } => {
@@ -264,7 +240,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     let (book, token) = if side == concurrency::bus::Side::Up {
                         (&up_book, &m.up_token_id)
                     } else { (&down_book, &m.down_token_id) };
-                    // Aiguillage breaker → live → paper.
                     if controls.is_breaker_tripped() {
                         // exécution coupée
                     } else if is_live {
@@ -312,83 +287,125 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             Action::None => {}
         }
 
-        // Conditions de tir (checklist AND) — pour le dashboard.
-        use concurrency::bus::Side;
-        let cand_side = decision.side.or(if gap > 0.0 { Some(Side::Up) } else if gap < 0.0 { Some(Side::Down) } else { None });
-        let cond_agreement = decision.fire;
-        let cond_gap = match cand_side {
-            Some(Side::Up) => fair_up - real_up >= cfg.gap_min,
-            Some(Side::Down) => real_up - fair_up >= cfg.gap_min,
-            None => false,
-        };
-        let cond_velocity = match cand_side {
-            Some(Side::Up) => velocity >= cfg.velocity_confirm,
-            Some(Side::Down) => velocity <= -cfg.velocity_confirm,
-            None => false,
-        };
-        let cond_ready = !blocked && !liquidity_vacuum && !sniper.in_cooldown();
-        let cond_persist = sniper.is_armed();
-        let all_conditions = cond_agreement && cond_gap && cond_velocity && cond_ready;
-
-        // Dashboard (écriture brève hors chemin critique).
-        let kelly = market.as_ref().map(|_| paper.kelly_size(gap.abs(), real_up.max(0.01))).unwrap_or(0.0);
-        let fsm = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
-        let lat_snap = lat.lock().unwrap().clone();
-        {
-            let mut d = dash.write().await;
-            d.binance_connected = spot > 0.0;
-            d.okx_connected = obi_o != 0.0 || { okx_book.lock().unwrap().mid_price().is_some() };
-            d.btc_spot = spot;
-            d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = decision.strength;
-            d.agreement = decision.fire; d.velocity = velocity;
-            d.fsm_state = fsm.into();
-            d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
-            d.remaining_s = remaining_s;
-            d.fair_up = fair_up; d.real_up = real_up; d.gap = gap;
-            d.liquidity_vacuum = liquidity_vacuum; d.kelly_size = kelly;
-            d.cond_agreement = cond_agreement; d.cond_gap = cond_gap; d.cond_velocity = cond_velocity;
-            d.cond_ready = cond_ready; d.cond_persist = cond_persist; d.all_conditions = all_conditions;
-            // Position affichée : live prend la priorité si présente, sinon paper.
-            if let Some(p) = live_mgr.position() {
-                d.in_position = true;
-                d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
-            } else if let Some(p) = &paper.position {
-                d.in_position = true;
-                d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
-            } else {
-                d.in_position = false;
-            }
-            d.cash = paper.state.cash; d.equity = paper.equity(mark_bid);
-            d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
-            d.shots = paper.state.shots; d.wins = paper.state.wins; d.losses = paper.state.losses;
-            d.hit_rate = paper.hit_rate();
-            d.lat_binance_ms    = lat_snap.binance_ms;
-            d.lat_okx_ms        = lat_snap.okx_ms;
-            d.lat_polymarket_ms = lat_snap.polymarket_ms;
-            d.mode = controls.mode_label().into();
-            d.paper_paused = controls.is_paper_paused();
-            d.live_enabled = controls.is_live_enabled();
-            d.live_paused = controls.is_live_paused();
-            d.live_armed = cfg.live_armed;
-            d.breaker_tripped = controls.is_breaker_tripped();
-            d.initial_capital = cfg.start_cash;
-            d.max_drawdown = cfg.max_drawdown;
-            d.live_bankroll = *live_bankroll.lock().unwrap();
-            // PnL live : privilégier le PnL réalisé du manager (somme des clôtures réelles).
-            d.live_pnl = if controls.live_active() {
-                if live_mgr.state.shots > 0 { Some(live_mgr.state.realized_pnl) } else { live_pnl_val }
+        // ── Gestion position + dashboard : seulement sur tick 50ms ──
+        if matches!(event, LoopEvent::Tick) {
+            // Gestion paper.
+            let mark_bid = if let Some(p) = &paper.position {
+                let bk = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
+                bk.best_bid()
             } else { None };
-            d.live_shots = live_mgr.state.shots.max(live_shots);
-            d.live_force_min = cfg.live_force_min_size;
-            d.lat_last_buy_ms = live_mgr.last_buy_ms;
-            d.lat_last_sell_ms = live_mgr.last_sell_ms;
-        }
+            paper.manage(mark_bid, now_ms, remaining_s);
+            last_mark_bid = mark_bid;
 
-        log_throttle += 1;
-        if log_throttle % 100 == 0 { // ~5 s
-            tracing::info!(obi_b = format!("{:+.2}", obi_b), obi_o = format!("{:+.2}", obi_o),
-                fair = format!("{:.3}", fair_up), real = format!("{:.3}", real_up),
-                gap = format!("{:+.3}", gap), fsm, shots = paper.state.shots, "radar");
+            // Gestion position LIVE (TP/SL/max-hold).
+            if let (Some(p), Some(creds), Some(m)) =
+                (live_mgr.position(), live_creds.as_ref(), market.as_ref())
+            {
+                let live_book = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
+                let live_mark = live_book.best_bid();
+                live_mgr.manage(
+                    creds, cfg.live_armed, live_mark, live_book,
+                    m.min_order_size, m.tick_size, now_ms, remaining_s,
+                ).await;
+            }
+
+            // Circuit breaker (drawdown).
+            let breaker_hit = if is_live {
+                match *live_bankroll.lock().unwrap() {
+                    Some(real) => live_dd.breached(real, cfg.max_drawdown),
+                    None => false,
+                }
+            } else {
+                bankroll::check_drawdown_breaker(paper.equity(last_mark_bid), cfg.start_cash, cfg.max_drawdown)
+            };
+            if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
+                tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
+                    "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+            }
+
+            // PnL live.
+            if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
+            was_live = is_live;
+            last_live_pnl_val = if is_live {
+                live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
+            } else { None };
+
+            // Conditions de tir (dashboard).
+            use concurrency::bus::Side;
+            let cand_side = decision.side.or(if gap > 0.0 { Some(Side::Up) } else if gap < 0.0 { Some(Side::Down) } else { None });
+            let cond_agreement = decision.fire;
+            let cond_gap = match cand_side {
+                Some(Side::Up) => fair_up - real_up >= cfg.gap_min,
+                Some(Side::Down) => real_up - fair_up >= cfg.gap_min,
+                None => false,
+            };
+            let cond_velocity = match cand_side {
+                Some(Side::Up) => velocity >= cfg.velocity_confirm,
+                Some(Side::Down) => velocity <= -cfg.velocity_confirm,
+                None => false,
+            };
+            let cond_ready = !blocked && !liquidity_vacuum && !sniper.in_cooldown();
+            let cond_persist = sniper.is_armed();
+            let all_conditions = cond_agreement && cond_gap && cond_velocity && cond_ready;
+
+            let kelly_size = market.as_ref().map(|_| paper.kelly_size(gap.abs(), real_up.max(0.01))).unwrap_or(0.0);
+            let fsm = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
+            let lat_snap = lat.lock().unwrap().clone();
+            {
+                let mut d = dash.write().await;
+                d.binance_connected = spot > 0.0;
+                d.okx_connected = obi_o != 0.0;
+                d.btc_spot = spot;
+                d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = decision.strength;
+                d.agreement = decision.fire; d.velocity = velocity;
+                d.fsm_state = fsm.into();
+                d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
+                d.remaining_s = remaining_s;
+                d.fair_up = fair_up; d.real_up = real_up; d.gap = gap;
+                d.liquidity_vacuum = liquidity_vacuum; d.kelly_size = kelly_size;
+                d.cond_agreement = cond_agreement; d.cond_gap = cond_gap; d.cond_velocity = cond_velocity;
+                d.cond_ready = cond_ready; d.cond_persist = cond_persist; d.all_conditions = all_conditions;
+                if let Some(p) = live_mgr.position() {
+                    d.in_position = true;
+                    d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+                } else if let Some(p) = &paper.position {
+                    d.in_position = true;
+                    d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+                } else {
+                    d.in_position = false;
+                }
+                d.cash = paper.state.cash; d.equity = paper.equity(last_mark_bid);
+                d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
+                d.shots = paper.state.shots; d.wins = paper.state.wins; d.losses = paper.state.losses;
+                d.hit_rate = paper.hit_rate();
+                d.lat_binance_ms    = lat_snap.binance_ms;
+                d.lat_okx_ms        = lat_snap.okx_ms;
+                d.lat_polymarket_ms = lat_snap.polymarket_ms;
+                d.mode = controls.mode_label().into();
+                d.paper_paused = controls.is_paper_paused();
+                d.live_enabled = controls.is_live_enabled();
+                d.live_paused = controls.is_live_paused();
+                d.live_armed = cfg.live_armed;
+                d.breaker_tripped = controls.is_breaker_tripped();
+                d.initial_capital = cfg.start_cash;
+                d.max_drawdown = cfg.max_drawdown;
+                d.live_bankroll = *live_bankroll.lock().unwrap();
+                d.live_pnl = if is_live {
+                    if live_mgr.state.shots > 0 { Some(live_mgr.state.realized_pnl) } else { last_live_pnl_val }
+                } else { None };
+                d.live_shots = live_mgr.state.shots.max(live_shots);
+                d.live_force_min = cfg.live_force_min_size;
+                d.lat_last_buy_ms = live_mgr.last_buy_ms;
+                d.lat_last_sell_ms = live_mgr.last_sell_ms;
+            }
+
+            log_throttle += 1;
+            if log_throttle % 100 == 0 { // ~5 s
+                let fsm_str = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
+                tracing::info!(obi_b = format!("{:+.2}", obi_b), obi_o = format!("{:+.2}", obi_o),
+                    fair = format!("{:.3}", fair_up), real = format!("{:.3}", real_up),
+                    gap = format!("{:+.3}", gap), fsm = fsm_str, shots = paper.state.shots, "radar");
+            }
         }
     }
 }

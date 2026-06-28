@@ -28,6 +28,8 @@ static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| 
     reqwest::Client::builder()
         .tcp_keepalive(std::time::Duration::from_secs(15))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_nodelay(true)          // élimine le buffering Nagle (~0-40ms par ordre)
+        .pool_max_idle_per_host(1)  // 1 seul endpoint CLOB
         .build()
         .expect("reqwest client init")
 });
@@ -36,6 +38,9 @@ static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| 
 #[cfg(feature = "live")]
 static CACHED_SIGNER: std::sync::OnceLock<alloy::signers::local::PrivateKeySigner> =
     std::sync::OnceLock::new();
+
+/// Clé HMAC pré-décodée (base64 url-safe → bytes) — évite un decode par ordre (~50µs).
+static CACHED_HMAC_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
 pub(crate) const CLOB_BASE: &str = "https://clob.polymarket.com";
 const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — JAMAIS FOK.
@@ -432,6 +437,10 @@ pub async fn startup_poly(creds: &LiveCredentials) -> anyhow::Result<()> {
             crate::polymarket::poly1271::init_auth_client(creds).await?;
         }
     }
+    // Pré-decode la clé HMAC une seule fois (évite ~50µs base64 decode par ordre).
+    if let Ok(key) = base64::engine::general_purpose::URL_SAFE.decode(&creds.api_secret) {
+        let _ = CACHED_HMAC_KEY.set(key);
+    }
     if creds.sig_type == 3 {
         sync_balance_allowance(creds).await
             .map_err(|e| anyhow::anyhow!("sync balance-allowance échouée (deposit wallet): {e}"))?;
@@ -530,10 +539,16 @@ pub fn build_l2_headers(
 }
 
 fn l2_signature(secret_b64: &str, ts: &str, method: &str, path: &str, body: &str) -> anyhow::Result<String> {
-    let key = base64::engine::general_purpose::URL_SAFE
-        .decode(secret_b64)
-        .map_err(|e| anyhow::anyhow!("secret base64 invalide: {e}"))?;
-    let mut mac = HmacSha256::new_from_slice(&key).map_err(|e| anyhow::anyhow!("clé HMAC: {e}"))?;
+    let decoded;
+    let key: &[u8] = if let Some(cached) = CACHED_HMAC_KEY.get() {
+        cached
+    } else {
+        decoded = base64::engine::general_purpose::URL_SAFE
+            .decode(secret_b64)
+            .map_err(|e| anyhow::anyhow!("secret base64 invalide: {e}"))?;
+        &decoded
+    };
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("clé HMAC: {e}"))?;
     mac.update(format!("{ts}{method}{path}{body}").as_bytes());
     Ok(base64::engine::general_purpose::URL_SAFE.encode(mac.finalize().into_bytes()))
 }

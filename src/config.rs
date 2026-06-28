@@ -61,7 +61,7 @@ impl Config {
             dashboard_port: env_or("PORT", 8768),
 
             binance_ws_url: env::var("BINANCE_WS_URL")
-                .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws/btcusdt@depth@100ms".into()),
+                .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws/btcusdt@depth".into()),
             okx_ws_url: env::var("OKX_WS_URL")
                 .unwrap_or_else(|_| "wss://ws.okx.com:8443/ws/v5/public".into()),
 

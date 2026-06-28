@@ -1,11 +1,14 @@
 //! Connecteur WebSocket OKX (`books`, 400 niveaux) — confirmation cross-exchange.
 //! Même `OrderBookL2` (bande OBI 0.15 %). Partagé via `Arc<Mutex<OrderBookL2>>`.
+//!
+//! **Event-driven OBI (Bloc L)** : chaque update livre `obi_o` via `watch::Sender`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -33,10 +36,15 @@ fn apply(book: &mut OrderBookL2, is_bid: bool, levels: &[Vec<String>]) {
     }
 }
 
-pub async fn run(url: String, shared: Arc<Mutex<OrderBookL2>>) -> anyhow::Result<()> {
+pub async fn run(
+    url: String,
+    shared: Arc<Mutex<OrderBookL2>>,
+    obi_tx: watch::Sender<f64>,
+    obi_n: usize,
+) -> anyhow::Result<()> {
     let mut backoff = Duration::from_millis(500);
     loop {
-        match connect_and_stream(&url, &shared).await {
+        match connect_and_stream(&url, &shared, &obi_tx, obi_n).await {
             Ok(()) => backoff = Duration::from_millis(500),
             Err(e) => tracing::error!(error = %e, "OKX WS, reconnexion"),
         }
@@ -45,7 +53,12 @@ pub async fn run(url: String, shared: Arc<Mutex<OrderBookL2>>) -> anyhow::Result
     }
 }
 
-async fn connect_and_stream(url: &str, shared: &Arc<Mutex<OrderBookL2>>) -> anyhow::Result<()> {
+async fn connect_and_stream(
+    url: &str,
+    shared: &Arc<Mutex<OrderBookL2>>,
+    obi_tx: &watch::Sender<f64>,
+    obi_n: usize,
+) -> anyhow::Result<()> {
     let (ws, _) = connect_async(url).await?;
     let (mut write, mut read) = ws.split();
     let sub = r#"{"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]}"#;
@@ -66,15 +79,19 @@ async fn connect_and_stream(url: &str, shared: &Arc<Mutex<OrderBookL2>>) -> anyh
         if m.data.is_empty() {
             continue;
         }
-        let mut book = shared.lock().unwrap();
-        if m.action == "snapshot" {
-            book.bids.clear();
-            book.asks.clear();
-        }
-        for d in &m.data {
-            apply(&mut book, true, &d.bids);
-            apply(&mut book, false, &d.asks);
-        }
+        let obi_o = {
+            let mut book = shared.lock().unwrap();
+            if m.action == "snapshot" {
+                book.bids.clear();
+                book.asks.clear();
+            }
+            for d in &m.data {
+                apply(&mut book, true, &d.bids);
+                apply(&mut book, false, &d.asks);
+            }
+            book.calculate_obi_topn(obi_n)
+        };
+        let _ = obi_tx.send(obi_o);
     }
     Ok(())
 }
