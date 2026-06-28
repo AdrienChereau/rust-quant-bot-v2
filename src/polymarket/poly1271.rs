@@ -129,7 +129,10 @@ pub async fn place_order_poly1271(
     // Récupère les métadonnées depuis le cache si dispo (peuplé au rollover par preload_token_meta).
     // Sinon fallback réseau (neg_risk + tick_size) — path lent, ne devrait arriver qu'au 1er ordre.
     let (price_dp, neg_risk_val) = if let Some(cache) = TOKEN_META.get() {
-        if let Some(meta) = cache.lock().unwrap().get(token_id).cloned() {
+        // Cloner AVANT le if/else : le MutexGuard (std) ne doit pas être tenu à travers le `.await`
+        // du fallback réseau ci-dessous, sinon le future n'est plus `Send` (→ tokio::spawn refusé).
+        let cached_meta = cache.lock().unwrap().get(token_id).cloned();
+        if let Some(meta) = cached_meta {
             tracing::debug!(token_id, neg_risk = meta.neg_risk, "métadonnées depuis cache");
             (meta.price_dp, meta.neg_risk)
         } else {
