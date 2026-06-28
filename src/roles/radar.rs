@@ -40,7 +40,7 @@ pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Re
 
     // Le radar n'exécute pas : contrôles présents seulement pour servir le dashboard.
     let controls = Arc::new(RuntimeControls::new());
-    let dash = dashboard::shared(cfg.dry_run);
+    let dash = dashboard::shared(cfg.dry_run, "radar");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
@@ -65,7 +65,19 @@ pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Re
     let strike = Arc::new(Mutex::new(StrikeState::default()));
     spawn_strike_task(strike.clone());
 
-    let sender = UdpSender::new(&target_ip, target_port).await?;
+    // Cible live (primaire) — toujours servie en premier.
+    let live_sender = UdpSender::new(&target_ip, target_port).await?;
+    // Cible paper (secondaire, optionnelle) — le radar tire AUSSI au paper, mais APRÈS le live.
+    let paper_sender = match (std::env::var("TARGET_PAPER_IP"), std::env::var("TARGET_PAPER_PORT")) {
+        (Ok(ip), port) if !ip.is_empty() => {
+            let p = port.ok().and_then(|s| s.parse().ok()).unwrap_or(8081u16);
+            match UdpSender::new(&ip, p).await {
+                Ok(s) => { tracing::info!(%ip, port = p, "📝 cible paper activée (tir secondaire)"); Some(s) }
+                Err(e) => { tracing::warn!(error = %e, "cible paper injoignable — live seul"); None }
+            }
+        }
+        _ => { tracing::info!("pas de TARGET_PAPER_IP — tir live uniquement"); None }
+    };
 
     let consolidated = ConsolidatedObi::new(
         cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
@@ -74,7 +86,7 @@ pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Re
     let vol = VolatilityTracker::new(2000, 0.80);
 
     // Signal task event-driven — se déclenche à chaque update WS (pas de tick).
-    spawn_signal_task(bin_rx, okx_rx, vel, vol, sniper, consolidated, sender, strike, cfg, dash, lat);
+    spawn_signal_task(bin_rx, okx_rx, vel, vol, sniper, consolidated, live_sender, paper_sender, strike, cfg, dash, lat);
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("SIGINT reçu — arrêt propre (radar)");
@@ -88,7 +100,8 @@ fn spawn_signal_task(
     mut vol: VolatilityTracker,
     mut sniper: Sniper,
     consolidated: ConsolidatedObi,
-    sender: UdpSender,
+    live_sender: UdpSender,
+    paper_sender: Option<UdpSender>,
     strike: Arc<Mutex<StrikeState>>,
     cfg: Config,
     dash: dashboard::Shared,
@@ -129,11 +142,19 @@ fn spawn_signal_task(
 
             // FSM : real_up = fair_up → gap nul, gap_min=0 ⇒ test neutralisé (jugé à l'exécuteur).
             let input = TickInput { now_ms, decision, fair_up, real_up: fair_up, velocity, liquidity_vacuum, blocked };
+            // Tir aux deux cibles : LIVE d'abord (priorité absolue à la vitesse d'exécution),
+            // PAPER ensuite. Même `sent_ms` pour les deux → latence transport comparable.
             match sniper.step(&input) {
                 Action::Fire { side, strength } => {
-                    sender.send(WireSignal::Attack { side, size: strength_to_size(strength), price: fair_up as f32 }).await;
+                    let sig = WireSignal::Attack { side, size: strength_to_size(strength), price: fair_up as f32, sent_ms: now_ms };
+                    live_sender.send(sig).await;
+                    if let Some(p) = &paper_sender { p.send(sig).await; }
                 }
-                Action::Kill => sender.send(WireSignal::Kill).await,
+                Action::Kill => {
+                    let sig = WireSignal::Kill { sent_ms: now_ms };
+                    live_sender.send(sig).await;
+                    if let Some(p) = &paper_sender { p.send(sig).await; }
+                }
                 Action::None => {}
             }
 

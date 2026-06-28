@@ -68,9 +68,9 @@
           <div class="row"><span>Sizing</span><b id="ctl_sizing">—</b></div>
           <div class="row"><span>Drawdown / max</span><b id="ctl_dd">—</b></div>
           <div class="toggle-wrap">
-            <button id="mode-toggle" class="mode-toggle" onclick="toggleMode()">—</button>
+            <button id="mode-toggle" class="mode-toggle" onclick="toggleRun()">—</button>
           </div>
-          <p class="muted" style="margin:.5rem 0 0">Bascule <b>PAPER ⇄ LIVE</b>. En LIVE, le sizing s'appuie sur la bankroll réelle ; reste <b>dry-run</b> tant que <code>LIVE_ARMED=true</code> + signature vérifiée.</p>
+          <p class="muted" style="margin:.5rem 0 0"><b>Start/Stop</b> = pause logicielle (le process et les WebSockets restent chauds). Sur le nœud LIVE, le sizing s'appuie sur la bankroll réelle ; reste <b>dry-run</b> tant que <code>LIVE_ARMED=true</code> + signature vérifiée.</p>
         </div>
 
         <div class="card">
@@ -100,6 +100,15 @@
           <h2>📡 Latences TCP</h2>
           <div class="row"><span>Polymarket WS</span><b id="lat_p">—</b></div>
           <div class="row lat-bar-row"><div class="lat-bar-wrap"><div id="latbar_p" class="lat-bar"></div></div></div>
+        </div>
+
+        <div class="card" id="card-lat-total">
+          <h2>⚡ Latence totale (signal→ordre)</h2>
+          <div class="row"><span><b>TOTAL</b></span><b id="lat_total">—</b></div>
+          <div class="row"><span>· Transport radar→nœud <span class="muted">(NTP)</span></span><b id="lat_transport">—</b></div>
+          <div class="row"><span>· Décision (recv→soumission)</span><b id="lat_decide">—</b></div>
+          <div class="row"><span>· POST CLOB (round-trip)</span><b id="lat_post">—</b></div>
+          <p class="muted" style="margin:.4rem 0 0">Mesuré au dernier ordre soumis. Transport fiable seulement si les horloges Tokyo/Dublin sont synchronisées (NTP).</p>
         </div>
     </div>
   </section>

@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust Quant Bot — RADAR (Tokyo, ap-northeast-1) : OBI Binance+OKX → UDP
+Description=Rust Quant Bot — RADAR (Tokyo, ap-northeast-1) : OBI Binance+OKX → UDP (live + paper)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,9 +7,12 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/rust-quant-bot
-# IP publique de l'exécuteur (Dublin) — À RENSEIGNER au déploiement.
-Environment=TARGET_EXECUTOR_IP=REMPLACER_PAR_IP_PUBLIQUE_DUBLIN
-Environment=TARGET_PORT=8080
+# Cible LIVE (Dublin) — servie EN PREMIER. À RENSEIGNER au déploiement.
+Environment=TARGET_LIVE_IP=REMPLACER_PAR_IP_PUBLIQUE_DUBLIN
+Environment=TARGET_LIVE_PORT=8080
+# Cible PAPER (machine séparée) — tir SECONDAIRE (après le live). Optionnel : si absent, live seul.
+Environment=TARGET_PAPER_IP=REMPLACER_PAR_IP_PUBLIQUE_PAPER
+Environment=TARGET_PAPER_PORT=8081
 # Dashboard local du radar (OBI/vélocité/signaux émis + latences CEX).
 Environment=PORT=8768
 Environment=RUST_LOG=info

@@ -50,18 +50,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Nœud Radar (Tokyo) : écoute Binance/OKX, calcule l'OBI, tire en UDP vers l'exécuteur.
+    /// Nœud Radar (Tokyo) : écoute Binance/OKX, calcule l'OBI, tire en UDP vers live (+ paper).
     Radar {
-        /// IP de l'exécuteur (Dublin). Fallback env `TARGET_EXECUTOR_IP`.
-        #[arg(short, long, env = "TARGET_EXECUTOR_IP")]
+        /// IP du nœud live (Dublin). Fallback env `TARGET_LIVE_IP` (ou legacy `TARGET_EXECUTOR_IP`).
+        #[arg(short, long, env = "TARGET_LIVE_IP")]
         target_ip: String,
-        /// Port UDP de l'exécuteur. Fallback env `TARGET_PORT`.
-        #[arg(long, env = "TARGET_PORT", default_value = "8080")]
+        /// Port UDP du nœud live. Fallback env `TARGET_LIVE_PORT` (ou legacy `TARGET_PORT`).
+        #[arg(long, env = "TARGET_LIVE_PORT", default_value = "8080")]
         target_port: u16,
     },
-    /// Nœud Exécuteur (Dublin) : écoute l'UDP et exécute (paper) sur Polymarket.
-    Executor {
+    /// Nœud Live (Dublin) : écoute l'UDP et exécute RÉELLEMENT sur Polymarket (zéro code paper).
+    Live {
         /// Port UDP d'écoute. Fallback env `LISTEN_PORT`.
+        #[arg(long, env = "LISTEN_PORT", default_value = "8080")]
+        listen_port: u16,
+    },
+    /// Nœud Paper (machine séparée) : écoute l'UDP et simule (zéro code live).
+    Paper {
+        /// Port UDP d'écoute. Fallback env `PAPER_LISTEN_PORT`.
+        #[arg(long, env = "PAPER_LISTEN_PORT", default_value = "8081")]
+        listen_port: u16,
+    },
+    /// Alias rétro-compatible de `live` (ancien nom).
+    Executor {
         #[arg(long, env = "LISTEN_PORT", default_value = "8080")]
         listen_port: u16,
     },
@@ -86,7 +97,9 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().mode.unwrap_or(Mode::Mono) {
         Mode::Radar { target_ip, target_port } => roles::radar::run(cfg, target_ip, target_port).await,
-        Mode::Executor { listen_port } => roles::executor::run(cfg, listen_port).await,
+        Mode::Live { listen_port } => roles::live::run(cfg, listen_port).await,
+        Mode::Paper { listen_port } => roles::paper::run(cfg, listen_port).await,
+        Mode::Executor { listen_port } => roles::live::run(cfg, listen_port).await,
         Mode::Mono => run_mono(cfg).await,
         Mode::Poly { cmd } => cli::run(cmd, cfg).await,
     }
@@ -132,7 +145,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    let dash = dashboard::shared(cfg.dry_run);
+    let dash = dashboard::shared(cfg.dry_run, "mono");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });

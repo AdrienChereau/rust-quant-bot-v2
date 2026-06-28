@@ -45,6 +45,23 @@ pub struct KellyParams {
     pub max_hold_secs: i64,
 }
 
+impl KellyParams {
+    /// Taille de Kelly sur une `equity` explicite : `f* = edge/odds`, bornée. Pure fonction du
+    /// sizing (aucune dépendance à `PaperEngine`) — utilisée par le PAPER (cash interne) **et** par
+    /// le LIVE (vraie collatéral CLOB). Renvoie le nombre de tokens (entier).
+    pub fn kelly_size_for(&self, edge: f64, price: f64, equity: f64) -> f64 {
+        if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
+            return 0.0;
+        }
+        // Pari binaire : gain net si on a raison ≈ (1−price)/price ; Kelly f = edge/odds.
+        let odds = (1.0 - price) / price;
+        let f_full = (edge / odds).clamp(0.0, 1.0);
+        let f = f_full * self.kelly_fraction;
+        let budget = (equity * f).min(equity * self.max_size_pct);
+        (budget / price).floor()
+    }
+}
+
 pub struct PaperEngine {
     pub state: SniperState,
     pub position: Option<OpenPosition>,
@@ -83,21 +100,13 @@ impl PaperEngine {
 
     /// Taille de Kelly sur le cash paper interne (sizing paper).
     pub fn kelly_size(&self, edge: f64, price: f64) -> f64 {
-        self.kelly_size_for(edge, price, self.state.cash)
+        self.params.kelly_size_for(edge, price, self.state.cash)
     }
 
-    /// Taille de Kelly sur une `equity` explicite : `f* = edge/odds`, bornée. Utilisé en LIVE avec
-    /// la **vraie collatéral** CLOB (et non le cash paper). Renvoie le nb de tokens (entier).
+    /// Taille de Kelly sur une `equity` explicite (délègue à `KellyParams::kelly_size_for`).
+    /// Conservé pour compat ; le LIVE appelle désormais directement `KellyParams::kelly_size_for`.
     pub fn kelly_size_for(&self, edge: f64, price: f64, equity: f64) -> f64 {
-        if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
-            return 0.0;
-        }
-        // Pari binaire : gain net si on a raison ≈ (1−price)/price ; Kelly f = edge/odds.
-        let odds = (1.0 - price) / price;
-        let f_full = (edge / odds).clamp(0.0, 1.0);
-        let f = f_full * self.params.kelly_fraction;
-        let budget = (equity * f).min(equity * self.params.max_size_pct);
-        (budget / price).floor()
+        self.params.kelly_size_for(edge, price, equity)
     }
 
     /// Exécute un tir (achat taker du side). Slippage : prix moyen en parcourant le

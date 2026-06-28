@@ -1,0 +1,27 @@
+[Unit]
+Description=Rust Quant Bot — PAPER (machine séparée) : écoute UDP → simulation pure (zéro ordre réel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rust-quant-bot
+# Build par défaut (SANS --features live) : aucun code live n'est compilé ici.
+Environment=DRY_RUN=true
+Environment=PAPER_LISTEN_PORT=8081
+# Dashboard PAPER (PnL paper, start/stop paper).
+Environment=PORT=8768
+Environment=STATE_PATH=/home/ubuntu/rust-quant-bot/data/sniper_state.json
+Environment=TRADES_PATH=/home/ubuntu/rust-quant-bot/data/sniper_trades.jsonl
+Environment=START_CASH=200
+Environment=MAX_DRAWDOWN=20
+Environment=RUST_LOG=info
+ExecStart=/home/ubuntu/rust-quant-bot/target/release/rust-quant-bot paper
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/ubuntu/rust-quant-bot/data/paper.log
+StandardError=append:/home/ubuntu/rust-quant-bot/data/paper.log
+
+[Install]
+WantedBy=multi-user.target

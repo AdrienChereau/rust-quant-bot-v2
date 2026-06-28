@@ -1,0 +1,35 @@
+[Unit]
+Description=Rust Quant Bot — LIVE (Dublin, eu-west-1) : écoute UDP → exécution RÉELLE Polymarket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rust-quant-bot
+# Build OBLIGATOIRE avec --features live (signing EIP-712 / POLY_1271). Binaire identique au paper.
+# Verrou matériel d'envoi réel : LIVE_ARMED=false par défaut (dry-run signé). Passer à true seulement
+# après preflight `poly verify` OK, puis surveiller.
+Environment=LIVE_ARMED=false
+Environment=DRY_RUN=false
+Environment=LISTEN_PORT=8080
+# Dashboard LIVE (bankroll/PnL réel, start/stop, breaker, latence totale).
+Environment=PORT=8769
+Environment=LIVE_STATE_PATH=/home/ubuntu/rust-quant-bot/data/live_state.json
+Environment=LIVE_TRADES_PATH=/home/ubuntu/rust-quant-bot/data/live_trades.jsonl
+Environment=MAX_DRAWDOWN=20
+Environment=RUST_LOG=info
+# Secrets Polymarket (POLY_PRIVATE_KEY, POLY_API_*, POLY_SIG_TYPE=3…) chargés depuis ~/.env (jamais en git).
+EnvironmentFile=-/home/ubuntu/rust-quant-bot/.env
+ExecStart=/home/ubuntu/rust-quant-bot/target/release/rust-quant-bot live
+# Priorité au hot-path : épingle sur des cœurs dédiés + nice négative (ajuster selon l'instance).
+CPUAffinity=0 1
+Nice=-5
+IOSchedulingClass=realtime
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/ubuntu/rust-quant-bot/data/live.log
+StandardError=append:/home/ubuntu/rust-quant-bot/data/live.log
+
+[Install]
+WantedBy=multi-user.target

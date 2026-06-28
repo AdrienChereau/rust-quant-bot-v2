@@ -19,6 +19,8 @@ const APP_JS: &str = include_str!("../frontend/app.js");
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DashState {
     pub dry_run: bool,
+    /// Type de nœud : "live" | "paper" | "radar" | "mono" — pilote l'affichage du frontend.
+    pub node_kind: String,
     // Radar
     pub binance_connected: bool,
     pub okx_connected: bool,
@@ -79,12 +81,19 @@ pub struct DashState {
     pub lat_last_buy_ms: Option<u64>,   // BUY FAK : début POST → réponse CLOB
     pub lat_last_sell_ms: Option<u64>,  // SELL FAK : début POST → réponse CLOB
     pub pm_ws_stale_ms: Option<u64>,    // now − last_ws_ts_ms (Phase 2+)
+    // Latence TOTALE pipeline signal→ordre (ms) — décomposée par leg + somme.
+    pub lat_transport_ms: Option<u64>,  // radar→nœud (sent_ms → recv) — requiert NTP sync
+    pub lat_decide_ms:    Option<u64>,  // recv UDP → soumission OrderEngine (mono-horloge)
+    pub lat_post_ms:      Option<u64>,  // POST CLOB round-trip (du dernier ordre)
+    pub lat_total_ms:     Option<u64>,  // transport + decide + post
 }
 
 pub type Shared = Arc<RwLock<DashState>>;
 
-pub fn shared(dry_run: bool) -> Shared {
-    Arc::new(RwLock::new(DashState { dry_run, ..Default::default() }))
+/// Construit l'état partagé du dashboard. `node_kind` ∈ {"live","paper","radar","mono"} pilote
+/// l'affichage côté frontend (un nœud = une vue).
+pub fn shared(dry_run: bool, node_kind: &str) -> Shared {
+    Arc::new(RwLock::new(DashState { dry_run, node_kind: node_kind.to_string(), ..Default::default() }))
 }
 
 pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> anyhow::Result<()> {
@@ -104,7 +113,8 @@ pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> 
 
             // Endpoints de contrôle (POST) — mutent les atomics lock-free.
             if method == "POST" {
-                let ok = handle_control(path, &controls);
+                let node_kind = state.read().await.node_kind.clone();
+                let ok = handle_control(path, &controls, &node_kind);
                 let body = format!("{{\"ok\":{ok},\"mode\":\"{}\"}}", controls.mode_label());
                 let _ = sock.write_all(http_resp("application/json", &body).as_bytes()).await;
                 let _ = sock.flush().await;
@@ -125,18 +135,36 @@ pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> 
 }
 
 /// Applique un endpoint de contrôle. Renvoie `true` si l'action est reconnue.
-/// ⚠️ Passer en LIVE ne déclenche PAS l'envoi réel : le verrou `LIVE_ARMED` (env) reste requis
-/// dans la boucle de trading (sinon dry-run). Modèle simplifié = un seul interrupteur PAPER ⇄ LIVE.
-fn handle_control(path: &str, c: &RuntimeControls) -> bool {
+///
+/// Start/Stop = **pause logicielle** (le process et les WebSockets restent chauds). La sémantique
+/// dépend du `node_kind` :
+/// - nœud `paper` → `paper_paused`.
+/// - nœud `live`  → `live_paused` (le live reste *enabled* ; le verrou `LIVE_ARMED` env reste requis
+///   pour l'envoi réel).
+///
+/// Les endpoints legacy `/mode/paper` `/mode/live` restent utilisables par le nœud `mono`.
+fn handle_control(path: &str, c: &RuntimeControls, node_kind: &str) -> bool {
     match path {
-        // PAPER : sizing sur le cash fictif, aucun ordre réel.
+        // Start/Stop génériques (pause logicielle) — sémantique selon le nœud.
+        "/start" => match node_kind {
+            "live" => {
+                c.live_enabled.store(true, Ordering::Relaxed);
+                c.live_paused.store(false, Ordering::Relaxed);
+                true
+            }
+            _ => { c.paper_paused.store(false, Ordering::Relaxed); true }
+        },
+        "/stop" => match node_kind {
+            "live" => { c.live_paused.store(true, Ordering::Relaxed); true }
+            _ => { c.paper_paused.store(true, Ordering::Relaxed); true }
+        },
+        // Legacy (mono) : bascule PAPER ⇄ LIVE dans un même process.
         "/mode/paper" => {
             c.live_enabled.store(false, Ordering::Relaxed);
             c.live_paused.store(true, Ordering::Relaxed);
             c.paper_paused.store(false, Ordering::Relaxed);
             true
         }
-        // LIVE : sizing sur la vraie collatéral CLOB (le paper ne tire plus, cf. hot-loop).
         "/mode/live" => {
             c.live_enabled.store(true, Ordering::Relaxed);
             c.live_paused.store(false, Ordering::Relaxed);

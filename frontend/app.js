@@ -1,8 +1,9 @@
 const $ = (id) => document.getElementById(id);
 function fmt(n, d = 2) { return (n == null || Number.isNaN(n)) ? "—" : Number(n).toFixed(d); }
 
-// Mode courant (dernier /state) — pilote la bascule PAPER ⇄ LIVE.
+// Mode courant + type de nœud (dernier /state).
 let currentMode = "PAPER";
+let nodeKind = "mono";
 
 // Endpoint de contrôle (POST) → feedback immédiat via le mode renvoyé, puis refresh complet.
 async function ctl(path) {
@@ -14,23 +15,28 @@ async function ctl(path) {
 }
 window.ctl = ctl;
 
-// Interrupteur unique : si on est en LIVE → repasse en PAPER, sinon → passe en LIVE.
-function toggleMode() {
-  const goingLive = (currentMode !== "LIVE");
-  if (goingLive && !confirm("Passer en LIVE ? Le sizing utilisera la bankroll réelle (CLOB).")) return;
-  ctl(goingLive ? "/mode/live" : "/mode/paper");
+// Start/Stop = pause logicielle. Si le nœud tourne (LIVE/PAPER) → Stop ; si en pause → Start.
+function toggleRun() {
+  const running = (currentMode === "LIVE" || currentMode === "PAPER");
+  if (running) {
+    ctl("/stop");
+  } else {
+    if (nodeKind === "live" && !confirm("Démarrer le nœud LIVE ? Le sizing utilisera la bankroll réelle (CLOB).")) return;
+    ctl("/start");
+  }
 }
-window.toggleMode = toggleMode;
+window.toggleRun = toggleRun;
 
-// Met à jour le libellé/style du bouton bascule selon le mode courant.
+// Met à jour le libellé/style du bouton Start/Stop selon l'état (en pause ou actif).
 function renderToggle(mode) {
   const btn = $("mode-toggle");
   if (!btn) return;
-  if (mode === "LIVE") {
-    btn.textContent = "↩ Revenir en PAPER";
+  const running = (mode === "LIVE" || mode === "PAPER");
+  if (running) {
+    btn.textContent = "⏸ STOP";
     btn.className = "mode-toggle live";
   } else {
-    btn.textContent = "▶ Passer en LIVE";
+    btn.textContent = "▶ START";
     btn.className = "mode-toggle paper";
   }
 }
@@ -45,23 +51,27 @@ async function refresh() {
 
     const dry = $("dry"); dry.textContent = s.dry_run ? "PAPER" : "LIVE"; dry.className = "badge " + (s.dry_run ? "paper" : "live");
 
-    // Detect role
-    const isOrder = (s.btc_spot > 0) || (s.lat_binance_ms != null) || (s.obi_binance !== 0);
-    const isKiller = (s.market_slug !== "") || (s.lat_polymarket_ms != null) || (s.cash > 0);
-    
-    if (isOrder && isKiller) {
-        $("app-name").textContent = "MONO TERMINAL";
-        $("order-terminal").style.display = "grid";
-        $("killer-terminal").style.display = "block";
-    } else if (isOrder) {
-        $("app-name").textContent = "ORDER TERMINAL (TOKYO)";
-        $("order-terminal").style.display = "grid";
-        $("killer-terminal").style.display = "none";
-    } else if (isKiller) {
-        $("app-name").textContent = "KILLER TERMINAL (DUBLIN)";
-        $("order-terminal").style.display = "none";
-        $("killer-terminal").style.display = "block";
+    // Type de nœud — pilote l'affichage (un nœud = une vue). Fallback heuristique si absent.
+    nodeKind = s.node_kind || "";
+    let isOrder, isKiller, isLiveNode;
+    if (nodeKind === "radar") { isOrder = true;  isKiller = false; isLiveNode = false; }
+    else if (nodeKind === "live")  { isOrder = false; isKiller = true;  isLiveNode = true;  }
+    else if (nodeKind === "paper") { isOrder = false; isKiller = true;  isLiveNode = false; }
+    else if (nodeKind === "mono")  { isOrder = true;  isKiller = true;  isLiveNode = (s.mode === "LIVE"); }
+    else {
+        // Fallback legacy : détection par contenu.
+        isOrder = (s.btc_spot > 0) || (s.lat_binance_ms != null) || (s.obi_binance !== 0);
+        isKiller = (s.market_slug !== "") || (s.lat_polymarket_ms != null) || (s.cash > 0);
+        isLiveNode = (s.mode === "LIVE");
     }
+
+    const titles = { radar: "ORDER TERMINAL (TOKYO)", live: "LIVE TERMINAL (DUBLIN)", paper: "PAPER TERMINAL", mono: "MONO TERMINAL" };
+    $("app-name").textContent = titles[nodeKind] || (isOrder && isKiller ? "MONO TERMINAL" : isOrder ? "ORDER TERMINAL" : "KILLER TERMINAL");
+    $("order-terminal").style.display = isOrder ? "grid" : "none";
+    $("killer-terminal").style.display = isKiller ? "block" : "none";
+    // Carte latence totale : nœud live/mono uniquement (le paper n'envoie pas d'ordre réel).
+    const cardTotal = $("card-lat-total");
+    if (cardTotal) cardTotal.style.display = isLiveNode ? "block" : "none";
 
     if (isOrder) {
         $("binance").innerHTML = s.binance_connected ? '<span class="ok">connecté</span>' : '<span class="ko">—</span>';
@@ -123,10 +133,10 @@ async function refresh() {
         $("shots").textContent = `${s.shots ?? 0} (${s.wins ?? 0}/${s.losses ?? 0})`;
         $("hr").textContent = ((s.hit_rate ?? 0) * 100).toFixed(1) + "%";
         
-        // Giant PNL — en LIVE, le PnL réel (Δ bankroll) ; sinon le PnL paper.
-        const liveActive = mode === "LIVE" && s.live_pnl != null;
-        const pnlVal = liveActive ? s.live_pnl : s.realized_pnl;
-        $("pnl-label").textContent = liveActive ? "REALIZED PNL — LIVE (réel, USDC)" : "REALIZED PNL — PAPER (USDC)";
+        // Giant PNL — nœud LIVE : PnL réel (Δ bankroll) ; nœud PAPER : PnL paper.
+        const showLivePnl = isLiveNode && s.live_pnl != null;
+        const pnlVal = showLivePnl ? s.live_pnl : s.realized_pnl;
+        $("pnl-label").textContent = showLivePnl ? "REALIZED PNL — LIVE (réel, USDC)" : "REALIZED PNL — PAPER (USDC)";
         const giantPnl = $("giant-pnl");
         giantPnl.textContent = (pnlVal >= 0 ? "+" : "") + fmt(pnlVal, 2);
         giantPnl.className = "giant-pnl " + (pnlVal > 0 ? "pos" : (pnlVal < 0 ? "neg" : ""));
@@ -165,7 +175,17 @@ async function refresh() {
     if (isKiller) {
         renderLat("lat_p", "latbar_p", s.lat_polymarket_ms);
     }
-    
+
+    if (isLiveNode) {
+        const ms = (v) => (v == null ? "—" : v.toFixed(0) + " ms");
+        const totColor = (v) => v == null ? "var(--muted)" : (v < 150 ? "var(--green)" : v < 400 ? "var(--amber)" : "var(--red)");
+        const totEl = $("lat_total");
+        if (totEl) { totEl.textContent = ms(s.lat_total_ms); totEl.style.color = totColor(s.lat_total_ms); }
+        if ($("lat_transport")) $("lat_transport").textContent = ms(s.lat_transport_ms);
+        if ($("lat_decide")) $("lat_decide").textContent = ms(s.lat_decide_ms);
+        if ($("lat_post")) $("lat_post").textContent = ms(s.lat_post_ms);
+    }
+
   } catch (e) {
     $("status").textContent = "✗ backend injoignable"; $("status").className = "ko";
   }
