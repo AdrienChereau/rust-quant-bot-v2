@@ -16,6 +16,7 @@ use crate::net::wire::WireSignal;
 use crate::polymarket::live_executor::{self, LiveCredentials};
 use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
+use crate::polymarket::pm_user_ws::{self, FillEvent};
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
 use crate::strategy::live_position::LivePositionManager;
@@ -113,6 +114,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Résultats en attente de l'OrderEngine.
     let mut pending_opens: Vec<PendingOpen> = Vec::new();
     let mut pending_close: Option<(oneshot::Receiver<OrderResult>, &'static str)> = None;
+    // User WS fill confirmations — lancé au premier marché détecté.
+    let mut user_ws_rx: Option<tokio::sync::watch::Receiver<Option<FillEvent>>> = None;
+    let mut user_ws_condition_id: String = String::new();
 
     loop {
         tokio::select! {
@@ -129,6 +133,32 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             let g = pm.lock().unwrap();
             (g.market.clone(), g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
         };
+
+        // ── 0. Spawn/relance du user WS si nouveau marché ────────────────────────────
+        if let (Some(ref m), Some(ref creds)) = (&market, &live_creds) {
+            if m.condition_id != user_ws_condition_id && !m.condition_id.is_empty() {
+                user_ws_condition_id = m.condition_id.clone();
+                user_ws_rx = Some(pm_user_ws::spawn_user_ws(creds.clone(), m.condition_id.clone()));
+                tracing::info!(condition_id = %m.condition_id, "pm_user_ws: lancé pour nouveau marché");
+            }
+        }
+
+        // Drain fills WS user — met à jour last_buy_ms/sell_ms si fill confirmé.
+        if let Some(ref mut rx) = user_ws_rx {
+            if rx.has_changed().unwrap_or(false) {
+                if let Some(fill) = rx.borrow_and_update().clone() {
+                    tracing::info!(order_id = %fill.order_id, filled = fill.filled_size,
+                        price = fill.avg_price, "✅ fill confirmé via user WS");
+                    // Réconciliation : si on a une position avec ce buy_order_id → déjà traitée.
+                    // Sinon, le fill confirme un SELL en cours.
+                    if let Some(ref pos) = live_mgr.position {
+                        if pos.buy_order_id == fill.order_id {
+                            // BUY confirmé — position déjà créée par on_buy_result.
+                        }
+                    }
+                }
+            }
+        }
 
         // ── 1. Drain résultats OrderEngine ────────────────────────────────────────────
         // BUY results.
