@@ -33,6 +33,7 @@ use pricing::volatility::VolatilityTracker;
 use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials};
 use polymarket::pm_poller::{spawn_pm_poller, PmShared};
+use polymarket::pm_websocket;
 use signal::consolidated_obi::ConsolidatedObi;
 use state::RuntimeControls;
 use strategy::bankroll::{self, KellyParams, PaperEngine};
@@ -145,7 +146,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
     // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop). `true` = on a besoin du strike.
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_poller(pm.clone(), true, live_creds.clone());
+    let ws_market_tx = pm_websocket::init_market_ws(pm.clone());
+    spawn_pm_poller(pm.clone(), true, Some(ws_market_tx), live_creds.clone());
 
     // Moteurs.
     let consolidated = ConsolidatedObi::new(cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);

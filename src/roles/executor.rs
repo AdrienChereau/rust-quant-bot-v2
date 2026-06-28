@@ -17,6 +17,7 @@ use crate::polymarket::live_executor::{self, LiveCredentials};
 use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use crate::polymarket::pm_user_ws::{self, FillEvent};
+use crate::polymarket::pm_websocket;
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
 use crate::strategy::live_position::LivePositionManager;
@@ -79,7 +80,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     }
 
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_poller(pm.clone(), false, live_creds.clone());
+    // Lance le WS market une seule fois ; le poller lui envoie les tokens à chaque rollover.
+    let ws_market_tx = pm_websocket::init_market_ws(pm.clone());
+    spawn_pm_poller(pm.clone(), false, Some(ws_market_tx), live_creds.clone());
 
     let lat = crate::latency::shared();
     {
