@@ -1,16 +1,12 @@
 //! Nœud **Exécuteur (Dublin)** — récepteur.
 //!
-//! Possède le carnet Polymarket, la bankroll et le moteur paper. Une tâche UDP dédiée décode les
-//! paquets 6 octets du radar et les pousse dans un `mpsc` ; la boucle timer (50 ms) :
-//!   1. gère la position ouverte (TP/SL/max-hold) à chaque tick ;
-//!   2. draine les signaux reçus → calcule le **gap = fair(paquet) − real(local)**, applique le
-//!      filtre `gap_min` + fin-de-fenêtre + cooldown, **dimensionne via Kelly** (autoritaire),
-//!      puis `paper.fire` (DRY_RUN : fill simulé, aucun ordre réel).
-//!
-//! Sonde de latence côté Dublin : Polymarket uniquement (`Probes::PmOnly`).
+//! Phase 3 : les ordres live passent par l'`OrderEngine` (mpsc actor) — la hot loop 50 ms
+//! n'attend plus jamais un POST CLOB. Bankroll via `watch::channel` (lock-free).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::{oneshot, watch};
 
 use crate::concurrency::bus::Side;
 use crate::config::Config;
@@ -18,10 +14,23 @@ use crate::dashboard;
 use crate::net::udp;
 use crate::net::wire::WireSignal;
 use crate::polymarket::live_executor::{self, LiveCredentials};
+use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
 use crate::strategy::live_position::LivePositionManager;
+
+/// Contexte d'un BUY en attente de confirmation par l'OrderEngine.
+struct PendingOpen {
+    rx: oneshot::Receiver<OrderResult>,
+    side: Side,
+    token_id: String,
+    neg_risk: bool,
+    order_price: f64,
+    size: f64,
+    tick: f64,
+    now_ms: u64,
+}
 
 pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     tracing::info!(listen_port, dry_run = cfg.dry_run, "🎯 EXÉCUTEUR (Dublin) démarré");
@@ -35,22 +44,22 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
     }
     if cfg.live_armed {
-        tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
+        tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible");
     }
     if cfg.live_force_min_size {
-        tracing::warn!("⚠️  LIVE_FORCE_MIN_SIZE=true — taille minimale forcée (Kelly ignoré, agressif)");
+        tracing::warn!("⚠️  LIVE_FORCE_MIN_SIZE=true — taille minimale forcée");
     }
 
-    // Vraie collatéral USDC (CLOB) — lue toutes les 30 s ; sert de bankroll pour le sizing LIVE.
-    let live_bankroll = Arc::new(Mutex::new(None::<f64>));
+    // Bankroll via watch::channel — zéro lock dans la hot loop.
+    let (bk_tx, bk_rx) = watch::channel(None::<f64>);
     if let Some(creds) = live_creds.clone() {
-        let bk = live_bankroll.clone();
+        let tx = bk_tx.clone();
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_secs(30));
             loop {
                 poll.tick().await;
                 match live_executor::get_collateral_balance(&creds).await {
-                    Ok(usdc) => { *bk.lock().unwrap() = Some(usdc);
+                    Ok(usdc) => { let _ = tx.send(Some(usdc));
                         tracing::info!(usdc = format!("{usdc:.2}"), "💰 bankroll réelle CLOB"); }
                     Err(e) => tracing::warn!(error = %e, "lecture bankroll CLOB échouée"),
                 }
@@ -58,13 +67,16 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         });
     }
 
+    // OrderEngine : acteur mpsc — POST CLOB hors hot loop.
+    let engine_tx = live_creds.as_ref()
+        .map(|c| order_engine::spawn_order_engine(c.clone(), cfg.live_armed, 8));
+
     let dash = dashboard::shared(cfg.dry_run);
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
     }
 
-    // `false` = l'exécuteur n'a pas besoin du strike (le fair arrive dans le paquet radar).
     let pm = Arc::new(Mutex::new(PmShared::default()));
     spawn_pm_poller(pm.clone(), false, live_creds.clone());
 
@@ -83,7 +95,6 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         std::env::var("STATE_PATH").unwrap_or_else(|_| "data/sniper_state.json".into()),
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
-    // Manager LIVE — symétrique au PaperEngine, mais touche le CLOB. Persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,
         std::env::var("LIVE_STATE_PATH").unwrap_or_else(|_| "data/live_state.json".into()),
@@ -91,99 +102,121 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     );
 
     let mut rx = udp::listen(listen_port).await?;
-
     let mut last_fire_ms: u64 = 0;
-    let mut last_fair: f64 = 0.5; // dernier fair reçu (affichage gap)
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let mut last_fair: f64 = 0.5;
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
-    let mut live_dd = bankroll::LiveDrawdown::default(); // drawdown sur la bankroll réelle (live)
-    let mut live_pnl = bankroll::LivePnl::default();     // PnL réalisé live (Δ bankroll)
-    let mut was_live = false;                            // détection de transition paper→live
-    let mut live_shots: u64 = 0;                         // ordres live acceptés cette session
+    let mut live_dd = bankroll::LiveDrawdown::default();
+    let mut live_pnl = bankroll::LivePnl::default();
+    let mut was_live = false;
+    let mut live_shots: u64 = 0;
+    // Résultats en attente de l'OrderEngine.
+    let mut pending_opens: Vec<PendingOpen> = Vec::new();
+    let mut pending_close: Option<(oneshot::Receiver<OrderResult>, &'static str)> = None;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                // Arrêt propre : l'état paper est déjà persisté à chaque clôture de position.
                 tracing::info!("SIGINT reçu — arrêt propre (exécuteur)");
                 break Ok(());
             }
-            _ = tick.tick() => {}
+            _ = tick_interval.tick() => {}
         }
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let live_bankroll_val = *bk_rx.borrow();
 
         let (market, real_up, up_book, down_book, remaining_s) = {
             let g = pm.lock().unwrap();
             (g.market.clone(), g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
         };
 
-        // 1. Gestion de la position ouverte (TP/SL/max-hold) — paper.
+        // ── 1. Drain résultats OrderEngine ────────────────────────────────────────────
+        // BUY results.
+        pending_opens.retain_mut(|p| {
+            match p.rx.try_recv() {
+                Ok(res) => {
+                    live_mgr.on_buy_result(res, p.side, &p.token_id, p.neg_risk,
+                        p.order_price, p.size, p.tick, p.now_ms);
+                    false
+                }
+                Err(oneshot::error::TryRecvError::Empty) => true,
+                Err(_) => false,
+            }
+        });
+        // SELL result.
+        if let Some((r, reason)) = pending_close.as_mut() {
+            match r.try_recv() {
+                Ok(res) => { live_mgr.on_sell_result(res, reason); pending_close = None; }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => { pending_close = None; }
+            }
+        }
+
+        // ── 2. Paper manage (synchrone) ────────────────────────────────────────────────
         let mark_bid = if let Some(p) = &paper.position {
-            let bk = if p.side == Side::Up { &up_book } else { &down_book };
+            let bk = if p.side == Side::Up { &*up_book } else { &*down_book };
             bk.best_bid()
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
 
-        // 1b. Gestion de la position LIVE (symétrique). Le manager poste les SELL FAK lui-même
-        //     si TP/SL/max-hold/fin-de-fenêtre est atteint ; reste idempotent sinon.
-        if let (Some(p), Some(creds), Some(m)) =
-            (live_mgr.position.as_ref(), live_creds.as_ref(), market.as_ref())
-        {
-            let live_book = if p.side == Side::Up { &up_book } else { &down_book };
-            let live_mark = live_book.best_bid();
-            live_mgr.manage(
-                creds, cfg.live_armed, live_mark, live_book,
-                m.min_order_size, m.tick_size, now_ms, remaining_s,
-            ).await;
+        // ── 3. Live manage → OrderEngine SELL (non-bloquant) ─────────────────────────
+        if pending_close.is_none() {
+            if let (Some(pos), Some(engine)) = (live_mgr.position.as_ref(), engine_tx.as_ref()) {
+                if let Some(m) = &market {
+                    let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
+                    if let Some(bid) = book.best_bid() {
+                        let held_s = (now_ms.saturating_sub(pos.opened_ms) / 1000) as i64;
+                        let reason = if bid >= pos.tp_price { Some("take_profit") }
+                            else if bid <= pos.sl_price { Some("stop_loss") }
+                            else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
+                            else { None };
+                        if let Some(r) = reason {
+                            let exit = match r { "take_profit" => pos.tp_price, "stop_loss" => pos.sl_price, _ => bid };
+                            let (tx, rx_r) = oneshot::channel();
+                            let cmd = OrderCmd::Close {
+                                token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
+                                price: exit, size: pos.size, tick: m.tick_size, reason: r, reply: tx,
+                            };
+                            if engine.try_send(cmd).is_ok() {
+                                pending_close = Some((rx_r, r));
+                                tracing::info!(reason = r, "⚡ SELL soumis à OrderEngine");
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Circuit breaker (drawdown) — LIVE : vraie bankroll CLOB ; PAPER : equity fictive.
+        // ── 4. Circuit breaker ────────────────────────────────────────────────────────
         let breaker_hit = if controls.live_active() {
-            match *live_bankroll.lock().unwrap() {
-                Some(real) => live_dd.breached(real, cfg.max_drawdown),
-                None => false, // bankroll réelle pas encore lue
-            }
+            live_bankroll_val.map_or(false, |real| live_dd.breached(real, cfg.max_drawdown))
         } else {
             bankroll::check_drawdown_breaker(paper.equity(mark_bid), cfg.start_cash, cfg.max_drawdown)
         };
         if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
             tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
-                "🛑 CIRCUIT BREAKER — drawdown atteint, exécution coupée");
+                "🛑 CIRCUIT BREAKER — drawdown atteint");
         }
 
-        // PnL live = Δ bankroll réelle depuis l'activation du live ; référence reposée à la bascule.
         let is_live = controls.live_active();
         if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
         was_live = is_live;
-        let live_pnl_val = if is_live {
-            live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
-        } else { None };
+        let live_pnl_val = if is_live { live_bankroll_val.map(|bk| live_pnl.update(bk)) } else { None };
 
-        // 2. Drain des signaux UDP reçus du radar.
+        // ── 5. Drain signaux UDP ──────────────────────────────────────────────────────
         while let Ok(sig) = rx.try_recv() {
             match sig {
                 WireSignal::Kill => tracing::warn!("⚡ KILL reçu — abstention"),
                 WireSignal::Attack { side, price, .. } => {
                     let fair = price as f64;
                     last_fair = fair;
-                    // gap = edge orienté selon le sens (toujours « fair en faveur du token visé »).
-                    let gap = match side {
-                        Side::Up => fair - real_up,
-                        Side::Down => real_up - fair,
-                    };
-                    // Raison de rejet unique (loggée) — sinon `None` = on tente l'exécution.
-                    let reject = if controls.is_breaker_tripped() {
-                        Some("breaker déclenché")
-                    } else if market.is_none() {
-                        Some("pas de marché")
-                    } else if remaining_s <= cfg.end_window_block_secs {
-                        Some("fin de fenêtre")
-                    } else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms {
-                        Some("cooldown")
-                    } else if gap < cfg.gap_min {
-                        Some("gap insuffisant")
-                    } else {
-                        None
-                    };
+                    let gap = match side { Side::Up => fair - real_up, Side::Down => real_up - fair };
+                    let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
+                        else if market.is_none() { Some("pas de marché") }
+                        else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
+                        else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
+                        else if gap < cfg.gap_min { Some("gap insuffisant") }
+                        else { None };
                     if let Some(reason) = reject {
                         tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
                             real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
@@ -192,27 +225,20 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                     }
                     if let Some(m) = &market {
                         let (book, token) = if side == Side::Up {
-                            (&up_book, &m.up_token_id)
+                            (&*up_book, &m.up_token_id)
                         } else {
-                            (&down_book, &m.down_token_id)
+                            (&*down_book, &m.down_token_id)
                         };
-                        let edge = gap; // gap ≥ gap_min > 0 ici
-                        // Aiguillage live → paper.
+                        let edge = gap;
                         if is_live {
-                            // En LIVE : on n'ouvre une position que si on a la vraie bankroll lue
-                            // ET qu'on n'a pas déjà une position live ouverte (LivePositionManager
-                            // l'enforce aussi, mais on évite un tir inutile).
-                            if live_mgr.position.is_some() {
-                                tracing::info!(reason = "position live déjà ouverte",
-                                    "✗ ordre live ignoré");
+                            if live_mgr.position.is_some() || !pending_opens.is_empty() {
+                                tracing::info!(reason = "position live déjà ouverte/pending", "✗ ordre live ignoré");
                             } else {
-                                match (*live_bankroll.lock().unwrap(), live_creds.as_ref()) {
-                                    (None, _) => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
-                                    (_, None) => tracing::warn!("LIVE actif mais POLY_* credentials absents — tir ignoré"),
-                                    (Some(bk), Some(creds)) => {
+                                match (live_bankroll_val, engine_tx.as_ref()) {
+                                    (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
+                                    (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
+                                    (Some(bk), Some(engine)) => {
                                         let order_price = book.best_ask().unwrap_or(real_up);
-                                        // Sizing : Kelly normal, OU taille minimale forcée (micro-test).
-                                        // LivePositionManager rajoutera la garde notionnel ≥ $1.
                                         let sized = if cfg.live_force_min_size {
                                             Some(m.min_order_size)
                                         } else {
@@ -222,20 +248,32 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                             )
                                         };
                                         match sized {
-                                            None => tracing::info!(reason = "taille sous le minimum",
-                                                min = m.min_order_size, "✗ ordre live ignoré"),
+                                            None => tracing::info!(min = m.min_order_size, "✗ taille sous le minimum"),
                                             Some(size) if size * order_price > bk => tracing::warn!(
-                                                cost = format!("{:.2}", size * order_price), bankroll = format!("{bk:.2}"),
-                                                "✗ ordre live ignoré — bankroll insuffisante"),
+                                                cost = format!("{:.2}", size * order_price),
+                                                bankroll = format!("{bk:.2}"),
+                                                "✗ bankroll insuffisante"),
                                             Some(size) => {
                                                 if cfg.live_force_min_size {
-                                                    tracing::warn!(size, "⚠️ taille FORCÉE au minimum (LIVE_FORCE_MIN_SIZE)");
+                                                    tracing::warn!(size, "⚠️ taille FORCÉE au minimum");
                                                 }
-                                                if live_mgr.try_open(
-                                                    creds, cfg.live_armed, side, token, m.neg_risk,
-                                                    order_price, size, m.tick_size, m.min_order_size, now_ms,
-                                                ).await {
+                                                let (tx, rx_r) = oneshot::channel();
+                                                let cmd = OrderCmd::Open {
+                                                    side, token_id: token.clone(), neg_risk: m.neg_risk,
+                                                    price: order_price, size, tick: m.tick_size,
+                                                    min_order_size: m.min_order_size, now_ms, reply: tx,
+                                                };
+                                                if engine.try_send(cmd).is_ok() {
+                                                    pending_opens.push(PendingOpen {
+                                                        rx: rx_r, side, token_id: token.clone(),
+                                                        neg_risk: m.neg_risk, order_price, size,
+                                                        tick: m.tick_size, now_ms,
+                                                    });
                                                     last_fire_ms = now_ms;
+                                                    tracing::info!(side = side.as_str(), price = order_price,
+                                                        size, "⚡ BUY soumis à OrderEngine");
+                                                } else {
+                                                    tracing::warn!("OrderEngine plein — tir ignoré");
                                                 }
                                             }
                                         }
@@ -252,21 +290,18 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             }
         }
 
-        // Dashboard exécuteur (PM/position/PnL ; OBI laissé à 0).
+        // ── 6. Dashboard ──────────────────────────────────────────────────────────────
         let lat_snap = lat.lock().unwrap().clone();
         {
             let mut d = dash.write().await;
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
             d.remaining_s = remaining_s;
             d.fair_up = last_fair; d.real_up = real_up; d.gap = last_fair - real_up;
-            // Position affichée : la live prend la priorité si elle existe, sinon la paper.
             if let Some(p) = &live_mgr.position {
-                d.in_position = true;
-                d.pos_side = p.side.as_str().into();
+                d.in_position = true; d.pos_side = p.side.as_str().into();
                 d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
             } else if let Some(p) = &paper.position {
-                d.in_position = true;
-                d.pos_side = p.side.as_str().into();
+                d.in_position = true; d.pos_side = p.side.as_str().into();
                 d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
             } else {
                 d.in_position = false;
@@ -284,9 +319,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.initial_capital = cfg.start_cash;
             d.max_drawdown = cfg.max_drawdown;
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
-            d.live_bankroll = *live_bankroll.lock().unwrap();
-            // PnL live : on PRIVILÉGIE le PnL réalisé par le manager (somme des clôtures réelles).
-            // Sinon fallback sur le Δ bankroll (live_pnl_val) — utile avant la 1re clôture.
+            d.live_bankroll = live_bankroll_val;
             d.live_pnl = if controls.live_active() {
                 if live_mgr.state.shots > 0 { Some(live_mgr.state.realized_pnl) } else { live_pnl_val }
             } else { None };

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrency::bus::Side;
 use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs, PlaceResult};
+use crate::polymarket::order_engine::OrderResult;
 use crate::polymarket::relayer::PolyBook;
 use crate::strategy::bankroll::KellyParams;
 
@@ -262,6 +263,96 @@ impl LivePositionManager {
             }
         }
     }
+
+    /// Callback appelé par executor.rs quand l'OrderEngine renvoie le résultat d'un BUY.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_buy_result(
+        &mut self,
+        res: OrderResult,
+        side: Side,
+        token_id: &str,
+        neg_risk: bool,
+        order_price: f64,
+        size: f64,
+        tick: f64,
+        now_ms: u64,
+    ) {
+        match res {
+            OrderResult::Placed { order_id, filled_size, avg_price, post_ms, .. } => {
+                self.last_buy_ms = Some(post_ms);
+                let entry = avg_price.unwrap_or(order_price);
+                let filled = filled_size.unwrap_or(size);
+                if filled <= 0.0 {
+                    tracing::warn!(order_id = %order_id, "BUY accepté mais fill = 0 — pas de position");
+                    return;
+                }
+                let tp = round_tick((entry + self.params.tp_cents / 100.0).min(0.99), tick);
+                let sl = round_tick((entry - self.params.sl_cents / 100.0).max(0.01), tick);
+                self.state.shots += 1;
+                self.position = Some(LivePosition {
+                    side, token_id: token_id.to_string(), entry_price: entry, size: filled,
+                    tp_price: tp, sl_price: sl, opened_ms: now_ms, neg_risk,
+                    buy_order_id: order_id.clone(),
+                });
+                self.append("open", side.as_str(), entry, filled, 0.0, &order_id);
+                tracing::warn!(side = side.as_str(), token_id, entry = format!("{entry:.3}"),
+                    size = filled, tp = format!("{tp:.2}"), sl = format!("{sl:.2}"),
+                    order_id = %order_id, "🎯 SNIPE LIVE");
+                self.persist();
+            }
+            OrderResult::DryRun { .. } => {}
+            OrderResult::Failed { error, .. } => {
+                tracing::error!(error = %error, "❌ BUY live échoué (OrderEngine)");
+            }
+        }
+    }
+
+    /// Callback appelé par executor.rs quand l'OrderEngine renvoie le résultat d'un SELL.
+    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str) {
+        match res {
+            OrderResult::Placed { order_id, filled_size, avg_price, post_ms, .. } => {
+                self.last_sell_ms = Some(post_ms);
+                self.apply_close(order_id, filled_size, avg_price, reason);
+            }
+            OrderResult::DryRun { .. } => {}
+            OrderResult::Failed { error, .. } => {
+                self.state.failed_closes += 1;
+                tracing::error!(error = %error, reason, "❌ SELL live échoué (OrderEngine)");
+                self.persist();
+            }
+        }
+    }
+
+    /// Met à jour PnL et libère la position après un SELL confirmé.
+    pub fn apply_close(
+        &mut self,
+        order_id: String,
+        filled_size: Option<f64>,
+        avg_price: Option<f64>,
+        reason: &str,
+    ) {
+        let Some(p) = self.position.take() else { return };
+        let sold = filled_size.unwrap_or(p.size);
+        let got_price = avg_price.unwrap_or(p.sl_price);
+        if sold <= 0.0 {
+            self.state.failed_closes += 1;
+            tracing::error!(reason, "❌ SELL fill = 0 — position libérée, perte enregistrée");
+            self.position = Some(p); // remet la position
+            self.persist();
+            return;
+        }
+        let pnl = (got_price - p.entry_price) * sold;
+        self.state.realized_pnl += pnl;
+        if pnl >= 0.0 { self.state.wins += 1 } else { self.state.losses += 1 }
+        let kind = match reason { "take_profit" => "close_tp", "stop_loss" => "close_sl", _ => "close_max_hold" };
+        self.append(kind, p.side.as_str(), got_price, sold, pnl, &order_id);
+        tracing::warn!(reason, exit = format!("{got_price:.3}"), pnl = format!("{pnl:.2}"),
+            realized_pnl = format!("{:.2}", self.state.realized_pnl), order_id = %order_id, "✖ clôture LIVE");
+        self.persist();
+    }
+
+    /// Persiste l'état (exposé pour l'OrderEngine callback dans executor.rs).
+    pub fn persist_state(&self) { self.persist(); }
 
     #[allow(dead_code)] // exposé pour le dashboard / tooling externe
     pub fn hit_rate(&self) -> f64 {

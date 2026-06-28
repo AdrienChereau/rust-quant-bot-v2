@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod live_executor;
+pub mod order_engine;
 pub mod pm_poller;
 pub mod pm_websocket;
 #[cfg(feature = "live")]
