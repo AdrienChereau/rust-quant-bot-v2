@@ -28,6 +28,7 @@ pub fn spawn_pm_poller(
     fetch_strike: bool,
     ws_tx: Option<watch::Sender<Vec<String>>>,
     #[allow(unused_variables)] live_creds: Option<LiveCredentials>,
+    ws_stale_threshold_ms: u64,
 ) {
     tokio::spawn(async move {
         let client = PolymarketClient::new();
@@ -69,7 +70,7 @@ pub fn spawn_pm_poller(
             }
             // Fallback REST carnets — skip si WS est récent (< 2 s).
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-            let ws_fresh = last_ws_ts_ms > 0 && now_ms.saturating_sub(last_ws_ts_ms) < 2000;
+            let ws_fresh = last_ws_ts_ms > 0 && now_ms.saturating_sub(last_ws_ts_ms) < ws_stale_threshold_ms;
             if !ws_fresh {
                 let up = client.get_book(&up_tok).await.ok();
                 let dn = client.get_book(&dn_tok).await.ok();

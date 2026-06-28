@@ -16,6 +16,7 @@ use crate::net::wire::WireSignal;
 use crate::polymarket::live_executor::{self, LiveCredentials};
 use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
+use crate::polymarket::relayer::{Market, PolyBook};
 use crate::polymarket::pm_user_ws;
 use crate::polymarket::pm_websocket;
 use crate::state::RuntimeControls;
@@ -57,7 +58,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     if let Some(creds) = live_creds.clone() {
         let tx = bk_tx.clone();
         tokio::spawn(async move {
-            let mut poll = tokio::time::interval(Duration::from_secs(30));
+            let mut poll = tokio::time::interval(Duration::from_secs(cfg.bankroll_poll_secs));
             loop {
                 poll.tick().await;
                 match live_executor::get_collateral_balance(&creds).await {
@@ -71,7 +72,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     // OrderEngine : acteur mpsc — POST CLOB hors hot loop.
     let engine_tx = live_creds.as_ref()
-        .map(|c| order_engine::spawn_order_engine(c.clone(), cfg.live_armed, 8));
+        .map(|c| order_engine::spawn_order_engine(c.clone(), cfg.live_armed, cfg.order_engine_queue));
 
     // User WS : une seule task ; on lui envoie le condition_id au rollover.
     let (user_ws_cond_tx, mut user_ws_fill_rx) = live_creds.as_ref()
@@ -88,7 +89,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let pm = Arc::new(Mutex::new(PmShared::default()));
     // Lance le WS market une seule fois ; le poller lui envoie les tokens à chaque rollover.
     let ws_market_tx = pm_websocket::init_market_ws(pm.clone());
-    spawn_pm_poller(pm.clone(), false, Some(ws_market_tx), live_creds.clone());
+    spawn_pm_poller(pm.clone(), false, Some(ws_market_tx), live_creds.clone(), cfg.pm_ws_stale_threshold_ms);
 
     let lat = crate::latency::shared();
     {
@@ -125,21 +126,122 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut pending_close: Option<(oneshot::Receiver<OrderResult>, &'static str)> = None;
     let mut user_ws_condition_id: String = String::new();
 
+    // État snapshot hoissé pour traitement immédiat du signal UDP (Bloc E).
+    let mut now_ms: u64 = 0;
+    let mut live_bankroll_val: Option<f64> = None;
+    let mut market: Option<Market> = None;
+    let mut real_up: f64 = 0.5;
+    let mut up_book: std::sync::Arc<PolyBook> = std::sync::Arc::new(PolyBook::default());
+    let mut down_book: std::sync::Arc<PolyBook> = std::sync::Arc::new(PolyBook::default());
+    let mut remaining_s: i64 = 0;
+    let mut is_live: bool = false;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT reçu — arrêt propre (exécuteur)");
                 break Ok(());
             }
+            // Signal UDP traité immédiatement — pas d'attente du prochain tick 50ms.
+            Some(sig) = rx.recv() => {
+                match sig {
+                    WireSignal::Kill => tracing::warn!("⚡ KILL reçu — abstention"),
+                    WireSignal::Attack { side, price, .. } => {
+                        let fair = price as f64;
+                        last_fair = fair;
+                        let gap = match side { Side::Up => fair - real_up, Side::Down => real_up - fair };
+                        let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
+                            else if market.is_none() { Some("pas de marché") }
+                            else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
+                            else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
+                            else if gap < cfg.gap_min { Some("gap insuffisant") }
+                            else { None };
+                        if let Some(reason) = reject {
+                            tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
+                                real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
+                                gap_min = cfg.gap_min, "✗ signal rejeté");
+                        } else if let Some(m) = &market {
+                            let (book, token) = if side == Side::Up {
+                                (&*up_book, &m.up_token_id)
+                            } else {
+                                (&*down_book, &m.down_token_id)
+                            };
+                            let edge = gap;
+                            if is_live {
+                                if live_mgr.position().is_some() || !pending_opens.is_empty() {
+                                    tracing::info!(reason = "position live déjà ouverte/pending", "✗ ordre live ignoré");
+                                } else {
+                                    match (live_bankroll_val, engine_tx.as_ref()) {
+                                        (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
+                                        (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
+                                        (Some(bk), Some(engine)) => {
+                                            let order_price = book.best_ask().unwrap_or(real_up);
+                                            let sized = if cfg.live_force_min_size {
+                                                Some(m.min_order_size)
+                                            } else {
+                                                bankroll::adjust_size_to_min(
+                                                    paper.kelly_size_for(edge, order_price, bk),
+                                                    m.min_order_size,
+                                                )
+                                            };
+                                            match sized {
+                                                None => tracing::info!(min = m.min_order_size, "✗ taille sous le minimum"),
+                                                Some(size) if size * order_price > bk => tracing::warn!(
+                                                    cost = format!("{:.2}", size * order_price),
+                                                    bankroll = format!("{bk:.2}"),
+                                                    "✗ bankroll insuffisante"),
+                                                Some(size) => {
+                                                    if cfg.live_force_min_size {
+                                                        tracing::warn!(size, "⚠️ taille FORCÉE au minimum");
+                                                    }
+                                                    let (tx, rx_r) = oneshot::channel();
+                                                    let cmd = OrderCmd::Open {
+                                                        side, token_id: token.clone(), neg_risk: m.neg_risk,
+                                                        price: order_price, size, tick: m.tick_size,
+                                                        min_order_size: m.min_order_size, now_ms, reply: tx,
+                                                    };
+                                                    if engine.try_send(cmd).is_ok() {
+                                                        pending_opens.push(PendingOpen {
+                                                            rx: rx_r, side, token_id: token.clone(),
+                                                            neg_risk: m.neg_risk, order_price, size,
+                                                            tick: m.tick_size, now_ms,
+                                                        });
+                                                        last_fire_ms = now_ms;
+                                                        tracing::info!(side = side.as_str(), price = order_price,
+                                                            size, "⚡ BUY soumis à OrderEngine");
+                                                    } else {
+                                                        tracing::warn!("OrderEngine plein — tir ignoré");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if !controls.is_paper_paused()
+                                && paper.fire(side, token, edge, book, m.tick_size, m.min_order_size, now_ms)
+                            {
+                                last_fire_ms = now_ms;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             _ = tick_interval.tick() => {}
         }
-        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-        let live_bankroll_val = *bk_rx.borrow();
 
-        let (market, real_up, up_book, down_book, remaining_s) = {
+        // ── Tick 50ms ────────────────────────────────────────────────────────────────
+        now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        live_bankroll_val = *bk_rx.borrow();
+
+        {
             let g = pm.lock().unwrap();
-            (g.market.clone(), g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
-        };
+            market = g.market.clone();
+            real_up = g.real_up;
+            up_book = g.up_book.clone();
+            down_book = g.down_book.clone();
+            remaining_s = g.remaining_s;
+        }
 
         // ── 0. Rollover user WS — notifie la task du nouveau condition_id ──────────────
         if let Some(ref m) = market {
@@ -250,99 +352,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 "🛑 CIRCUIT BREAKER — drawdown atteint");
         }
 
-        let is_live = controls.live_active();
+        is_live = controls.live_active();
         if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
         was_live = is_live;
         let live_pnl_val = if is_live { live_bankroll_val.map(|bk| live_pnl.update(bk)) } else { None };
 
-        // ── 5. Drain signaux UDP ──────────────────────────────────────────────────────
-        while let Ok(sig) = rx.try_recv() {
-            match sig {
-                WireSignal::Kill => tracing::warn!("⚡ KILL reçu — abstention"),
-                WireSignal::Attack { side, price, .. } => {
-                    let fair = price as f64;
-                    last_fair = fair;
-                    let gap = match side { Side::Up => fair - real_up, Side::Down => real_up - fair };
-                    let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
-                        else if market.is_none() { Some("pas de marché") }
-                        else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
-                        else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
-                        else if gap < cfg.gap_min { Some("gap insuffisant") }
-                        else { None };
-                    if let Some(reason) = reject {
-                        tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
-                            real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
-                            gap_min = cfg.gap_min, "✗ signal rejeté");
-                        continue;
-                    }
-                    if let Some(m) = &market {
-                        let (book, token) = if side == Side::Up {
-                            (&*up_book, &m.up_token_id)
-                        } else {
-                            (&*down_book, &m.down_token_id)
-                        };
-                        let edge = gap;
-                        if is_live {
-                            if live_mgr.position().is_some() || !pending_opens.is_empty() {
-                                tracing::info!(reason = "position live déjà ouverte/pending", "✗ ordre live ignoré");
-                            } else {
-                                match (live_bankroll_val, engine_tx.as_ref()) {
-                                    (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
-                                    (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
-                                    (Some(bk), Some(engine)) => {
-                                        let order_price = book.best_ask().unwrap_or(real_up);
-                                        let sized = if cfg.live_force_min_size {
-                                            Some(m.min_order_size)
-                                        } else {
-                                            bankroll::adjust_size_to_min(
-                                                paper.kelly_size_for(edge, order_price, bk),
-                                                m.min_order_size,
-                                            )
-                                        };
-                                        match sized {
-                                            None => tracing::info!(min = m.min_order_size, "✗ taille sous le minimum"),
-                                            Some(size) if size * order_price > bk => tracing::warn!(
-                                                cost = format!("{:.2}", size * order_price),
-                                                bankroll = format!("{bk:.2}"),
-                                                "✗ bankroll insuffisante"),
-                                            Some(size) => {
-                                                if cfg.live_force_min_size {
-                                                    tracing::warn!(size, "⚠️ taille FORCÉE au minimum");
-                                                }
-                                                let (tx, rx_r) = oneshot::channel();
-                                                let cmd = OrderCmd::Open {
-                                                    side, token_id: token.clone(), neg_risk: m.neg_risk,
-                                                    price: order_price, size, tick: m.tick_size,
-                                                    min_order_size: m.min_order_size, now_ms, reply: tx,
-                                                };
-                                                if engine.try_send(cmd).is_ok() {
-                                                    pending_opens.push(PendingOpen {
-                                                        rx: rx_r, side, token_id: token.clone(),
-                                                        neg_risk: m.neg_risk, order_price, size,
-                                                        tick: m.tick_size, now_ms,
-                                                    });
-                                                    last_fire_ms = now_ms;
-                                                    tracing::info!(side = side.as_str(), price = order_price,
-                                                        size, "⚡ BUY soumis à OrderEngine");
-                                                } else {
-                                                    tracing::warn!("OrderEngine plein — tir ignoré");
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else if !controls.is_paper_paused()
-                            && paper.fire(side, token, edge, book, m.tick_size, m.min_order_size, now_ms)
-                        {
-                            last_fire_ms = now_ms;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 6. Dashboard ──────────────────────────────────────────────────────────────
+        // ── 5. Dashboard ──────────────────────────────────────────────────────────────
         let lat_snap = lat.lock().unwrap().clone();
         {
             let mut d = dash.write().await;
@@ -379,6 +394,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.live_force_min = cfg.live_force_min_size;
             d.lat_last_buy_ms = live_mgr.last_buy_ms;
             d.lat_last_sell_ms = live_mgr.last_sell_ms;
+            d.pm_ws_stale_ms = {
+                let last = pm.lock().unwrap().last_ws_ts_ms;
+                if last > 0 { Some(now_ms.saturating_sub(last)) } else { None }
+            };
         }
 
         log_throttle += 1;

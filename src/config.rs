@@ -47,6 +47,11 @@ pub struct Config {
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
     pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
                                    // (agressif — micro-test plomberie sur petite bankroll)
+
+    // Infrastructure live (Bloc D)
+    pub pm_ws_stale_threshold_ms: u64, // skip REST book si WS < ce seuil (ms)
+    pub bankroll_poll_secs: u64,       // fréquence refresh bankroll CLOB
+    pub order_engine_queue: usize,     // capacité mpsc OrderEngine
 }
 
 impl Config {
@@ -86,6 +91,10 @@ impl Config {
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
+
+            pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
+            bankroll_poll_secs: env_or("BANKROLL_POLL_SECS", 10u64),
+            order_engine_queue: env_or("ORDER_ENGINE_QUEUE", 8usize),
         }
     }
 }

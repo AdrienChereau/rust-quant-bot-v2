@@ -292,7 +292,14 @@ mod tests {
         KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 10.0, sl_cents: 8.0, max_hold_secs: 120 }
     }
     fn engine() -> PaperEngine {
-        PaperEngine::load_or_init(200.0, params(), "/tmp/sniper_s.json".into(), "/tmp/sniper_t.jsonl".into())
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        PaperEngine::load_or_init(
+            200.0, params(),
+            format!("/tmp/sniper_s_test_{id}.json"),
+            format!("/tmp/sniper_t_test_{id}.jsonl"),
+        )
     }
     fn book() -> PolyBook {
         PolyBook { bids: vec![Level { price: 0.49, size: 1000.0 }], asks: vec![Level { price: 0.50, size: 1000.0 }] }
