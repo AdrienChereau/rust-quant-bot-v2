@@ -262,9 +262,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         vol.update(now_ms, spot);
         let velocity = vel.velocity();
 
-        // Vol EWMA sur log-return.
+        // Vol EWMA sur log-return (variance par seconde — dt géré en interne).
         if let Some(prev) = prev_spot {
-            if prev > 0.0 { ewma.update((spot / prev).ln()); }
+            if prev > 0.0 { ewma.update(now_ms, (spot / prev).ln()); }
         }
         prev_spot = Some(spot);
 

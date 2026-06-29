@@ -85,11 +85,13 @@ impl OrderBookL2 {
     /// Capture la structure de profondeur au-delà du BBO — anti-spoofing plus robuste.
     /// `lambda=0.5` → poids 1, 0.61, 0.37, 0.22 … sur les niveaux successifs.
     pub fn calculate_obi_multilevel(&self, n_levels: usize, lambda: f64) -> f64 {
-        let mid_key = {
-            let bp = self.bids.iter().next_back().map(|(&k, _)| k).unwrap_or(0);
-            let ak = self.asks.iter().next().map(|(&k, _)| k).unwrap_or(u64::MAX);
-            (bp + ak) / 2
+        // Les deux côtés doivent exister (sinon OBI indéfini). Évite aussi l'overflow u64
+        // de `bp + u64::MAX` quand un côté est vide.
+        let (bp, ak) = match (self.bids.keys().next_back(), self.asks.keys().next()) {
+            (Some(&b), Some(&a)) => (b, a),
+            _ => return 0.0,
         };
+        let mid_key = bp / 2 + ak / 2; // midpoint sans overflow
         let bids: Vec<f64> = self.bids.range(..=mid_key).rev().take(n_levels)
             .map(|(_, &v)| v).collect();
         let asks: Vec<f64> = self.asks.range(mid_key..).take(n_levels)

@@ -149,7 +149,7 @@ fn spawn_signal_task(
             kalman.update(now_ms, micro);
 
             if let Some(prev) = prev_spot {
-                if prev > 0.0 { ewma.update((spot / prev).ln()); }
+                if prev > 0.0 { ewma.update(now_ms, (spot / prev).ln()); }
             }
             prev_spot = Some(spot);
 
