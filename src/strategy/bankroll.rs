@@ -43,6 +43,7 @@ pub struct KellyParams {
     pub tp_cents: f64,
     pub sl_cents: f64,
     pub max_hold_secs: i64,
+    pub kelly_price_max: f64,   // KELLY_PRICE_MAX=0.90 — clamp favoris seulement (pas de plancher)
 }
 
 impl KellyParams {
@@ -53,12 +54,93 @@ impl KellyParams {
         if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
             return 0.0;
         }
-        // Pari binaire : gain net si on a raison ≈ (1−price)/price ; Kelly f = edge/odds.
         let odds = (1.0 - price) / price;
         let f_full = (edge / odds).clamp(0.0, 1.0);
         let f = f_full * self.kelly_fraction;
         let budget = (equity * f).min(equity * self.max_size_pct);
         (budget / price).floor()
+    }
+
+    /// Kelly robuste : clamp sur les favoris (price > kelly_price_max) + pénalité incertitude.
+    /// - Clamp UNIQUEMENT vers le haut (pas de plancher : sur-pénalise les longshots rentables).
+    /// - Robustesse = (1 − incertitude) ; incertitude = score_sigma/|score| + 0.5×basis_unc.
+    pub fn robust_kelly_size_for(
+        &self,
+        edge: f64,
+        price: f64,
+        equity: f64,
+        score_abs: f64,
+        score_sigma: f64,
+        basis_unc: f64,
+    ) -> f64 {
+        if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
+            return 0.0;
+        }
+        let price_k = price.min(self.kelly_price_max);
+        let odds = (1.0 - price_k) / price_k;
+        let uncertainty = (score_sigma / (score_abs + 1e-9) + 0.5 * basis_unc).min(1.0);
+        let robustness = (1.0 - uncertainty).max(0.0);
+        let f_full = (edge / odds * robustness).clamp(0.0, 1.0);
+        let f = f_full * self.kelly_fraction;
+        let budget = (equity * f).min(equity * self.max_size_pct);
+        (budget / price).floor()
+    }
+}
+
+/// Variance EMA O(1) pour le score composite — remplace VecDeque + rolling_std.
+/// λ=0.9995 → fenêtre effective ≈ 2000 samples = 20 secondes à 100 Hz.
+pub struct EmaScoreStat {
+    lambda: f64,
+    ema: f64,
+    ema_sq: f64,
+    count: u32,
+}
+
+impl EmaScoreStat {
+    pub fn new(lambda: f64) -> Self {
+        Self { lambda, ema: 0.0, ema_sq: 0.0, count: 0 }
+    }
+
+    pub fn update(&mut self, score: f64) {
+        self.count += 1;
+        self.ema = self.lambda * self.ema + (1.0 - self.lambda) * score;
+        self.ema_sq = self.lambda * self.ema_sq + (1.0 - self.lambda) * score * score;
+    }
+
+    /// Écart-type du score. Conservateur (retourne 1.0) pendant les 100 premiers samples.
+    pub fn std_dev(&self) -> f64 {
+        if self.count < 100 { return 1.0; }
+        (self.ema_sq - self.ema * self.ema).max(0.0).sqrt()
+    }
+}
+
+/// IC Tracker : corrélation de Pearson entre score_at_entry et outcome sur une fenêtre glissante.
+pub struct IcTracker {
+    history: std::collections::VecDeque<(f64, f64)>, // (score, outcome ∈ {+1, -1})
+    window: usize,
+}
+
+impl IcTracker {
+    pub fn new(window: usize) -> Self {
+        Self { history: std::collections::VecDeque::with_capacity(window + 1), window }
+    }
+
+    pub fn record(&mut self, score: f64, win: bool) {
+        if self.history.len() >= self.window { self.history.pop_front(); }
+        self.history.push_back((score, if win { 1.0 } else { -1.0 }));
+    }
+
+    /// Pearson IC ∈ [-1, 1]. Retourne 0.0 si moins de 20 observations.
+    pub fn ic(&self) -> f64 {
+        if self.history.len() < 20 { return 0.0; }
+        let n = self.history.len() as f64;
+        let (mut sx, mut sy, mut sxy, mut sx2, mut sy2) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(x, y) in &self.history {
+            sx += x; sy += y; sxy += x * y; sx2 += x * x; sy2 += y * y;
+        }
+        let num = n * sxy - sx * sy;
+        let den = ((n * sx2 - sx * sx) * (n * sy2 - sy * sy)).sqrt();
+        if den < 1e-9 { 0.0 } else { (num / den).clamp(-1.0, 1.0) }
     }
 }
 
@@ -305,7 +387,7 @@ mod tests {
     use crate::polymarket::relayer::Level;
 
     fn params() -> KellyParams {
-        KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 10.0, sl_cents: 8.0, max_hold_secs: 120 }
+        KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 10.0, sl_cents: 8.0, max_hold_secs: 120, kelly_price_max: 0.90 }
     }
     fn engine() -> PaperEngine {
         use std::sync::atomic::{AtomicU64, Ordering};

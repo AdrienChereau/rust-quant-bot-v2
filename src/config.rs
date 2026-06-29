@@ -56,6 +56,29 @@ pub struct Config {
     pub pm_ws_stale_threshold_ms: u64, // skip REST book si WS < ce seuil (ms)
     pub bankroll_poll_secs: u64,       // fréquence refresh bankroll CLOB
     pub order_engine_queue: usize,     // capacité mpsc OrderEngine
+
+    // Signal stack v2 (Étapes 1-10)
+    pub obi_multilevel_lambda: f64,   // OBI_MULTILEVEL_LAMBDA=0.5
+    pub score_fire_threshold: f64,    // SCORE_FIRE_THRESHOLD=0.35
+    pub d2_gamma: f64,                // D2_GAMMA=0.50
+    pub agg_trade_ws_url: String,     // AGG_TRADE_WS_URL
+    pub tfi_window_ms: u64,           // TFI_WINDOW_MS=5000
+    pub basis_threshold_usd: f64,     // BASIS_THRESHOLD_USD=20.0
+    pub basis_stale_ms: u64,          // BASIS_STALE_MS=80
+    pub basis_lambda: f64,            // BASIS_LAMBDA=0.90
+    pub kalman_q00: f64,              // KALMAN_Q00=0.09
+    pub kalman_q11: f64,              // KALMAN_Q11=0.01
+    pub kalman_spike_sigma: f64,      // KALMAN_SPIKE_SIGMA=5.0
+    pub kalman_reset_after_n: u32,    // KALMAN_RESET_AFTER_N=10
+    pub kalman_r: f64,                // KALMAN_R=25.0
+    pub vel_norm_factor: f64,         // VEL_NORM_FACTOR=5.0
+    pub composite_w_obi: f64,         // COMPOSITE_W_OBI=0.40
+    pub composite_w_tfi: f64,         // COMPOSITE_W_TFI=0.30
+    pub composite_w_kalman: f64,      // COMPOSITE_W_KALMAN=0.20
+    pub composite_w_basis: f64,       // COMPOSITE_W_BASIS=0.10
+    pub ewma_lambda: f64,             // EWMA_LAMBDA=0.94
+    pub ewma_score_lambda: f64,       // EWMA_SCORE_LAMBDA=0.9995
+    pub kelly_price_max: f64,         // KELLY_PRICE_MAX=0.90
 }
 
 impl Config {
@@ -101,6 +124,29 @@ impl Config {
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
             bankroll_poll_secs: env_or("BANKROLL_POLL_SECS", 10u64),
             order_engine_queue: env_or("ORDER_ENGINE_QUEUE", 8usize),
+
+            obi_multilevel_lambda: env_or("OBI_MULTILEVEL_LAMBDA", 0.5f64),
+            score_fire_threshold: env_or("SCORE_FIRE_THRESHOLD", 0.35f64),
+            d2_gamma: env_or("D2_GAMMA", 0.50f64),
+            agg_trade_ws_url: env::var("AGG_TRADE_WS_URL")
+                .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws/btcusdt@aggTrade".into()),
+            tfi_window_ms: env_or("TFI_WINDOW_MS", 5000u64),
+            basis_threshold_usd: env_or("BASIS_THRESHOLD_USD", 20.0f64),
+            basis_stale_ms: env_or("BASIS_STALE_MS", 80u64),
+            basis_lambda: env_or("BASIS_LAMBDA", 0.90f64),
+            kalman_q00: env_or("KALMAN_Q00", 0.09f64),
+            kalman_q11: env_or("KALMAN_Q11", 0.01f64),
+            kalman_spike_sigma: env_or("KALMAN_SPIKE_SIGMA", 5.0f64),
+            kalman_reset_after_n: env_or("KALMAN_RESET_AFTER_N", 10u32),
+            kalman_r: env_or("KALMAN_R", 25.0f64),
+            vel_norm_factor: env_or("VEL_NORM_FACTOR", 5.0f64),
+            composite_w_obi: env_or("COMPOSITE_W_OBI", 0.40f64),
+            composite_w_tfi: env_or("COMPOSITE_W_TFI", 0.30f64),
+            composite_w_kalman: env_or("COMPOSITE_W_KALMAN", 0.20f64),
+            composite_w_basis: env_or("COMPOSITE_W_BASIS", 0.10f64),
+            ewma_lambda: env_or("EWMA_LAMBDA", 0.94f64),
+            ewma_score_lambda: env_or("EWMA_SCORE_LAMBDA", 0.9995f64),
+            kelly_price_max: env_or("KELLY_PRICE_MAX", 0.90f64),
         }
     }
 }

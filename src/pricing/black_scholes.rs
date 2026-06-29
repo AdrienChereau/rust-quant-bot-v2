@@ -15,9 +15,34 @@ pub fn fair_up_probability(spot: f64, strike: f64, sigma_annual: f64, t_years: f
     if t_years <= 0.0 || sigma_annual <= 0.0 {
         return if spot > strike { 1.0 } else if spot < strike { 0.0 } else { 0.5 };
     }
-    let d2 = ((spot / strike).ln() - 0.5 * sigma_annual * sigma_annual * t_years)
-        / (sigma_annual * t_years.sqrt());
-    normal_cdf(d2)
+    normal_cdf(d2(spot, strike, sigma_annual, t_years))
+}
+
+/// d2 brut (exposant de la CDF normale pour la proba binary option).
+pub fn d2(spot: f64, strike: f64, sigma_annual: f64, t_years: f64) -> f64 {
+    if t_years <= 0.0 || sigma_annual <= 0.0 {
+        return if spot > strike { f64::INFINITY } else { f64::NEG_INFINITY };
+    }
+    ((spot / strike).ln() - 0.5 * sigma_annual * sigma_annual * t_years)
+        / (sigma_annual * t_years.sqrt())
+}
+
+/// fair_up avec décalage d2 par le score composite.
+/// `d2_adj = d2_base + γ × score` puis N(d2_adj).
+/// La courbure gaussienne atténue naturellement le décalage près des bords :
+///   ATM  (d2≈0, score=1, γ=0.5) : P 0.50 → 0.69 (+19pp)
+///   OTM  (d2≈1.64, score=1)     : P 0.95 → 0.984 (+3.4pp)
+pub fn fair_up_with_d2_shift(
+    spot: f64,
+    strike: f64,
+    sigma_annual: f64,
+    t_years: f64,
+    score: f64,
+    gamma: f64,
+) -> f64 {
+    if spot <= 0.0 || strike <= 0.0 { return 0.5; }
+    let d2_adj = d2(spot, strike, sigma_annual, t_years) + gamma * score;
+    normal_cdf(d2_adj)
 }
 
 pub fn years_from_secs(secs: f64) -> f64 {

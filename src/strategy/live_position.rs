@@ -499,7 +499,7 @@ mod tests {
 
     fn mgr() -> LivePositionManager {
         LivePositionManager::load_or_init(
-            KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 4.0, sl_cents: 3.0, max_hold_secs: 60 },
+            KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 4.0, sl_cents: 3.0, max_hold_secs: 60, kelly_price_max: 0.90 },
             "/tmp/live_state_test_phase_c.json".into(),
             "/tmp/live_trades_test_phase_c.jsonl".into(),
         )

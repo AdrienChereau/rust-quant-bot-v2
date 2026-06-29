@@ -20,6 +20,7 @@ mod signal;
 mod state;
 mod strategy;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,16 +29,19 @@ use tokio::sync::watch;
 
 use binance::local_book::OrderBookL2;
 use binance::math_engine::VelocityTracker;
+use binance::trade_feed::run_agg_trade;
 use config::Config;
-use pricing::black_scholes::{fair_up_probability, years_from_secs};
-use pricing::volatility::VolatilityTracker;
+use pricing::black_scholes::{fair_up_with_d2_shift, years_from_secs};
+use pricing::volatility::{EwmaVolatility, VolatilityTracker};
 use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials};
 use polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use polymarket::pm_websocket;
-use signal::consolidated_obi::ConsolidatedObi;
+use signal::basis::BasisSignal;
+use signal::composite::{self, CompositeWeights};
+use signal::kalman::KalmanFilter;
 use state::RuntimeControls;
-use strategy::bankroll::{self, KellyParams, PaperEngine};
+use strategy::bankroll::{self, EmaScoreStat, IcTracker, KellyParams, PaperEngine};
 use strategy::live_position::LivePositionManager;
 use strategy::sniper::{Action, Sniper, TickInput};
 
@@ -156,27 +160,58 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     { let l = lat.clone(); tokio::spawn(async move { latency::run(l, latency::Probes::All).await; }); }
 
     // Watch channels OBI — les WS tasks envoient après chaque apply_levels().
-    let (bin_tx, mut bin_rx) = watch::channel::<(f64, Option<f64>)>((0.0, None));
-    let (okx_tx, mut okx_rx) = watch::channel::<f64>(0.0);
+    let (bin_tx, mut bin_rx) = watch::channel::<(f64, Option<f64>, Option<f64>)>((0.0, None, None));
+    let (okx_tx, mut okx_rx) = watch::channel::<(f64, f64)>((0.0, 0.0));
+
+    // AtomicU64 lock-free : Task B (aggTrade) → tfi_atomic ; Task C (OKX) → okx_ts_atomic.
+    let tfi_atomic    = Arc::new(AtomicU64::new(0u64));
+    let okx_ts_atomic = Arc::new(AtomicU64::new(0u64));
 
     let obi_n = cfg.obi_top_n;
     let binance_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
     let okx_book = Arc::new(Mutex::new(OrderBookL2::new(cfg.obi_band_pct)));
-    tokio::spawn(binance::websocket::run(cfg.binance_ws_url.clone(), binance_book.clone(), bin_tx, obi_n));
-    tokio::spawn(okx::websocket::run(cfg.okx_ws_url.clone(), okx_book.clone(), okx_tx, obi_n));
+    tokio::spawn(binance::websocket::run(
+        cfg.binance_ws_url.clone(), binance_book.clone(),
+        bin_tx, obi_n, cfg.obi_multilevel_lambda,
+    ));
+    tokio::spawn(okx::websocket::run(
+        cfg.okx_ws_url.clone(), okx_book.clone(),
+        okx_tx, obi_n, Arc::clone(&okx_ts_atomic),
+    ));
+    // Task B : aggTrade → TFI O(1) → AtomicU64 (zéro verrou avec le hot loop)
+    tokio::spawn(run_agg_trade(
+        cfg.agg_trade_ws_url.clone(), Arc::clone(&tfi_atomic), cfg.tfi_window_ms,
+    ));
 
     // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop). `true` = on a besoin du strike.
     let pm = Arc::new(Mutex::new(PmShared::default()));
     let ws_market_tx = pm_websocket::init_market_ws(pm.clone());
     spawn_pm_poller(pm.clone(), true, Some(ws_market_tx), live_creds.clone(), cfg.pm_ws_stale_threshold_ms);
 
-    // Moteurs.
-    let consolidated = ConsolidatedObi::new(cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
-    let mut sniper = Sniper::new(cfg.obi_dwell_ms, cfg.cooldown_ms, cfg.gap_min, cfg.velocity_confirm);
-    let mut vel = VelocityTracker::new(1000);
-    let mut vol = VolatilityTracker::new(2000, 0.80);
-    let kelly = KellyParams { kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
-        tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents, max_hold_secs: cfg.max_hold_secs };
+    // Moteurs signal stack v2.
+    let mut sniper = Sniper::new(cfg.obi_dwell_ms, cfg.cooldown_ms, cfg.gap_min, cfg.score_fire_threshold);
+    let mut vel   = VelocityTracker::new(1000); // pour liquidity_vacuum (unités relatives)
+    let mut vol   = VolatilityTracker::new(2000, 0.80);
+    let mut ewma  = EwmaVolatility::new(cfg.ewma_lambda, 0.80);
+    let mut kalman = KalmanFilter::new(
+        cfg.kalman_q00, cfg.kalman_q11, cfg.kalman_r,
+        cfg.kalman_spike_sigma, cfg.kalman_reset_after_n,
+    );
+    let mut basis = BasisSignal::new(cfg.basis_stale_ms, cfg.basis_threshold_usd, cfg.basis_lambda);
+    let weights = CompositeWeights {
+        w_obi: cfg.composite_w_obi, w_tfi: cfg.composite_w_tfi,
+        w_kalman: cfg.composite_w_kalman, w_basis: cfg.composite_w_basis,
+    };
+    let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
+    let mut ic_tracker = IcTracker::new(200);
+    let mut prev_spot: Option<f64> = None;
+    let mut last_fire_score: f64 = 0.0;
+
+    let kelly = KellyParams {
+        kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
+        tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents,
+        max_hold_secs: cfg.max_hold_secs, kelly_price_max: cfg.kelly_price_max,
+    };
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash, kelly,
         std::env::var("STATE_PATH").unwrap_or_else(|_| "data/sniper_state.json".into()),
@@ -217,15 +252,36 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-        // OBI depuis les receivers (valeur la plus récente, quel que soit l'événement).
-        let (obi_b, spot_opt) = *bin_rx.borrow();
-        let obi_o = *okx_rx.borrow();
+        // ── Lectures lock-free ──
+        let (obi_b, spot_opt, microprice_opt) = *bin_rx.borrow();
+        let (obi_o, mid_okx) = *okx_rx.borrow();
         let Some(spot) = spot_opt else { continue };
 
+        // Vélocité relative (pour liquidity_vacuum — unités relatives, seuil inchangé).
         vel.update(now_ms, spot);
         vol.update(now_ms, spot);
         let velocity = vel.velocity();
-        let decision = consolidated.evaluate(obi_b, obi_o);
+
+        // Vol EWMA sur log-return.
+        if let Some(prev) = prev_spot {
+            if prev > 0.0 { ewma.update((spot / prev).ln()); }
+        }
+        prev_spot = Some(spot);
+
+        // Kalman sur microprice (USD/s).
+        let micro = microprice_opt.unwrap_or(spot);
+        kalman.update(now_ms, micro);
+
+        // TFI et timestamp OKX (lock-free).
+        let tfi    = f64::from_bits(tfi_atomic.load(Ordering::Relaxed));
+        let okx_ts = okx_ts_atomic.load(Ordering::Relaxed);
+
+        // Basis + score composite.
+        let (basis_norm, basis_unc) = basis.evaluate(micro, mid_okx, okx_ts, now_ms);
+        let vel_norm = (kalman.velocity() / cfg.vel_norm_factor).clamp(-1.0, 1.0);
+        let score = composite::score(obi_b, tfi, vel_norm, basis_norm, basis_unc, &weights);
+        ema_stat.update(score);
+        let score_sigma = ema_stat.std_dev();
 
         // Snapshot Polymarket.
         let (market, strike, real_up, up_book, down_book, remaining_s) = {
@@ -233,12 +289,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             (g.market.clone(), g.strike, g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
         };
 
+        // fair_up B&S avec décalage d2 par le score composite.
         let mut fair_up = 0.5;
         let mut gap = 0.0;
         if let (Some(m), Some(strike)) = (&market, strike) {
             let _ = m;
             let t_years = years_from_secs(remaining_s.max(0) as f64);
-            fair_up = fair_up_probability(spot, strike, vol.annualized_sigma(), t_years);
+            let sigma_blended = 0.5 * vol.annualized_sigma() + 0.5 * ewma.annualized_sigma();
+            fair_up = fair_up_with_d2_shift(spot, strike, sigma_blended, t_years, score, cfg.d2_gamma);
             gap = fair_up - real_up;
         }
 
@@ -247,9 +305,11 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         // ── FSM sniper : se déclenche sur chaque event OBI et Tick ──
         let is_live = controls.live_active();
-        let input = TickInput { now_ms, decision, fair_up, real_up, velocity, liquidity_vacuum, blocked };
+        let input = TickInput { now_ms, score, score_sigma, basis_unc, fair_up, real_up,
+            kalman_velocity: kalman.velocity(), liquidity_vacuum, blocked };
         match sniper.step(&input) {
             Action::Fire { side, .. } => {
+                last_fire_score = score.abs();
                 if let Some(m) = &market {
                     let (book, token) = if side == concurrency::bus::Side::Up {
                         (&up_book, &m.up_token_id)
@@ -269,7 +329,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                                         Some(m.min_order_size)
                                     } else {
                                         bankroll::adjust_size_to_min(
-                                            paper.kelly_size_for(gap.abs(), price, bk),
+                                            kelly.robust_kelly_size_for(gap.abs(), price, bk, score.abs(), score_sigma, basis_unc),
                                             m.min_order_size,
                                         )
                                     };
@@ -303,12 +363,17 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         // ── Gestion position + dashboard : seulement sur tick 50ms ──
         if matches!(event, LoopEvent::Tick) {
-            // Gestion paper.
+            // Gestion paper + IC Tracker.
             let mark_bid = if let Some(p) = &paper.position {
                 let bk = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
                 bk.best_bid()
             } else { None };
+            let wins_before = paper.state.wins;
+            let had_position = paper.position.is_some();
             paper.manage(mark_bid, now_ms, remaining_s);
+            if had_position && paper.position.is_none() {
+                ic_tracker.record(last_fire_score, paper.state.wins > wins_before);
+            }
             last_mark_bid = mark_bid;
 
             // Gestion position LIVE (TP/SL/max-hold).
@@ -345,24 +410,16 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             } else { None };
 
             // Conditions de tir (dashboard).
-            use concurrency::bus::Side;
-            let cand_side = decision.side.or(if gap > 0.0 { Some(Side::Up) } else if gap < 0.0 { Some(Side::Down) } else { None });
-            let cond_agreement = decision.fire;
-            let cond_gap = match cand_side {
-                Some(Side::Up) => fair_up - real_up >= cfg.gap_min,
-                Some(Side::Down) => real_up - fair_up >= cfg.gap_min,
-                None => false,
-            };
-            let cond_velocity = match cand_side {
-                Some(Side::Up) => velocity >= cfg.velocity_confirm,
-                Some(Side::Down) => velocity <= -cfg.velocity_confirm,
-                None => false,
-            };
+            let score_ok = score.abs() >= cfg.score_fire_threshold;
+            let cond_gap = (fair_up - real_up).abs() >= cfg.gap_min;
+            let cond_velocity = vel_norm.abs() > 0.1;
             let cond_ready = !blocked && !liquidity_vacuum && !sniper.in_cooldown();
             let cond_persist = sniper.is_armed();
-            let all_conditions = cond_agreement && cond_gap && cond_velocity && cond_ready;
+            let all_conditions = score_ok && cond_gap && cond_ready;
 
-            let kelly_size = market.as_ref().map(|_| paper.kelly_size(gap.abs(), real_up.max(0.01))).unwrap_or(0.0);
+            let kelly_size = market.as_ref().map(|_|
+                kelly.robust_kelly_size_for(gap.abs(), real_up.max(0.01), paper.state.cash, score.abs(), score_sigma, basis_unc)
+            ).unwrap_or(0.0);
             let fsm = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
             let lat_snap = lat.lock().unwrap().clone();
             {
@@ -370,14 +427,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 d.binance_connected = spot > 0.0;
                 d.okx_connected = obi_o != 0.0;
                 d.btc_spot = spot;
-                d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = decision.strength;
-                d.agreement = decision.fire; d.velocity = velocity;
+                d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = score;
+                d.agreement = score_ok; d.velocity = velocity;
                 d.fsm_state = fsm.into();
                 d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
                 d.remaining_s = remaining_s;
                 d.fair_up = fair_up; d.real_up = real_up; d.gap = gap;
                 d.liquidity_vacuum = liquidity_vacuum; d.kelly_size = kelly_size;
-                d.cond_agreement = cond_agreement; d.cond_gap = cond_gap; d.cond_velocity = cond_velocity;
+                d.cond_agreement = score_ok; d.cond_gap = cond_gap; d.cond_velocity = cond_velocity;
                 d.cond_ready = cond_ready; d.cond_persist = cond_persist; d.all_conditions = all_conditions;
                 if let Some(p) = live_mgr.position() {
                     d.in_position = true;
@@ -416,9 +473,13 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             log_throttle += 1;
             if log_throttle % 100 == 0 { // ~5 s
                 let fsm_str = if sniper.in_cooldown() { "COOLDOWN" } else if sniper.is_armed() { "ARMING" } else { "IDLE" };
-                tracing::info!(obi_b = format!("{:+.2}", obi_b), obi_o = format!("{:+.2}", obi_o),
+                tracing::info!(
+                    score = format!("{:+.3}", score), obi_b = format!("{:+.2}", obi_b),
+                    obi_o = format!("{:+.2}", obi_o), tfi = format!("{:+.2}", tfi),
                     fair = format!("{:.3}", fair_up), real = format!("{:.3}", real_up),
-                    gap = format!("{:+.3}", gap), fsm = fsm_str, shots = paper.state.shots, "radar");
+                    gap = format!("{:+.3}", gap), fsm = fsm_str, shots = paper.state.shots,
+                    ic = format!("{:.3}", ic_tracker.ic()), "mono"
+                );
             }
         }
     }

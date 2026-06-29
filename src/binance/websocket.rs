@@ -3,7 +3,7 @@
 //! seule façon de couvrir la bande OBI 0.15 % (±~$90 sur BTC). Partagé via
 //! `Arc<Mutex<OrderBookL2>>` ; le hot-loop lit sans bloquer le réseau.
 //!
-//! **Event-driven OBI (Bloc L)** : chaque update livre un `(obi_b, spot)` via
+//! **Event-driven (Bloc L)** : chaque update livre `(obi_b, spot, microprice)` via
 //! `watch::Sender` → le signal task évalue immédiatement (zéro attente tick).
 
 use std::sync::{Arc, Mutex};
@@ -46,15 +46,20 @@ fn apply_levels(book: &mut OrderBookL2, is_bid: bool, levels: &[[String; 2]]) {
     }
 }
 
+/// Canal : `(obi_b, spot_opt, microprice_opt)`.
+/// - `obi_b`       : OBI multi-niveaux ∈ [-1, 1]
+/// - `spot_opt`    : mid-price (None avant la 1re sync)
+/// - `microprice_opt`: microprice top-of-book (None si livre vide)
 pub async fn run(
     url: String,
     shared: Arc<Mutex<OrderBookL2>>,
-    obi_tx: watch::Sender<(f64, Option<f64>)>,
+    obi_tx: watch::Sender<(f64, Option<f64>, Option<f64>)>,
     obi_n: usize,
+    obi_lambda: f64,
 ) -> anyhow::Result<()> {
     let mut backoff = Duration::from_millis(500);
     loop {
-        match connect_and_stream(&url, &shared, &obi_tx, obi_n).await {
+        match connect_and_stream(&url, &shared, &obi_tx, obi_n, obi_lambda).await {
             Ok(()) => backoff = Duration::from_millis(500),
             Err(e) => tracing::error!(error = %e, "Binance WS, reconnexion"),
         }
@@ -66,19 +71,18 @@ pub async fn run(
 async fn connect_and_stream(
     url: &str,
     shared: &Arc<Mutex<OrderBookL2>>,
-    obi_tx: &watch::Sender<(f64, Option<f64>)>,
+    obi_tx: &watch::Sender<(f64, Option<f64>, Option<f64>)>,
     obi_n: usize,
+    obi_lambda: f64,
 ) -> anyhow::Result<()> {
     let (ws, _) = connect_async(url).await?;
     tracing::info!(%url, "Binance WS connecté");
     let (_w, mut read) = ws.split();
 
-    // Tampon des events le temps de récupérer le snapshot REST.
     let mut buffer: Vec<DepthEvent> = Vec::new();
     let snapshot = fetch_snapshot().await?;
     let mut last_id = snapshot.last_update_id;
 
-    // Seed le carnet partagé.
     {
         let mut book = shared.lock().unwrap();
         book.bids.clear();
@@ -101,40 +105,33 @@ async fn connect_and_stream(
         };
 
         if !synced {
-            // On ignore les events entièrement antérieurs au snapshot.
-            if ev.final_id <= last_id {
-                continue;
-            }
+            if ev.final_id <= last_id { continue; }
             buffer.push(ev);
-            // Le premier event valide doit chevaucher last_id+1.
             if buffer.first().map_or(false, |e| e.first_id <= last_id + 1) {
-                let (obi_b, spot_opt) = {
+                let snap = {
                     let mut book = shared.lock().unwrap();
                     for e in buffer.drain(..) {
                         apply_levels(&mut book, true, &e.bids);
                         apply_levels(&mut book, false, &e.asks);
                         last_id = e.final_id;
                     }
-                    (book.calculate_obi_topn(obi_n), book.mid_price())
+                    (book.calculate_obi_multilevel(obi_n, obi_lambda), book.mid_price(), book.microprice())
                 };
                 synced = true;
-                let _ = obi_tx.send((obi_b, spot_opt));
+                let _ = obi_tx.send(snap);
             }
             continue;
         }
 
-        // Flux synchronisé : appliquer en continu (tolérant aux petits trous → OBI statistique).
-        if ev.final_id <= last_id {
-            continue;
-        }
-        let (obi_b, spot_opt) = {
+        if ev.final_id <= last_id { continue; }
+        let snap = {
             let mut book = shared.lock().unwrap();
             apply_levels(&mut book, true, &ev.bids);
             apply_levels(&mut book, false, &ev.asks);
             last_id = ev.final_id;
-            (book.calculate_obi_topn(obi_n), book.mid_price())
+            (book.calculate_obi_multilevel(obi_n, obi_lambda), book.mid_price(), book.microprice())
         };
-        let _ = obi_tx.send((obi_b, spot_opt));
+        let _ = obi_tx.send(snap);
     }
     Ok(())
 }

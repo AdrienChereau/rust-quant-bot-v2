@@ -2,7 +2,29 @@
 
 use std::collections::VecDeque;
 
-const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
+pub(crate) const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
+
+/// Volatilité EWMA (RiskMetrics λ=0.94) — complémentaire à VolatilityTracker.
+/// Blendée 50/50 avec la vol réalisée pour le pricing B&S.
+pub struct EwmaVolatility {
+    pub lambda: f64,   // 0.94
+    variance: f64,
+    floor: f64,
+}
+
+impl EwmaVolatility {
+    pub fn new(lambda: f64, floor: f64) -> Self {
+        Self { lambda, variance: 0.0, floor }
+    }
+
+    pub fn update(&mut self, log_return: f64) {
+        self.variance = self.lambda * self.variance + (1.0 - self.lambda) * log_return * log_return;
+    }
+
+    pub fn annualized_sigma(&self) -> f64 {
+        (self.variance * SECONDS_PER_YEAR).sqrt().max(self.floor)
+    }
+}
 
 pub struct VolatilityTracker {
     window_ms: u64,

@@ -66,6 +66,44 @@ impl OrderBookL2 {
         if denom == 0.0 { return 0.0; }
         (bid_vol - ask_vol) / denom
     }
+
+    /// Microprice : mid pondéré par le volume top-of-book (anti-bruit spread).
+    /// `(bid_px × ask_qty + ask_px × bid_qty) / (bid_qty + ask_qty)`
+    pub fn microprice(&self) -> Option<f64> {
+        let (&bk, &bq) = self.bids.iter().next_back()?;
+        let (&ak, &aq) = self.asks.iter().next()?;
+        let bp = bk as f64 / PRICE_SCALE;
+        let ap = ak as f64 / PRICE_SCALE;
+        let bq_f = bq as f64; // cast explicite : robustesse si le type BTreeMap change
+        let aq_f = aq as f64;
+        let denom = bq_f + aq_f;
+        if denom <= 0.0 { return None; }
+        Some((bp * aq_f + ap * bq_f) / denom)
+    }
+
+    /// OBI multi-niveaux avec décroissance exponentielle (Σ e^{-λi} × obi_i / Σ e^{-λi}).
+    /// Capture la structure de profondeur au-delà du BBO — anti-spoofing plus robuste.
+    /// `lambda=0.5` → poids 1, 0.61, 0.37, 0.22 … sur les niveaux successifs.
+    pub fn calculate_obi_multilevel(&self, n_levels: usize, lambda: f64) -> f64 {
+        let mid_key = {
+            let bp = self.bids.iter().next_back().map(|(&k, _)| k).unwrap_or(0);
+            let ak = self.asks.iter().next().map(|(&k, _)| k).unwrap_or(u64::MAX);
+            (bp + ak) / 2
+        };
+        let bids: Vec<f64> = self.bids.range(..=mid_key).rev().take(n_levels)
+            .map(|(_, &v)| v).collect();
+        let asks: Vec<f64> = self.asks.range(mid_key..).take(n_levels)
+            .map(|(_, &v)| v).collect();
+
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (i, (bq, aq)) in bids.iter().zip(asks.iter()).enumerate() {
+            let w = (-lambda * i as f64).exp();
+            let obi_i = (bq - aq) / (bq + aq + 1e-9);
+            num += w * obi_i;
+            den += w;
+        }
+        if den > 0.0 { num / den } else { 0.0 }
+    }
 }
 
 #[cfg(test)]
