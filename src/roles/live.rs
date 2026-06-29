@@ -318,7 +318,15 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
                             else { None };
                         if let Some(r) = reason {
-                            let exit = match r { "take_profit" => pos.tp_price, "stop_loss" => pos.sl_price, _ => bid };
+                            // SL/max_hold : vendre SOUS le bid pour garantir le fill. Vendre au
+                            // prix SL était une contradiction (le SL se déclenche quand bid <= sl_price,
+                            // donc un SELL limite à sl_price ne trouvait jamais d'acheteur → boucle).
+                            // La FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe le
+                            // mouvement du bid pendant le transit.
+                            let exit = match r {
+                                "take_profit" => pos.tp_price,
+                                _ => (bid - cfg.exit_buffer).max(0.01),
+                            };
                             let (tx, rx_r) = oneshot::channel();
                             let cmd = OrderCmd::Close {
                                 token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
