@@ -32,7 +32,7 @@ use binance::local_book::OrderBookL2;
 use binance::math_engine::VelocityTracker;
 use binance::trade_feed::run_agg_trade;
 use config::Config;
-use pricing::black_scholes::{fair_up_with_d2_shift, years_from_secs};
+use pricing::black_scholes::{d2 as bs_d2, fair_up_with_d2_shift, years_from_secs};
 use pricing::volatility::{EwmaVolatility, VolatilityTracker};
 use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials};
@@ -309,11 +309,18 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         // fair_up B&S avec décalage d2 par le score composite.
         let mut fair_up = 0.5;
         let mut gap = 0.0;
-        if let (Some(m), Some(strike)) = (&market, strike) {
-            let _ = m;
+        let sigma_realized = vol.annualized_sigma();
+        let sigma_ewma = ewma.annualized_sigma();
+        let sigma_blended = 0.5 * sigma_realized + 0.5 * sigma_ewma;
+        let mut d2_base = 0.0;
+        let mut d2_adj = 0.0;
+        let mut strike_val = 0.0;
+        if let (Some(_m), Some(strk)) = (&market, strike) {
             let t_years = years_from_secs(remaining_s.max(0) as f64);
-            let sigma_blended = 0.5 * vol.annualized_sigma() + 0.5 * ewma.annualized_sigma();
-            fair_up = fair_up_with_d2_shift(spot, strike, sigma_blended, t_years, score, tp.d2_gamma);
+            strike_val = strk;
+            d2_base = bs_d2(spot, strk, sigma_blended, t_years);
+            d2_adj = d2_base + tp.d2_gamma * score;
+            fair_up = fair_up_with_d2_shift(spot, strk, sigma_blended, t_years, score, tp.d2_gamma);
             gap = fair_up - real_up;
         }
 
@@ -446,6 +453,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 d.btc_spot = spot;
                 d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = score;
                 d.agreement = score_ok; d.velocity = velocity;
+                // Compartiment Maths — valeurs vivantes du signal stack.
+                d.microprice = micro; d.tfi = tfi;
+                d.kalman_velocity = kalman.velocity(); d.vel_norm = vel_norm;
+                d.basis_norm = basis_norm; d.basis_unc = basis_unc;
+                d.score = score; d.score_sigma = score_sigma;
+                d.sigma_realized = sigma_realized; d.sigma_ewma = sigma_ewma; d.sigma_blended = sigma_blended;
+                d.d2_base = d2_base; d.d2_adj = d2_adj; d.strike = strike_val;
+                d.ic = ic_tracker.ic();
                 d.fsm_state = fsm.into();
                 d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
                 d.remaining_s = remaining_s;

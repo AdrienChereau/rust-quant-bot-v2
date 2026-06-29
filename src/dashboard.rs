@@ -32,6 +32,22 @@ pub struct DashState {
     pub obi_consolidated: f64,
     pub agreement: bool,
     pub velocity: f64,
+    // ── Valeurs vivantes du signal stack v2 (compartiment "Maths") ──
+    pub microprice: f64,      // micro-price top-of-book (USD)
+    pub tfi: f64,             // Trade Flow Imbalance ∈ [-1,1]
+    pub kalman_velocity: f64, // vélocité Kalman (USD/s)
+    pub vel_norm: f64,        // vélocité Kalman normalisée ∈ [-1,1]
+    pub basis_norm: f64,      // basis OKX−BNB normalisé ∈ [-1,1]
+    pub basis_unc: f64,       // incertitude basis ∈ [0,1] (staleness)
+    pub score: f64,           // score composite ∈ [-1,1]
+    pub score_sigma: f64,     // écart-type EMA du score
+    pub sigma_realized: f64,  // vol réalisée annualisée
+    pub sigma_ewma: f64,      // vol EWMA annualisée
+    pub sigma_blended: f64,   // vol blendée 50/50 (utilisée par B&S)
+    pub d2_base: f64,         // d2 brut B&S
+    pub d2_adj: f64,          // d2 + γ·score (décalé)
+    pub strike: f64,          // strike de la fenêtre (USD)
+    pub ic: f64,              // information coefficient (Pearson, 200 trades)
     // Sniper
     pub fsm_state: String,    // IDLE/ARMING/COOLDOWN
     pub market_slug: String,

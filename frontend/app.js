@@ -85,6 +85,18 @@ async function refresh() {
         chk("c_agree", s.cond_agreement); chk("c_persist", s.cond_persist); chk("c_vel", s.cond_velocity);
         chk("c_gap", s.cond_gap); chk("c_ready", s.cond_ready);
         $("c_all").innerHTML = s.all_conditions ? '<span class="ok">🔥 FEU</span>' : '<span class="muted">en attente</span>';
+
+        // Compartiment Maths — valeurs vivantes du signal stack.
+        const plain = (id, v, d = 3) => { $(id).textContent = fmt(v, d); };
+        obi($("m_obib"), s.obi_binance); obi($("m_obio"), s.obi_okx);
+        obi($("m_tfi"), s.tfi); obi($("m_velnorm"), s.vel_norm); obi($("m_basis"), s.basis_norm);
+        plain("m_basisunc", s.basis_unc, 2);
+        obi($("m_score"), s.score);
+        plain("m_scoresigma", s.score_sigma, 3);
+        plain("m_sigreal", s.sigma_realized, 3); plain("m_sigewma", s.sigma_ewma, 3); plain("m_sigblend", s.sigma_blended, 3);
+        plain("m_strike", s.strike, 1); plain("m_micro", s.microprice, 1); plain("m_kvel", s.kalman_velocity, 2);
+        signed($("m_d2base"), s.d2_base, 3); signed($("m_d2adj"), s.d2_adj, 3);
+        plain("m_ic", s.ic, 3);
     }
 
     if (isKiller) {

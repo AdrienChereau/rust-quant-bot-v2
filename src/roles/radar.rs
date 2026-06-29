@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::net::udp::UdpSender;
 use crate::net::wire::WireSignal;
 use crate::polymarket::relayer::btc_price_at_window_open;
-use crate::pricing::black_scholes::{fair_up_with_d2_shift, years_from_secs};
+use crate::pricing::black_scholes::{d2 as bs_d2, fair_up_with_d2_shift, years_from_secs};
 use crate::pricing::volatility::{EwmaVolatility, VolatilityTracker};
 use crate::signal::basis::BasisSignal;
 use crate::signal::composite::{self, CompositeWeights};
@@ -168,9 +168,15 @@ fn spawn_signal_task(
             let remaining_s = window_ts + WINDOW_SEC - now_s;
             let strike_opt = { let s = strike.lock().unwrap(); if s.window_ts == window_ts { s.strike } else { None } };
 
-            let sigma_blended = 0.5 * vol.annualized_sigma() + 0.5 * ewma.annualized_sigma();
+            let sigma_realized = vol.annualized_sigma();
+            let sigma_ewma = ewma.annualized_sigma();
+            let sigma_blended = 0.5 * sigma_realized + 0.5 * sigma_ewma;
+            let (mut d2_base, mut d2_adj, mut strike_val) = (0.0, 0.0, 0.0);
             let fair_up = if let Some(strk) = strike_opt {
                 let t_years = years_from_secs(remaining_s.max(0) as f64);
+                strike_val = strk;
+                d2_base = bs_d2(spot, strk, sigma_blended, t_years);
+                d2_adj = d2_base + cfg.d2_gamma * score;
                 fair_up_with_d2_shift(spot, strk, sigma_blended, t_years, score, cfg.d2_gamma)
             } else { 0.5 };
 
@@ -207,6 +213,12 @@ fn spawn_signal_task(
                 d.okx_connected = obi_o != 0.0;
                 d.btc_spot = spot;
                 d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = score;
+                d.microprice = micro; d.tfi = tfi;
+                d.kalman_velocity = kalman.velocity(); d.vel_norm = vel_norm;
+                d.basis_norm = basis_norm; d.basis_unc = basis_unc;
+                d.score = score; d.score_sigma = score_sigma;
+                d.sigma_realized = sigma_realized; d.sigma_ewma = sigma_ewma; d.sigma_blended = sigma_blended;
+                d.d2_base = d2_base; d.d2_adj = d2_adj; d.strike = strike_val;
                 d.agreement = score.abs() >= cfg.score_fire_threshold;
                 d.velocity = velocity;
                 d.fsm_state = fsm.into();

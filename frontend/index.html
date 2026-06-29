@@ -3,13 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Sniper — Monitoring</title>
+  <title>Cryptonite</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header>
-    <h1><span id="app-name">TERMINAL</span> <span id="dry" class="badge">—</span> <span id="mode" class="badge mode">—</span></h1>
-    <span id="clock" class="muted"></span>
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-mark">Cryptonite</span>
+      <span class="brand-sub" id="app-name">—</span>
+    </div>
+    <div class="header-right">
+      <span id="dry" class="badge">—</span>
+      <span id="mode" class="badge mode">—</span>
+      <span id="clock" class="muted"></span>
+    </div>
   </header>
 
   <div id="breaker-banner" class="breaker-banner" hidden>🛑 CIRCUIT BREAKER DÉCLENCHÉ — exécution coupée <button class="btn-reset" onclick="ctl('/breaker/reset')">↺ Réinitialiser</button></div>
@@ -36,6 +44,39 @@
       <div class="row"><span>4. Gap fair/real suffisant</span><b id="c_gap">—</b></div>
       <div class="row"><span>5. Prêt (pas cooldown/vacuum/fin)</span><b id="c_ready">—</b></div>
       <div class="row"><span><b>→ TIR</b></span><b id="c_all">—</b></div>
+    </div>
+
+    <div class="card maths-card">
+      <h2>Maths en direct — valeurs utilisées</h2>
+      <div class="maths-grid">
+        <div class="maths-col">
+          <div class="maths-group">Inputs du score</div>
+          <div class="row"><span>OBI Binance (multilevel)</span><b id="m_obib">—</b></div>
+          <div class="row"><span>OBI OKX (top-N)</span><b id="m_obio">—</b></div>
+          <div class="row"><span>TFI (flux trades)</span><b id="m_tfi">—</b></div>
+          <div class="row"><span>Vélocité Kalman norm.</span><b id="m_velnorm">—</b></div>
+          <div class="row"><span>Basis OKX−BNB norm.</span><b id="m_basis">—</b></div>
+          <div class="row"><span>Incertitude basis</span><b id="m_basisunc">—</b></div>
+        </div>
+        <div class="maths-col">
+          <div class="maths-group">Score composite</div>
+          <div class="row"><span>Score ∈ [−1, 1]</span><b id="m_score">—</b></div>
+          <div class="row"><span>Score σ (EMA)</span><b id="m_scoresigma">—</b></div>
+          <div class="maths-group">Volatilité annualisée</div>
+          <div class="row"><span>Réalisée</span><b id="m_sigreal">—</b></div>
+          <div class="row"><span>EWMA (λ=0.94)</span><b id="m_sigewma">—</b></div>
+          <div class="row"><span>Blended → B&S</span><b id="m_sigblend">—</b></div>
+        </div>
+        <div class="maths-col">
+          <div class="maths-group">Black-Scholes</div>
+          <div class="row"><span>Strike fenêtre</span><b id="m_strike">—</b></div>
+          <div class="row"><span>Micro-price</span><b id="m_micro">—</b></div>
+          <div class="row"><span>Vélocité Kalman (USD/s)</span><b id="m_kvel">—</b></div>
+          <div class="row"><span>d2 brut</span><b id="m_d2base">—</b></div>
+          <div class="row"><span>d2 ajusté (+γ·score)</span><b id="m_d2adj">—</b></div>
+          <div class="row"><span>IC (200 trades)</span><b id="m_ic">—</b></div>
+        </div>
+      </div>
     </div>
 
     <div class="card" id="card-lat">
