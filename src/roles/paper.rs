@@ -30,6 +30,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let tuning = crate::tuning::Tuning::load(&cfg);
 
     let dash = dashboard::shared(true, "paper");
+    dash.write().await.trades_path =
+        std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into());
     {
         let (port, st, ct, tn) = (cfg.dashboard_port, dash.clone(), controls.clone(), tuning.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, Some(tn)).await; });
@@ -63,6 +65,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     let mut rx = udp::listen(listen_port).await?;
     let mut last_fire_ms: u64 = 0;
+    let mut last_series_ms: u64 = 0;
     let mut last_fair: f64 = 0.5;
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
     let mut log_throttle: u32 = 0;
@@ -132,6 +135,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             up_book = g.up_book.clone();
             down_book = g.down_book.clone();
             remaining_s = g.remaining_s;
+        }
+
+        // Échantillon série graphe (1/s, borné). Pas de BTC spot côté paper → 0.
+        if now_ms.saturating_sub(last_series_ms) >= 1000 {
+            crate::series::push(now_ms, last_fair, real_up, 0.0);
+            last_series_ms = now_ms;
         }
 
         // ── Paper manage (TP/SL/max-hold) ─────────────────────────────────────────────

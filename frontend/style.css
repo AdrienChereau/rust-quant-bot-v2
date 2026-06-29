@@ -263,6 +263,35 @@ code {
 .tuning-actions { display: flex; gap: 10px; padding: 12px 18px 6px; }
 #tuning-status { padding: 0 18px 10px; font-size: 0.84rem; min-height: 1.2em; }
 
+/* ── Graphe entrées / sorties ─────────────────────────────────── */
+#chart-section { margin-top: 20px; }
+.chart-legend {
+  display: flex; gap: 18px; flex-wrap: wrap;
+  padding: 10px 18px 4px; font-size: 0.8rem; color: var(--muted);
+}
+.chart-legend span { display: flex; align-items: center; gap: 6px; }
+.chart-legend .lg { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.lg-real  { background: var(--blue); }
+.lg-fair  { background: var(--accent); height: 0 !important; border-top: 2px dashed var(--accent); }
+.lg-entry { width: 0 !important; height: 0 !important; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 8px solid var(--green); }
+.lg-exit  { width: 8px !important; height: 8px !important; border-radius: 50%; background: var(--red); }
+#trade-chart { display: block; width: 100%; height: auto; padding: 6px 12px 14px; }
+
+/* ── Logs en direct ───────────────────────────────────────────── */
+#logs-section { margin-top: 20px; }
+.log-view {
+  margin: 0; padding: 12px 16px;
+  max-height: 320px; overflow-y: auto;
+  background: var(--panel-alt);
+  border-top: 1px solid var(--border-soft);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.76rem; line-height: 1.5;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+}
+.log-view .lvl-info  { color: var(--muted); }
+.log-view .lvl-warn  { color: var(--amber); }
+.log-view .lvl-error { color: var(--red); font-weight: 600; }
+
 /* ── Footer ───────────────────────────────────────────────────── */
 footer {
   margin-top: 28px; padding-top: 16px;

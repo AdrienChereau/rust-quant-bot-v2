@@ -23,6 +23,9 @@ pub struct DashState {
     pub dry_run: bool,
     /// Type de nœud : "live" | "paper" | "radar" | "mono" — pilote l'affichage du frontend.
     pub node_kind: String,
+    /// Chemin du fichier de trades (.jsonl) lu à la demande par l'endpoint /trades. Vide = pas de graphe.
+    #[serde(skip)]
+    pub trades_path: String,
     // Radar
     pub binance_connected: bool,
     pub okx_connected: bool,
@@ -171,12 +174,40 @@ pub async fn serve(
                     Some(t) => params_json(t),
                     None => "{\"enabled\":false}".to_string(),
                 }),
+                "/logs" => ("application/json",
+                    serde_json::json!({ "lines": crate::logbuffer::snapshot() }).to_string()),
+                "/series" => ("application/json",
+                    serde_json::to_string(&crate::series::snapshot()).unwrap_or_else(|_| "[]".into())),
+                "/trades" => ("application/json", {
+                    let path = state.read().await.trades_path.clone();
+                    trades_json(&path)
+                }),
                 _ => ("text/plain", "not found".to_string()),
             };
             let _ = sock.write_all(http_resp(ctype, &body).as_bytes()).await;
             let _ = sock.flush().await;
         });
     }
+}
+
+/// `GET /trades` : lit le `.jsonl` de trades à la demande (task dashboard, hors hot loop) et
+/// renvoie les 100 derniers enregistrements (fire/take_profit/stop_loss/max_hold) pour le graphe.
+fn trades_json(path: &str) -> String {
+    if path.is_empty() { return "[]".to_string(); }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return "[]".to_string(),
+    };
+    let recs: Vec<serde_json::Value> = content
+        .lines()
+        .rev()
+        .take(100)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    serde_json::to_string(&recs).unwrap_or_else(|_| "[]".into())
 }
 
 /// `GET /params` : snapshot courant + bornes + noms de scénarios.

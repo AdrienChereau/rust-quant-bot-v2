@@ -154,6 +154,28 @@
     </div>
   </section>
 
+  <!-- GRAPHE ENTRÉES / SORTIES (mono / paper) -->
+  <section id="chart-section" style="display:none">
+    <div class="card">
+      <h2>Entrées / sorties — prix Polymarket Up</h2>
+      <div class="chart-legend">
+        <span><i class="lg lg-real"></i> Real Up (PM)</span>
+        <span><i class="lg lg-fair"></i> Fair Up (B&S)</span>
+        <span><i class="lg lg-entry"></i> Entrée</span>
+        <span><i class="lg lg-exit"></i> Sortie</span>
+      </div>
+      <canvas id="trade-chart" width="1120" height="320"></canvas>
+    </div>
+  </section>
+
+  <!-- LOGS EN DIRECT (tous les nœuds — Dublin inclus) -->
+  <section id="logs-section" style="display:none">
+    <div class="card">
+      <h2>Logs en direct <span class="muted" id="log-node" style="text-transform:none;letter-spacing:0"></span></h2>
+      <pre id="log-view" class="log-view">…</pre>
+    </div>
+  </section>
+
   <!-- CONSOLE DE TUNING À CHAUD (mono / paper) -->
   <section id="tuning-section" style="display:none">
     <div class="card tuning-card">

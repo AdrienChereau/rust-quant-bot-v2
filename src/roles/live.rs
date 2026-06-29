@@ -88,6 +88,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         .unwrap_or((None, None));
 
     let dash = dashboard::shared(cfg.dry_run, "live");
+    dash.write().await.trades_path =
+        std::env::var("LIVE_TRADES_PATH").unwrap_or_else(|_| "data/live_trades.jsonl".into());
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, None).await; });

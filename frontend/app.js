@@ -279,7 +279,120 @@ window.applyScenario = applyScenario;
 window.resetParams = resetParams;
 function tStatus(msg, ok) { const el = $("tuning-status"); el.textContent = msg; el.className = ok ? "ok" : "ko"; }
 
+// ── Logs en direct (tous les nœuds) ───────────────────────────────────────────
+async function pollLogs() {
+  const sec = $("logs-section");
+  if (!sec) return;
+  try {
+    const r = await (await fetch("/logs", { cache: "no-store" })).json();
+    const lines = r.lines || [];
+    sec.style.display = "block";
+    $("log-node").textContent = "· " + (nodeKind || "");
+    const view = $("log-view");
+    const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+    view.innerHTML = lines.slice(-300).map((l) => {
+      let cls = "lvl-info";
+      if (l.includes("ERROR")) cls = "lvl-error";
+      else if (l.includes("WARN")) cls = "lvl-warn";
+      return `<span class="${cls}">${escapeHtml(l)}</span>`;
+    }).join("\n");
+    if (atBottom) view.scrollTop = view.scrollHeight;
+  } catch (e) {}
+}
+function escapeHtml(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+// ── Graphe entrées / sorties (mono / paper) ───────────────────────────────────
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+async function pollChart() {
+  const sec = $("chart-section");
+  if (!sec) return;
+  if (!(nodeKind === "mono" || nodeKind === "paper")) { sec.style.display = "none"; return; }
+  sec.style.display = "block";
+  try {
+    const [series, trades] = await Promise.all([
+      (await fetch("/series", { cache: "no-store" })).json(),
+      (await fetch("/trades", { cache: "no-store" })).json(),
+    ]);
+    drawChart(series || [], trades || []);
+  } catch (e) {}
+}
+
+function drawChart(series, trades) {
+  const cv = $("trade-chart"); if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const padL = 52, padR = 16, padT = 14, padB = 26;
+
+  let tradePts = trades.map((t) => ({ t: Date.parse(t.ts), price: t.price, kind: t.kind, side: t.side, pnl: t.pnl }))
+    .filter((t) => !Number.isNaN(t.t) && t.price > 0);
+  if (series.length < 2 && tradePts.length < 1) {
+    ctx.fillStyle = cssVar("--muted"); ctx.font = "13px sans-serif";
+    ctx.fillText("En attente de données…", padL, H / 2);
+    return;
+  }
+  // Fenêtre temporelle = celle de la série (live) ; on ne garde que les trades dedans.
+  const t0 = series.length ? series[0].t : Math.min(...tradePts.map((t) => t.t));
+  const t1 = series.length ? series[series.length - 1].t : Math.max(...tradePts.map((t) => t.t));
+  tradePts = tradePts.filter((t) => t.t >= t0 && t.t <= t1);
+  const allP = series.flatMap((p) => [p.real, p.fair]).concat(tradePts.map((t) => t.price)).filter((v) => v > 0);
+  if (allP.length < 1) {
+    ctx.fillStyle = cssVar("--muted"); ctx.font = "13px sans-serif";
+    ctx.fillText("En attente de données…", padL, H / 2);
+    return;
+  }
+  let pmin = Math.min(...allP), pmax = Math.max(...allP);
+  const pad = Math.max((pmax - pmin) * 0.12, 0.02); pmin -= pad; pmax += pad;
+  const xs = (t) => padL + (t1 === t0 ? 0.5 : (t - t0) / (t1 - t0)) * (W - padL - padR);
+  const ys = (p) => padT + (1 - (p - pmin) / (pmax - pmin || 1)) * (H - padT - padB);
+
+  // Grille + axes
+  ctx.strokeStyle = cssVar("--border-soft"); ctx.fillStyle = cssVar("--muted");
+  ctx.font = "11px -apple-system, sans-serif"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const p = pmin + (pmax - pmin) * i / 4, y = ys(p);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(p.toFixed(2), 8, y + 3);
+  }
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (t1 - t0) * i / 4, x = xs(t);
+    ctx.fillText(new Date(t).toLocaleTimeString().slice(0, 5), x - 14, H - 8);
+  }
+
+  // Lignes real / fair
+  const line = (key, color, dash) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.setLineDash(dash || []);
+    ctx.beginPath(); let started = false;
+    series.forEach((p) => { const v = p[key]; if (v <= 0) return; const x = xs(p.t), y = ys(v);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y); });
+    ctx.stroke(); ctx.setLineDash([]);
+  };
+  line("real", cssVar("--blue"), []);
+  line("fair", cssVar("--accent"), [5, 4]);
+
+  // Marqueurs entrées / sorties
+  tradePts.forEach((t) => {
+    const x = xs(t.t), y = ys(t.price);
+    if (t.kind === "fire") {
+      ctx.fillStyle = t.side === "up" ? cssVar("--green") : cssVar("--red");
+      ctx.beginPath();
+      if (t.side === "up") { ctx.moveTo(x, y - 6); ctx.lineTo(x - 5, y + 4); ctx.lineTo(x + 5, y + 4); }
+      else { ctx.moveTo(x, y + 6); ctx.lineTo(x - 5, y - 4); ctx.lineTo(x + 5, y - 4); }
+      ctx.closePath(); ctx.fill();
+    } else {
+      ctx.fillStyle = (t.pnl >= 0) ? cssVar("--green") : cssVar("--red");
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.strokeStyle = cssVar("--panel"); ctx.lineWidth = 1.5; ctx.stroke();
+    }
+  });
+}
+
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
 setInterval(refresh, 1000);
+setInterval(pollLogs, 2000);
+setInterval(pollChart, 2000);
 refresh();
 loadParams();
+pollLogs();
+pollChart();

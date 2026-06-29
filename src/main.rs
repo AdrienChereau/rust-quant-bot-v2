@@ -11,11 +11,13 @@ mod concurrency;
 mod config;
 mod dashboard;
 mod latency;
+mod logbuffer;
 mod net;
 mod okx;
 mod polymarket;
 mod pricing;
 mod roles;
+mod series;
 mod signal;
 mod state;
 mod strategy;
@@ -95,8 +97,11 @@ async fn main() -> anyhow::Result<()> {
     // .env puis .env.local (local écrase) — sur AWS, un seul `.env` suffit.
     dotenvy::dotenv().ok();
     dotenvy::from_filename_override(".env.local").ok();
+    // Logs : tee stdout/journald + ring buffer en mémoire (endpoint /logs sur tous les nœuds).
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(false)
+        .with_writer(logbuffer::maker())
         .init();
     let cfg = Config::from_env();
 
@@ -154,6 +159,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let tuning = tuning::Tuning::load(&cfg);
 
     let dash = dashboard::shared(cfg.dry_run, "mono");
+    dash.write().await.trades_path =
+        std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into());
     {
         let (port, st, ct, tn) = (cfg.dashboard_port, dash.clone(), controls.clone(), tuning.clone());
         tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, Some(tn)).await; });
@@ -240,6 +247,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // État de gestion gardé entre les OBI events pour que le bras Tick y accède.
     let mut last_mark_bid: Option<f64> = None;
     let mut last_live_pnl_val: Option<f64> = None;
+    let mut last_series_ms: u64 = 0; // échantillonnage série graphe (1/s)
 
     loop {
         let event = tokio::select! {
@@ -387,6 +395,12 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         // ── Gestion position + dashboard : seulement sur tick 50ms ──
         if matches!(event, LoopEvent::Tick) {
+            // Échantillon série graphe (1/s, borné) — pour le chart entrées/sorties.
+            if now_ms.saturating_sub(last_series_ms) >= 1000 {
+                series::push(now_ms, fair_up, real_up, spot);
+                last_series_ms = now_ms;
+            }
+
             // Gestion paper + IC Tracker.
             let mark_bid = if let Some(p) = &paper.position {
                 let bk = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
