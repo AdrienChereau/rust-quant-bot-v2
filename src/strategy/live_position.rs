@@ -91,6 +91,8 @@ pub struct LivePositionManager {
     pub state: LiveState,
     pub last_buy_ms: Option<u64>,
     pub last_sell_ms: Option<u64>,
+    /// Échecs de clôture consécutifs (runtime, non persisté) — anti-boucle de SELL.
+    consec_close_fails: u32,
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -122,7 +124,8 @@ impl LivePositionManager {
             .unwrap_or_default();
         tracing::info!(realized_pnl = state.realized_pnl, shots = state.shots,
             wins = state.wins, losses = state.losses, "État LIVE chargé");
-        Self { phase: LivePhase::Idle, state, last_buy_ms: None, last_sell_ms: None, params, state_path, trades_path }
+        Self { phase: LivePhase::Idle, state, last_buy_ms: None, last_sell_ms: None,
+            consec_close_fails: 0, params, state_path, trades_path }
     }
 
     /// Tente d'ouvrir une position : POST BUY FAK.
@@ -330,7 +333,21 @@ impl LivePositionManager {
             OrderResult::DryRun { .. } => {}
             OrderResult::Failed { error, .. } => {
                 self.state.failed_closes += 1;
-                tracing::error!(error = %error, reason, "❌ SELL live échoué (OrderEngine)");
+                self.consec_close_fails += 1;
+                // "balance not enough / balance: 0" → la position n'existe plus on-chain
+                // (réglée à l'expiration de la fenêtre 5 min, ou jamais détenue). Inutile de
+                // réessayer : on abandonne pour ne pas spammer le CLOB en boucle (50 ms).
+                let gone = error.to_lowercase().contains("balance");
+                if gone || self.consec_close_fails >= 5 {
+                    tracing::error!(error = %error, reason, consec = self.consec_close_fails,
+                        "🛑 position abandonnée (introuvable on-chain) — phase → Idle, voir bankroll");
+                    self.phase = LivePhase::Idle;
+                    self.state.losses += 1;
+                    self.consec_close_fails = 0;
+                } else {
+                    tracing::error!(error = %error, reason, consec = self.consec_close_fails,
+                        "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
+                }
                 self.persist();
             }
         }
@@ -403,6 +420,7 @@ impl LivePositionManager {
             size = filled, tp = format!("{tp:.2}"), sl = format!("{sl:.2}"),
             order_id = %order_id, "🎯 SNIPE LIVE");
         self.phase = LivePhase::Open(pos);
+        self.consec_close_fails = 0;
         self.persist();
     }
 
@@ -415,6 +433,7 @@ impl LivePositionManager {
         tracing::warn!(reason, exit = format!("{got_price:.3}"), pnl = format!("{pnl:.2}"),
             realized_pnl = format!("{:.2}", self.state.realized_pnl), order_id = %order_id, "✖ clôture LIVE");
         self.phase = LivePhase::Idle;
+        self.consec_close_fails = 0;
         self.persist();
     }
 
