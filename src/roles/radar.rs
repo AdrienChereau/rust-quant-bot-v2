@@ -44,7 +44,7 @@ pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Re
     let dash = dashboard::shared(cfg.dry_run, "radar");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, None).await; });
     }
 
     let lat = latency::shared();

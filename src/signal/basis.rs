@@ -13,6 +13,11 @@ impl BasisSignal {
         Self { stale_ms, threshold, lambda, smoothed: 0.0 }
     }
 
+    /// Ajuste le seuil de normalisation à chaud (préserve l'état EWMA `smoothed`).
+    pub fn set_threshold(&mut self, threshold: f64) {
+        self.threshold = threshold;
+    }
+
     /// Retourne `(basis_norm ∈ [-1,1], uncertainty ∈ [0,1])`.
     pub fn evaluate(
         &mut self,

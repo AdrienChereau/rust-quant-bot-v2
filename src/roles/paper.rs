@@ -25,10 +25,14 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Paper actif par défaut (live_* inutilisés ici).
     let controls = Arc::new(RuntimeControls::new());
 
+    // Console de tuning à chaud — ici, seuls les réglages d'EXÉCUTION ont un effet (gap, cooldown,
+    // Kelly) : le paper reçoit le score déjà décidé par le radar, il ne recalcule pas le signal.
+    let tuning = crate::tuning::Tuning::load(&cfg);
+
     let dash = dashboard::shared(true, "paper");
     {
-        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        let (port, st, ct, tn) = (cfg.dashboard_port, dash.clone(), controls.clone(), tuning.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, Some(tn)).await; });
     }
 
     // Flux marché Polymarket (carnets pour fills VWAP + marks) — public, sans credential.
@@ -83,6 +87,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 match sig {
                     WireSignal::Kill { .. } => tracing::warn!("⚡ KILL reçu — abstention"),
                     WireSignal::Attack { side, price, sent_ms, .. } => {
+                        // Snapshot tuning (lock-free) : gap/cooldown/sizing réglables à chaud.
+                        let tp = tuning.snapshot();
+                        paper.update_sizing(tp.kelly_fraction, tp.max_kelly_size_pct, tp.kelly_price_max);
                         // Latence transport radar→paper (informatif ; requiert NTP sync).
                         last_transport_ms = Some((chrono::Utc::now().timestamp_millis() as u64).saturating_sub(sent_ms));
                         let fair = price as f64;
@@ -92,13 +99,13 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if controls.is_paper_paused() { Some("paper en pause") }
                             else if market.is_none() { Some("pas de marché") }
                             else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
-                            else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
-                            else if gap < cfg.gap_min { Some("gap insuffisant") }
+                            else if now_ms.saturating_sub(last_fire_ms) < tp.cooldown_ms as u64 { Some("cooldown") }
+                            else if gap < tp.gap_min { Some("gap insuffisant") }
                             else { None };
                         if let Some(reason) = reject {
                             tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
                                 real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
-                                gap_min = cfg.gap_min, "✗ signal rejeté (paper)");
+                                gap_min = tp.gap_min, "✗ signal rejeté (paper)");
                         } else if let Some(m) = &market {
                             let (book, token) = if side == Side::Up {
                                 (&*up_book, &m.up_token_id)

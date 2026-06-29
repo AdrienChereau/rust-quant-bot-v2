@@ -113,6 +113,25 @@
     </div>
   </section>
 
+  <!-- CONSOLE DE TUNING À CHAUD (mono / paper) -->
+  <section id="tuning-section" style="display:none">
+    <div class="card tuning-card">
+      <h2>🎛️ Réglages à chaud <span class="muted" style="font-size:.7em">(snapshot lock-free — n'altère pas la vitesse du hot loop)</span></h2>
+      <div class="tuning-scenario">
+        <span>Scénario&nbsp;:</span>
+        <select id="scenario-select"></select>
+        <button class="btn-apply" onclick="applyScenario()">Appliquer le scénario</button>
+      </div>
+      <div id="tuning-grid" class="tuning-grid"></div>
+      <div class="tuning-actions">
+        <button class="btn-apply" onclick="applyParams()">✓ Appliquer les changements</button>
+        <button class="btn-reset" onclick="resetParams()">↺ Valeurs par défaut</button>
+      </div>
+      <div id="tuning-status" class="muted">—</div>
+      <p class="muted" style="margin:.5rem 0 0">Toute valeur est validée contre ses bornes côté backend et journalisée dans <code>data/params_changes.jsonl</code>. Les changements s'appliquent à la prochaine décision, jamais à une position ouverte.</p>
+    </div>
+  </section>
+
   <footer class="muted">Connexion : <span id="status">…</span></footer>
   <script src="/app.js"></script>
 </body>

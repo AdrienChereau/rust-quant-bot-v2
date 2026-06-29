@@ -2,6 +2,7 @@
 //! Tourne sur une tâche séparée lisant un snapshot partagé → **zéro impact** sur
 //! le hot-loop (OBI 50 ms + FSM).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 use crate::state::RuntimeControls;
+use crate::tuning::SharedTuning;
 
 const INDEX_HTML: &str = include_str!("../frontend/index.html");
 const STYLE_CSS: &str = include_str!("../frontend/style.css");
@@ -97,23 +99,45 @@ pub fn shared(dry_run: bool, node_kind: &str) -> Shared {
     Arc::new(RwLock::new(DashState { dry_run, node_kind: node_kind.to_string(), ..Default::default() }))
 }
 
-pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> anyhow::Result<()> {
+/// Sert le dashboard. `tuning` = `Some(..)` sur les nœuds qui exposent la console de réglages
+/// (mono, paper) ; `None` sur radar/live (pas de tuning à chaud → endpoints désactivés).
+pub async fn serve(
+    port: u16,
+    state: Shared,
+    controls: Arc<RuntimeControls>,
+    tuning: Option<SharedTuning>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "Dashboard sur http://0.0.0.0:{port}");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let state = state.clone();
         let controls = controls.clone();
+        let tuning = tuning.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 4096];
             let Ok(n) = sock.read(&mut buf).await else { return };
             let req = String::from_utf8_lossy(&buf[..n]);
             let mut tokens = req.split_whitespace();
             let method = tokens.next().unwrap_or("GET");
             let path = tokens.next().unwrap_or("/").split('?').next().unwrap_or("/");
 
-            // Endpoints de contrôle (POST) — mutent les atomics lock-free.
+            // Endpoints de contrôle (POST) — mutent les atomics lock-free / le snapshot de tuning.
             if method == "POST" {
+                // Réglages à chaud (uniquement si le nœud expose la console).
+                if let Some(t) = tuning.as_ref() {
+                    if path == "/params" || path == "/scenario" {
+                        let req_body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let body = if path == "/params" {
+                            handle_params(t, req_body)
+                        } else {
+                            handle_scenario(t, req_body)
+                        };
+                        let _ = sock.write_all(http_resp("application/json", &body).as_bytes()).await;
+                        let _ = sock.flush().await;
+                        return;
+                    }
+                }
                 let node_kind = state.read().await.node_kind.clone();
                 let ok = handle_control(path, &controls, &node_kind);
                 let body = format!("{{\"ok\":{ok},\"mode\":\"{}\"}}", controls.mode_label());
@@ -127,11 +151,53 @@ pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> 
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
                 "/app.js" => ("application/javascript; charset=utf-8", APP_JS.to_string()),
                 "/state" => ("application/json", serde_json::to_string(&*state.read().await).unwrap_or_else(|_| "{}".into())),
+                "/params" => ("application/json", match tuning.as_ref() {
+                    Some(t) => params_json(t),
+                    None => "{\"enabled\":false}".to_string(),
+                }),
                 _ => ("text/plain", "not found".to_string()),
             };
             let _ = sock.write_all(http_resp(ctype, &body).as_bytes()).await;
             let _ = sock.flush().await;
         });
+    }
+}
+
+/// `GET /params` : snapshot courant + bornes + noms de scénarios.
+fn params_json(t: &SharedTuning) -> String {
+    let snap = t.snapshot();
+    let scenarios: Vec<&String> = t.file.scenarios.keys().collect();
+    serde_json::json!({
+        "enabled": true,
+        "params": snap.to_map(),
+        "bounds": t.file.bounds,
+        "scenarios": scenarios,
+    }).to_string()
+}
+
+/// `POST /params` : applique un lot `{ "clé": valeur, ... }`, validé contre les bornes.
+fn handle_params(t: &SharedTuning, body: &str) -> String {
+    let updates: BTreeMap<String, f64> = match serde_json::from_str(body.trim()) {
+        Ok(m) => m,
+        Err(e) => return serde_json::json!({ "ok": false, "errors": [format!("JSON invalide: {e}")] }).to_string(),
+    };
+    match t.apply_updates(&updates, "dashboard") {
+        Ok(next) => serde_json::json!({ "ok": true, "params": next.to_map() }).to_string(),
+        Err(errs) => serde_json::json!({ "ok": false, "errors": errs }).to_string(),
+    }
+}
+
+/// `POST /scenario` : applique un preset nommé `{ "name": "..." }`.
+fn handle_scenario(t: &SharedTuning, body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Req { name: String }
+    let req: Req = match serde_json::from_str(body.trim()) {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({ "ok": false, "errors": [format!("JSON invalide: {e}")] }).to_string(),
+    };
+    match t.apply_scenario(&req.name, "dashboard") {
+        Ok(next) => serde_json::json!({ "ok": true, "params": next.to_map() }).to_string(),
+        Err(errs) => serde_json::json!({ "ok": false, "errors": errs }).to_string(),
     }
 }
 

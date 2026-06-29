@@ -192,6 +192,82 @@ async function refresh() {
     $("status").textContent = "✗ backend injoignable"; $("status").className = "ko";
   }
 }
+// ── Console de tuning à chaud ─────────────────────────────────────────────────
+// Le panneau se construit dynamiquement depuis /params (aucune valeur en dur) ; il ne se
+// reconstruit qu'après un Apply pour ne jamais écraser ce que l'opérateur est en train de saisir.
+let paramsBounds = {}, paramsLoaded = {};
+
+async function loadParams() {
+  try {
+    const p = await (await fetch("/params", { cache: "no-store" })).json();
+    if (!p.enabled) { $("tuning-section").style.display = "none"; return; }
+    $("tuning-section").style.display = "block";
+    paramsBounds = p.bounds || {};
+    paramsLoaded = p.params || {};
+    const sel = $("scenario-select");
+    if (sel.options.length === 0) {
+      sel.innerHTML = '<option value="">— choisir —</option>' +
+        (p.scenarios || []).map((n) => `<option value="${n}">${n}</option>`).join("");
+    }
+    buildGrid();
+  } catch (e) {}
+}
+
+function stepFor(b) { const r = b.max - b.min; return r <= 1 ? 0.01 : (r <= 100 ? 1 : 10); }
+
+function buildGrid() {
+  const grid = $("tuning-grid");
+  grid.innerHTML = Object.keys(paramsBounds).map((k) => {
+    const b = paramsBounds[k], v = paramsLoaded[k];
+    return `<div class="tuning-row">
+      <label>${k}</label>
+      <input type="number" data-key="${k}" min="${b.min}" max="${b.max}" step="${stepFor(b)}" value="${v}" />
+      <span class="muted t-range">[${b.min} … ${b.max}]</span>
+    </div>`;
+  }).join("");
+  grid.querySelectorAll("input").forEach((inp) => {
+    inp.addEventListener("input", () => {
+      const b = paramsBounds[inp.dataset.key], val = parseFloat(inp.value);
+      inp.classList.toggle("invalid", Number.isNaN(val) || val < b.min || val > b.max);
+    });
+  });
+}
+
+async function postTuning(path, body) {
+  try {
+    const r = await (await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    })).json();
+    if (r.ok) { paramsLoaded = r.params; buildGrid(); tStatus("✓ appliqué", true); }
+    else { tStatus("✗ " + (r.errors || ["erreur"]).join(" · "), false); }
+  } catch (e) { tStatus("✗ backend injoignable", false); }
+}
+
+function applyParams() {
+  const updates = {};
+  $("tuning-grid").querySelectorAll("input").forEach((inp) => {
+    const k = inp.dataset.key, val = parseFloat(inp.value);
+    if (!Number.isNaN(val) && val !== paramsLoaded[k]) updates[k] = val;
+  });
+  if (Object.keys(updates).length === 0) { tStatus("aucun changement", true); return; }
+  postTuning("/params", updates);
+}
+function applyScenario() {
+  const name = $("scenario-select").value;
+  if (!name) { tStatus("choisis un scénario", false); return; }
+  postTuning("/scenario", { name });
+}
+function resetParams() {
+  const updates = {};
+  Object.keys(paramsBounds).forEach((k) => { updates[k] = paramsBounds[k].default; });
+  postTuning("/params", updates);
+}
+window.applyParams = applyParams;
+window.applyScenario = applyScenario;
+window.resetParams = resetParams;
+function tStatus(msg, ok) { const el = $("tuning-status"); el.textContent = msg; el.className = ok ? "ok" : "ko"; }
+
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
 setInterval(refresh, 1000);
 refresh();
+loadParams();

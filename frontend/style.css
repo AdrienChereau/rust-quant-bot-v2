@@ -189,5 +189,38 @@ code { color: var(--cyan); background: rgba(87,214,230,.1); padding: 1px 5px; bo
 .breaker-banner.pulse { animation: breaker-pulse 1s ease-in-out infinite; }
 @keyframes breaker-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
+/* ── Console de tuning à chaud ─────────────────────────────── */
+#tuning-section { margin-top: 18px; }
+.tuning-card { max-width: 1100px; }
+.tuning-scenario {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.tuning-scenario select {
+  font-family: inherit; font-size: 13px; background: var(--panel-bg-alt); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 5px 8px;
+}
+.btn-apply {
+  font-family: inherit; font-size: 13px; font-weight: 700; padding: 6px 14px;
+  cursor: pointer; background: rgba(46,230,110,.14); color: var(--green);
+  border: 1px solid var(--green); border-radius: 4px; text-transform: uppercase;
+}
+.btn-apply:hover { background: rgba(46,230,110,.28); box-shadow: 0 0 14px rgba(46,230,110,.4); }
+.tuning-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 2px 18px; padding: 10px 12px;
+}
+.tuning-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.tuning-row label { flex: 1; color: var(--cyan); font-size: 13px; }
+.tuning-row input {
+  width: 92px; font-family: inherit; font-size: 13px; text-align: right;
+  background: var(--panel-bg-alt); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px;
+}
+.tuning-row input.invalid { border-color: var(--red); color: var(--red); background: #2a0d0d; }
+.tuning-row .t-range { font-size: 11px; min-width: 96px; }
+.tuning-actions { display: flex; gap: 12px; padding: 10px 12px 4px; }
+#tuning-status { padding: 0 12px 8px; font-size: 13px; min-height: 1.2em; }
+
 /* ── Footer ────────────────────────────────────────────────── */
 footer { margin-top: 18px; padding: 8px 4px; font-size: 13px; border-top: 1px solid var(--border-soft); }

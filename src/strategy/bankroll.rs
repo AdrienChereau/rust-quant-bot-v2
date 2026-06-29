@@ -187,6 +187,15 @@ impl PaperEngine {
         self.params.kelly_size_for(edge, price, self.state.cash)
     }
 
+    /// Met à jour à chaud les paramètres de **sizing** (fraction, plafond, clamp favoris) depuis
+    /// le snapshot de tuning. TP/SL/max-hold restent figés (changer le TP/SL d'une position
+    /// ouverte serait dangereux — exclu du tuning à chaud).
+    pub fn update_sizing(&mut self, kelly_fraction: f64, max_size_pct: f64, kelly_price_max: f64) {
+        self.params.kelly_fraction = kelly_fraction;
+        self.params.max_size_pct = max_size_pct;
+        self.params.kelly_price_max = kelly_price_max;
+    }
+
     /// Taille de Kelly sur une `equity` explicite (délègue à `KellyParams::kelly_size_for`).
     /// Conservé pour compat ; le LIVE appelle désormais directement `KellyParams::kelly_size_for`.
     pub fn kelly_size_for(&self, edge: f64, price: f64, equity: f64) -> f64 {

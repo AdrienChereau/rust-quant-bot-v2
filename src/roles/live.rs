@@ -90,7 +90,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let dash = dashboard::shared(cfg.dry_run, "live");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, None).await; });
     }
 
     let pm = Arc::new(Mutex::new(PmShared::default()));

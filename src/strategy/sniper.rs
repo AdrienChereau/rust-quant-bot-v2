@@ -52,6 +52,14 @@ impl Sniper {
         Self { state: State::Idle, dwell_ms, cooldown_ms, gap_min, score_fire_threshold }
     }
 
+    /// Met à jour les seuils réglables à chaud (depuis le snapshot de tuning). Mutation O(1)
+    /// de trois scalaires ; n'altère pas l'état de la FSM. Le radar/live ne l'appellent pas.
+    pub fn apply_tunables(&mut self, gap_min: f64, cooldown_ms: u64, score_fire_threshold: f64) {
+        self.gap_min = gap_min;
+        self.cooldown_ms = cooldown_ms;
+        self.score_fire_threshold = score_fire_threshold;
+    }
+
     pub fn is_armed(&self) -> bool {
         matches!(self.state, State::Arming { .. })
     }

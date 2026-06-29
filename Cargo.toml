@@ -18,6 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
+arc-swap = "1"            # snapshot lock-free des paramètres réglables à chaud (console de tuning)
 
 # Auth L2 Polymarket (HMAC-SHA256 des en-têtes /order).
 hmac = "0.12"

@@ -19,6 +19,7 @@ mod roles;
 mod signal;
 mod state;
 mod strategy;
+mod tuning;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -149,10 +150,13 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
+    // Console de tuning à chaud (snapshot lock-free partagé avec le dashboard).
+    let tuning = tuning::Tuning::load(&cfg);
+
     let dash = dashboard::shared(cfg.dry_run, "mono");
     {
-        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        let (port, st, ct, tn) = (cfg.dashboard_port, dash.clone(), controls.clone(), tuning.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, Some(tn)).await; });
     }
 
     // Sonde de latence TCP (toutes les 5 s, hors hot-loop) — mono = les trois cibles.
@@ -198,10 +202,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         cfg.kalman_spike_sigma, cfg.kalman_reset_after_n,
     );
     let mut basis = BasisSignal::new(cfg.basis_stale_ms, cfg.basis_threshold_usd, cfg.basis_lambda);
-    let weights = CompositeWeights {
-        w_obi: cfg.composite_w_obi, w_tfi: cfg.composite_w_tfi,
-        w_kalman: cfg.composite_w_kalman, w_basis: cfg.composite_w_basis,
-    };
+    // `weights` et les seuils du sniper/Kelly sont reconstruits à chaque tick depuis le snapshot
+    // de tuning (console à chaud) — voir le hot loop plus bas.
     let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
     let mut ic_tracker = IcTracker::new(200);
     let mut prev_spot: Option<f64> = None;
@@ -252,6 +254,21 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
 
+        // ── Snapshot des réglages à chaud (lock-free) — un Arc cohérent par tick.
+        //    snapshot() = load_full() : Send-safe pour traverser les .await (try_open/manage). ──
+        let tp = tuning.snapshot();
+        sniper.apply_tunables(tp.gap_min, tp.cooldown_ms as u64, tp.score_fire_threshold);
+        basis.set_threshold(tp.basis_threshold_usd);
+        paper.update_sizing(tp.kelly_fraction, tp.max_kelly_size_pct, tp.kelly_price_max);
+        let weights = CompositeWeights {
+            w_obi: tp.w_obi, w_tfi: tp.w_tfi, w_kalman: tp.w_kalman, w_basis: tp.w_basis,
+        };
+        let kelly = KellyParams {
+            kelly_fraction: tp.kelly_fraction, max_size_pct: tp.max_kelly_size_pct,
+            tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents,
+            max_hold_secs: cfg.max_hold_secs, kelly_price_max: tp.kelly_price_max,
+        };
+
         // ── Lectures lock-free ──
         let (obi_b, spot_opt, microprice_opt) = *bin_rx.borrow();
         let (obi_o, mid_okx) = *okx_rx.borrow();
@@ -278,7 +295,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         // Basis + score composite.
         let (basis_norm, basis_unc) = basis.evaluate(micro, mid_okx, okx_ts, now_ms);
-        let vel_norm = (kalman.velocity() / cfg.vel_norm_factor).clamp(-1.0, 1.0);
+        let vel_norm = (kalman.velocity() / tp.vel_norm_factor).clamp(-1.0, 1.0);
         let score = composite::score(obi_b, tfi, vel_norm, basis_norm, basis_unc, &weights);
         ema_stat.update(score);
         let score_sigma = ema_stat.std_dev();
@@ -296,11 +313,11 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             let _ = m;
             let t_years = years_from_secs(remaining_s.max(0) as f64);
             let sigma_blended = 0.5 * vol.annualized_sigma() + 0.5 * ewma.annualized_sigma();
-            fair_up = fair_up_with_d2_shift(spot, strike, sigma_blended, t_years, score, cfg.d2_gamma);
+            fair_up = fair_up_with_d2_shift(spot, strike, sigma_blended, t_years, score, tp.d2_gamma);
             gap = fair_up - real_up;
         }
 
-        let liquidity_vacuum = velocity <= cfg.vacuum_velocity && obi_b <= cfg.vacuum_obi;
+        let liquidity_vacuum = velocity <= tp.vacuum_velocity && obi_b <= tp.vacuum_obi;
         let blocked = market.is_none() || strike.is_none() || remaining_s <= cfg.end_window_block_secs;
 
         // ── FSM sniper : se déclenche sur chaque event OBI et Tick ──
@@ -410,8 +427,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             } else { None };
 
             // Conditions de tir (dashboard).
-            let score_ok = score.abs() >= cfg.score_fire_threshold;
-            let cond_gap = (fair_up - real_up).abs() >= cfg.gap_min;
+            let score_ok = score.abs() >= tp.score_fire_threshold;
+            let cond_gap = (fair_up - real_up).abs() >= tp.gap_min;
             let cond_velocity = vel_norm.abs() > 0.1;
             let cond_ready = !blocked && !liquidity_vacuum && !sniper.in_cooldown();
             let cond_persist = sniper.is_armed();
