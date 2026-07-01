@@ -16,6 +16,7 @@ mod net;
 mod okx;
 mod polymarket;
 mod pricing;
+mod recorder;
 mod roles;
 mod series;
 mod signal;
@@ -250,6 +251,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let mut last_mark_bid: Option<f64> = None;
     let mut last_live_pnl_val: Option<f64> = None;
     let mut last_series_ms: u64 = 0; // échantillonnage série graphe (1/s)
+    // Enregistreur de calibration : features 1 Hz + issue de chaque fenêtre → windows.jsonl.
+    let mut win_rec = recorder::WindowRecorder::new(
+        std::env::var("RECORD_PATH").unwrap_or_else(|_| "data/windows.jsonl".into()));
 
     loop {
         let event = tokio::select! {
@@ -403,6 +407,13 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             if now_ms.saturating_sub(last_series_ms) >= 1000 {
                 series::push(now_ms, fair_up, real_up, spot);
                 last_series_ms = now_ms;
+            }
+
+            // Enregistreur de calibration (1 Hz interne + outcome au rollover).
+            if strike_val > 0.0 {
+                let window_ts = ((now_ms / 1000) as i64 / 300) * 300;
+                win_rec.sample(now_ms, window_ts, remaining_s, spot, strike_val,
+                    sigma_blended, score, fair_up, real_up);
             }
 
             // Règlement des ordres en vol (latence simulée) contre le book PM courant.
