@@ -1,6 +1,6 @@
 //! Sizing Kelly fractionnel + exécution PAPER du sniper (P5).
 //!
-//! Sur un signal FIRE : achat taker du side + take-profit à +`tp_cents`, avec
+//! Sur un signal FIRE : achat taker du side + take-profit à +`tp_pct` (proportionnel), avec
 //! **stop-loss**, **max-hold** et liquidation à la résolution. Sizing = fraction de
 //! Kelly (half-Kelly par défaut), bornée. Fills paper réalistes : slippage en
 //! parcourant le carnet PM ; sélection adverse (biais selon le mouvement futur).
@@ -40,8 +40,8 @@ pub struct OpenPosition {
 pub struct KellyParams {
     pub kelly_fraction: f64,    // 0.5 = half-Kelly
     pub max_size_pct: f64,      // plafond taille×prix / equity
-    pub tp_cents: f64,
-    pub sl_cents: f64,
+    pub tp_pct: f64,   // fraction du prix d'entrée (0.08 = +8 %) — risque cohérent sur toute la plage 0.01–0.99
+    pub sl_pct: f64,   // fraction du prix d'entrée (0.06 = −6 %)
     pub max_hold_secs: i64,
     pub kelly_price_max: f64,   // KELLY_PRICE_MAX=0.90 — clamp favoris seulement (pas de plancher)
 }
@@ -230,8 +230,10 @@ impl PaperEngine {
             return false;
         }
         self.state.cash -= cost;
-        let tp = (avg_price + self.params.tp_cents / 100.0).min(0.99);
-        let sl = (avg_price - self.params.sl_cents / 100.0).max(0.01);
+        // TP/SL proportionnels au prix d'entrée (et non en cents absolus) : un stop à −6 %
+        // représente le même risque qu'on entre à 0.04 ou à 0.94. Évite le −75 % sur token bon marché.
+        let tp = (avg_price * (1.0 + self.params.tp_pct)).min(0.99);
+        let sl = (avg_price * (1.0 - self.params.sl_pct)).max(0.01);
         self.position = Some(OpenPosition {
             side, token_id: token_id.to_string(), entry_price: avg_price, size: filled,
             tp_price: round_tick(tp, tick), sl_price: round_tick(sl, tick), opened_ms: now_ms,
@@ -396,7 +398,7 @@ mod tests {
     use crate::polymarket::relayer::Level;
 
     fn params() -> KellyParams {
-        KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 10.0, sl_cents: 8.0, max_hold_secs: 120, kelly_price_max: 0.90 }
+        KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_pct: 0.10, sl_pct: 0.08, max_hold_secs: 120, kelly_price_max: 0.90 }
     }
     fn engine() -> PaperEngine {
         use std::sync::atomic::{AtomicU64, Ordering};

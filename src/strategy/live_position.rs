@@ -422,8 +422,8 @@ impl LivePositionManager {
         order_id: &str,
         now_ms: u64,
     ) {
-        let tp = round_tick((entry + self.params.tp_cents / 100.0).min(0.99), tick);
-        let sl = round_tick((entry - self.params.sl_cents / 100.0).max(0.01), tick);
+        let tp = round_tick((entry * (1.0 + self.params.tp_pct)).min(0.99), tick);
+        let sl = round_tick((entry * (1.0 - self.params.sl_pct)).max(0.01), tick);
         self.state.shots += 1;
         let pos = LivePosition {
             side, token_id: token_id.to_string(), entry_price: entry, size: filled,
@@ -499,7 +499,7 @@ mod tests {
 
     fn mgr() -> LivePositionManager {
         LivePositionManager::load_or_init(
-            KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 4.0, sl_cents: 3.0, max_hold_secs: 60, kelly_price_max: 0.90 },
+            KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_pct: 0.06, sl_pct: 0.05, max_hold_secs: 60, kelly_price_max: 0.90 },
             "/tmp/live_state_test_phase_c.json".into(),
             "/tmp/live_trades_test_phase_c.jsonl".into(),
         )

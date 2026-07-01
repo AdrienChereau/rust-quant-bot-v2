@@ -107,7 +107,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     let kelly = KellyParams {
         kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
-        tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents,
+        tp_pct: cfg.take_profit_pct, sl_pct: cfg.stop_loss_pct,
         max_hold_secs: cfg.max_hold_secs, kelly_price_max: cfg.kelly_price_max,
     };
     let mut live_mgr = LivePositionManager::load_or_init(

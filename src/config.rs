@@ -38,8 +38,8 @@ pub struct Config {
     pub start_cash: f64,
     pub kelly_fraction: f64,
     pub max_kelly_size_pct: f64,     // plafond taille / equity
-    pub take_profit_cents: f64,
-    pub stop_loss_cents: f64,
+    pub take_profit_pct: f64,   // TP proportionnel au prix d'entrée (0.08 = +8 %)
+    pub stop_loss_pct: f64,     // SL proportionnel au prix d'entrée (0.06 = −6 %)
     pub max_hold_secs: i64,
 
     // Live testing (passage paper → réel)
@@ -111,8 +111,8 @@ impl Config {
             start_cash: env_or("START_CASH", 200.0),
             kelly_fraction: env_or("KELLY_FRACTION", 0.5),
             max_kelly_size_pct: env_or("MAX_KELLY_SIZE_PCT", 0.02),
-            take_profit_cents: env_or("TAKE_PROFIT_CENTS", 4.0),
-            stop_loss_cents: env_or("STOP_LOSS_CENTS", 3.0),
+            take_profit_pct: env_or("TAKE_PROFIT_PCT", 0.08),
+            stop_loss_pct: env_or("STOP_LOSS_PCT", 0.06),
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
 
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
