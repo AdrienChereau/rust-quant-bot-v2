@@ -49,6 +49,8 @@ pub struct Config {
                                    // (agressif — micro-test plomberie sur petite bankroll)
     pub fixed_order_usd: f64,      // FIXED_ORDER_USD > 0 : ignore Kelly, force un notionnel fixe ($)
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
+    pub sim_latency_ms: u64,       // SIM_LATENCY_MS : latence simulée signal→ordre PM (paper) — 400 ms prod
+    pub taker_fee_bps: f64,        // TAKER_FEE_BPS : frais taker (bps) appliqués entrée+sortie (paper)
     pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties SL/max_hold
                                    // (garantit le fill de la vente ; la FAK price-improve).
 
@@ -119,6 +121,8 @@ impl Config {
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
+            sim_latency_ms: env_or("SIM_LATENCY_MS", 400u64),
+            taker_fee_bps: env_or("TAKER_FEE_BPS", 0.0),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),

@@ -31,9 +31,20 @@ pub struct OpenPosition {
     pub token_id: String,
     pub entry_price: f64,
     pub size: f64,
+    pub cost_basis: f64, // ce qu'on a réellement payé, frais taker d'entrée inclus
     pub tp_price: f64,
     pub sl_price: f64,
     pub opened_ms: u64,
+}
+
+/// Ordre soumis mais pas encore rempli : modélise la latence signal→ordre. Il se règle après
+/// `sim_latency_ms` contre le book PM de ce moment-là (dérive adverse capturée).
+#[derive(Debug, Clone)]
+struct PendingOrder {
+    side: Side,
+    token_id: String,
+    edge: f64,
+    submit_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +160,11 @@ pub struct PaperEngine {
     pub position: Option<OpenPosition>,
     /// > 0 : notionnel fixe en $ par tir (ignore Kelly). 0 = sizing Kelly normal.
     pub fixed_order_usd: f64,
+    /// Frais taker (bps du notionnel), appliqués à l'entrée ET à la sortie.
+    pub taker_fee_bps: f64,
+    /// Latence simulée signal→ordre (ms) : le fill se règle après ce délai contre le book courant.
+    pub sim_latency_ms: u64,
+    pending: Option<PendingOrder>,
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -171,7 +187,8 @@ impl PaperEngine {
             .and_then(|s| serde_json::from_str::<SniperState>(&s).ok())
             .unwrap_or(SniperState { cash: start_cash, start_cash, peak_equity: start_cash, ..Default::default() });
         tracing::info!(cash = state.cash, shots = state.shots, wins = state.wins, "État sniper chargé");
-        Self { state, position: None, fixed_order_usd: 0.0, params, state_path, trades_path }
+        Self { state, position: None, fixed_order_usd: 0.0, taker_fee_bps: 0.0, sim_latency_ms: 0,
+            pending: None, params, state_path, trades_path }
     }
 
     pub fn equity(&self, mark: Option<f64>) -> f64 {
@@ -202,15 +219,31 @@ impl PaperEngine {
         self.params.kelly_size_for(edge, price, equity)
     }
 
-    /// Exécute un tir (achat taker du side). Slippage : prix moyen en parcourant le
-    /// carnet ; sélection adverse modélisée à la clôture (cf. close_position).
-    #[allow(clippy::too_many_arguments)]
-    pub fn fire(&mut self, side: Side, token_id: &str, edge: f64, book: &PolyBook, tick: f64, min_size: f64, now_ms: u64) -> bool {
-        if self.position.is_some() {
-            return false; // un seul tir à la fois
+    /// Soumet un tir (signal FIRE). **Ne remplit PAS tout de suite** : l'ordre part en vol et se
+    /// règle après `sim_latency_ms` (cf. `settle_pending`). Un seul ordre en vol / une position
+    /// à la fois. Renvoie `true` si l'ordre est accepté (mis en file).
+    pub fn submit(&mut self, side: Side, token_id: &str, edge: f64, now_ms: u64) -> bool {
+        if self.position.is_some() || self.pending.is_some() {
+            return false;
         }
+        self.pending = Some(PendingOrder { side, token_id: token_id.to_string(), edge, submit_ms: now_ms });
+        true
+    }
+
+    /// Règle l'ordre en vol s'il a atteint la latence simulée. Fill contre le book **courant**
+    /// (retardé de `sim_latency_ms` par rapport au signal → dérive adverse capturée) + frais taker
+    /// à l'entrée. À appeler à chaque tick. Renvoie `true` si un fill a eu lieu.
+    pub fn settle_pending(&mut self, now_ms: u64, up_book: &PolyBook, down_book: &PolyBook, tick: f64, min_size: f64) -> bool {
+        let Some(p) = self.pending.as_ref() else { return false };
+        if now_ms.saturating_sub(p.submit_ms) < self.sim_latency_ms {
+            return false; // l'ordre n'est pas encore "arrivé" sur Polymarket
+        }
+        if self.position.is_some() { self.pending = None; return false; }
+        let (side, token_id, edge) = (p.side, p.token_id.clone(), p.edge);
+        self.pending = None;
+
+        let book = if side == Side::Up { up_book } else { down_book };
         let Some(best_ask) = book.best_ask() else { return false };
-        // Notionnel fixe ($) si activé (tests/comparaison) — sinon sizing Kelly normal.
         let size = if self.fixed_order_usd > 0.0 {
             (self.fixed_order_usd / best_ask).floor().max(min_size)
         } else {
@@ -220,28 +253,28 @@ impl PaperEngine {
             self.state.blocked_size += 1;
             return false;
         }
-        // Slippage : VWAP des asks consommés.
         let (avg_price, filled) = vwap_buy(book, size);
         if filled <= 0.0 {
             return false;
         }
-        let cost = avg_price * filled;
+        let notional = avg_price * filled;
+        let fee = notional * self.taker_fee_bps / 10_000.0;
+        let cost = notional + fee;
         if self.state.cash < cost {
             return false;
         }
         self.state.cash -= cost;
-        // TP/SL proportionnels au prix d'entrée (et non en cents absolus) : un stop à −6 %
-        // représente le même risque qu'on entre à 0.04 ou à 0.94. Évite le −75 % sur token bon marché.
+        // TP/SL proportionnels au prix d'entrée (risque cohérent sur toute la plage 0.01–0.99).
         let tp = (avg_price * (1.0 + self.params.tp_pct)).min(0.99);
         let sl = (avg_price * (1.0 - self.params.sl_pct)).max(0.01);
         self.position = Some(OpenPosition {
-            side, token_id: token_id.to_string(), entry_price: avg_price, size: filled,
+            side, token_id, entry_price: avg_price, size: filled, cost_basis: cost,
             tp_price: round_tick(tp, tick), sl_price: round_tick(sl, tick), opened_ms: now_ms,
         });
         self.state.shots += 1;
-        self.append("fire", side.as_str(), avg_price, filled, 0.0);
-        tracing::warn!(side = side.as_str(), token_id, entry = format!("{:.3}", avg_price),
-            size = filled, tp = format!("{:.2}", tp), "🎯 SNIPE");
+        self.append("fire", side.as_str(), avg_price, filled, -fee);
+        tracing::warn!(side = side.as_str(), entry = format!("{:.3}", avg_price), size = filled,
+            fee = format!("{:.4}", fee), lat_ms = self.sim_latency_ms, "🎯 SNIPE (réglé)");
         true
     }
 
@@ -270,15 +303,19 @@ impl PaperEngine {
 
     fn close_position(&mut self, exit_price: f64, reason: &str) {
         let Some(p) = self.position.take() else { return };
-        let proceeds = exit_price * p.size;
+        // Vente taker : frais sur le notionnel de sortie. PnL = produits nets − cost_basis
+        // (frais d'entrée déjà inclus dans cost_basis) → frais taker aller-retour comptés.
+        let gross = exit_price * p.size;
+        let fee = gross * self.taker_fee_bps / 10_000.0;
+        let proceeds = gross - fee;
         self.state.cash += proceeds;
-        let pnl = proceeds - p.entry_price * p.size;
+        let pnl = proceeds - p.cost_basis;
         self.state.realized_pnl = self.state.cash - self.state.start_cash;
         if pnl >= 0.0 { self.state.wins += 1 } else { self.state.losses += 1 }
         let eq = self.state.cash;
         if eq > self.state.peak_equity { self.state.peak_equity = eq; }
         self.append(reason, p.side.as_str(), exit_price, p.size, pnl);
-        tracing::warn!(reason, token_id = p.token_id, exit = format!("{:.3}", exit_price), pnl = format!("{:.2}", pnl),
+        tracing::warn!(reason, token_id = p.token_id, exit = format!("{:.3}", exit_price), pnl = format!("{:.3}", pnl),
             cash = format!("{:.2}", self.state.cash), "✖ clôture");
         self.persist();
     }
@@ -427,7 +464,9 @@ mod tests {
     #[test]
     fn fire_then_take_profit() {
         let mut e = engine();
-        assert!(e.fire(Side::Up, "tok", 0.10, &book(), 0.01, 5.0, 0));
+        let b = book();
+        assert!(e.submit(Side::Up, "tok", 0.10, 0));
+        assert!(e.settle_pending(0, &b, &b, 0.01, 5.0)); // latence 0 → fill immédiat
         assert!(e.position.is_some());
         // le bid monte au-dessus du TP → clôture gagnante
         let closed = e.manage(Some(0.65), 1000, 200);
@@ -438,10 +477,38 @@ mod tests {
     #[test]
     fn stop_loss_triggers() {
         let mut e = engine();
-        e.fire(Side::Up, "tok", 0.10, &book(), 0.01, 5.0, 0);
-        let closed = e.manage(Some(0.40), 1000, 200); // sous le SL (~0.42)
+        let b = book();
+        e.submit(Side::Up, "tok", 0.10, 0);
+        e.settle_pending(0, &b, &b, 0.01, 5.0);
+        let closed = e.manage(Some(0.40), 1000, 200); // sous le SL (~0.46)
         assert!(closed);
         assert_eq!(e.state.losses, 1);
+    }
+
+    #[test]
+    fn latency_defers_fill() {
+        let mut e = engine();
+        e.sim_latency_ms = 400;
+        let b = book();
+        e.submit(Side::Up, "tok", 0.10, 1000);
+        // avant 400 ms : pas de fill
+        assert!(!e.settle_pending(1200, &b, &b, 0.01, 5.0));
+        assert!(e.position.is_none());
+        // après 400 ms : fill
+        assert!(e.settle_pending(1400, &b, &b, 0.01, 5.0));
+        assert!(e.position.is_some());
+    }
+
+    #[test]
+    fn taker_fee_reduces_pnl() {
+        let mut e = engine();
+        e.taker_fee_bps = 100.0; // 1 %
+        let b = book();
+        e.submit(Side::Up, "tok", 0.10, 0);
+        e.settle_pending(0, &b, &b, 0.01, 5.0);
+        let cb = e.position.as_ref().unwrap().cost_basis;
+        let notional = e.position.as_ref().unwrap().entry_price * e.position.as_ref().unwrap().size;
+        assert!(cb > notional, "cost_basis doit inclure les frais d'entrée");
     }
 
     #[test]

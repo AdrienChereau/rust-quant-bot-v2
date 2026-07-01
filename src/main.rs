@@ -227,6 +227,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
+    paper.sim_latency_ms = cfg.sim_latency_ms;   // latence simulée signal→ordre (400 ms prod)
+    paper.taker_fee_bps = cfg.taker_fee_bps;     // frais taker entrée+sortie
     // Manager LIVE — symétrique au PaperEngine, persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,
@@ -385,7 +387,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                             }
                         }
                     } else if !controls.is_paper_paused() {
-                        paper.fire(side, token, gap.abs(), book, m.tick_size, m.min_order_size, now_ms);
+                        // Soumission : le fill se règle 400 ms plus tard (settle_pending, bras Tick).
+                        let _ = book;
+                        paper.submit(side, token, gap.abs(), now_ms);
                     }
                 }
             }
@@ -399,6 +403,11 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             if now_ms.saturating_sub(last_series_ms) >= 1000 {
                 series::push(now_ms, fair_up, real_up, spot);
                 last_series_ms = now_ms;
+            }
+
+            // Règlement des ordres en vol (latence simulée) contre le book PM courant.
+            if let Some(m) = &market {
+                paper.settle_pending(now_ms, &up_book, &down_book, m.tick_size, m.min_order_size);
             }
 
             // Gestion paper + IC Tracker.

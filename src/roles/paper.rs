@@ -59,6 +59,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
+    paper.sim_latency_ms = cfg.sim_latency_ms;
+    paper.taker_fee_bps = cfg.taker_fee_bps;
     if cfg.fixed_order_usd > 0.0 {
         tracing::warn!(usd = cfg.fixed_order_usd, "⚠️ FIXED_ORDER_USD actif — Kelly ignoré (tests)");
     }
@@ -110,12 +112,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                 real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
                                 gap_min = tp.gap_min, "✗ signal rejeté (paper)");
                         } else if let Some(m) = &market {
-                            let (book, token) = if side == Side::Up {
-                                (&*up_book, &m.up_token_id)
-                            } else {
-                                (&*down_book, &m.down_token_id)
-                            };
-                            if paper.fire(side, token, gap, book, m.tick_size, m.min_order_size, now_ms) {
+                            // Soumission : le fill se règle après sim_latency_ms (settle_pending, tick).
+                            let token = if side == Side::Up { &m.up_token_id } else { &m.down_token_id };
+                            if paper.submit(side, token, gap, now_ms) {
                                 last_fire_ms = now_ms;
                             }
                         }
@@ -141,6 +140,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         if now_ms.saturating_sub(last_series_ms) >= 1000 {
             crate::series::push(now_ms, last_fair, real_up, 0.0);
             last_series_ms = now_ms;
+        }
+
+        // ── Règlement des ordres en vol (latence simulée) contre le book PM courant ────
+        if let Some(m) = &market {
+            paper.settle_pending(now_ms, &up_book, &down_book, m.tick_size, m.min_order_size);
         }
 
         // ── Paper manage (TP/SL/max-hold) ─────────────────────────────────────────────
