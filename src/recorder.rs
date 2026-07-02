@@ -33,6 +33,8 @@ impl WindowRecorder {
     }
 
     /// À appeler à chaque tick (échantillonne à 1 Hz ; détecte le rollover de fenêtre).
+    /// `up_ask`/`down_ask` : meilleurs asks des deux books — pour une EV au prix d'exécution
+    /// réel (croiser le spread), pas au mid flatteur. 0.0 si book vide.
     #[allow(clippy::too_many_arguments)]
     pub fn sample(
         &mut self,
@@ -45,6 +47,8 @@ impl WindowRecorder {
         score: f64,
         fair: f64,
         real: f64,
+        up_ask: f64,
+        down_ask: f64,
     ) {
         // Rollover : la fenêtre précédente est finie → issue = dernier spot vu vs son strike.
         if window_ts != self.cur_window_ts {
@@ -77,6 +81,8 @@ impl WindowRecorder {
             "score": score,
             "fair": fair,
             "real": real,
+            "up_ask": up_ask,
+            "down_ask": down_ask,
         }));
     }
 
@@ -97,10 +103,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut r = WindowRecorder::new(path.clone());
         // fenêtre 1 : deux samples (spot finit au-dessus du strike)
-        r.sample(1_000, 300, 250, 60_100.0, 60_000.0, 0.5, 0.1, 0.6, 0.55);
-        r.sample(2_500, 300, 248, 60_150.0, 60_000.0, 0.5, 0.1, 0.6, 0.55);
+        r.sample(1_000, 300, 250, 60_100.0, 60_000.0, 0.5, 0.1, 0.6, 0.55, 0.56, 0.46);
+        r.sample(2_500, 300, 248, 60_150.0, 60_000.0, 0.5, 0.1, 0.6, 0.55, 0.56, 0.46);
         // rollover → outcome up=true pour la fenêtre 300
-        r.sample(3_500, 600, 300, 60_150.0, 60_050.0, 0.5, 0.0, 0.5, 0.5);
+        r.sample(3_500, 600, 300, 60_150.0, 60_050.0, 0.5, 0.0, 0.5, 0.5, 0.51, 0.51);
         let content = std::fs::read_to_string(&path).unwrap();
         let outcome: Vec<_> = content.lines().filter(|l| l.contains("\"outcome\"")).collect();
         assert_eq!(outcome.len(), 1);
@@ -115,7 +121,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut r = WindowRecorder::new(path.clone());
         for i in 0..30u64 {
-            r.sample(1_000 + i * 100, 300, 250, 60_000.0, 60_000.0, 0.5, 0.0, 0.5, 0.5);
+            r.sample(1_000 + i * 100, 300, 250, 60_000.0, 60_000.0, 0.5, 0.0, 0.5, 0.5, 0.51, 0.51);
         }
         // 3 s de ticks à 10 Hz → 3 samples max
         let content = std::fs::read_to_string(&path).unwrap();

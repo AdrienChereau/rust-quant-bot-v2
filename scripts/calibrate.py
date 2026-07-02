@@ -97,26 +97,48 @@ def main():
     print(f"TEST : fair calibré {btest:.4f} vs prix PM {bpm_test:.4f} → "
           + ("✅ ON BAT LE MARCHÉ" if btest < bpm_test else "❌ le marché nous bat — pas d'edge de calibration"))
 
-    # ── 3. Table d'EV hold-to-resolution (sur TEST uniquement) ───────────────
-    print(f"\n── EV hold-to-resolution (test, frais {fee_bps} bps) ──")
-    print(f"{'seuil':>6} | {'trades':>6} | {'EV moyen $/1$':>13} | {'EV total':>8}")
+    # ── 3. EV hold-to-resolution HONNÊTE : 1 trade max/fenêtre, fill au ASK ──
+    # - pseudo-réplication tuée : on ne prend que la PREMIÈRE divergence de chaque fenêtre ;
+    # - exécution réelle : achat au best ask du book (si absent des vieux logs → mid + ½ spread
+    #   supposé de 1 cent) ; frais taker sur le notionnel.
+    half_spread = 0.01
+    if "--half-spread" in sys.argv:
+        half_spread = float(sys.argv[sys.argv.index("--half-spread") + 1])
+    by_win = defaultdict(list)
+    for s in test:
+        by_win[s["window_ts"]].append(s)
+    for w in by_win.values():
+        w.sort(key=lambda s: s["ts"])
+
+    print(f"\n── EV hold-to-resolution (test, 1 trade/fenêtre, fill au ask, frais {fee_bps} bps) ──")
+    print(f"{'seuil':>6} | {'fenêtres':>8} | {'EV moyen $/1$':>13} | {'z':>5} | verdict")
     for thr in [0.03, 0.05, 0.08, 0.10, 0.15]:
         evs = []
-        for s in test:
-            p = fair(s["spot"], s["strike"], sg, s["remaining_s"], gm, s["score"])
-            up_px, down_px = s["real"], 1.0 - s["real"]
-            if p - up_px > thr and up_px > 0.01:      # acheter UP
-                ev = (1.0 - up_px if s["y"] == 1.0 else -up_px) - fee * up_px
-                evs.append(ev)
-            elif (1.0 - p) - down_px > thr and down_px > 0.01:  # acheter DOWN
-                ev = (1.0 - down_px if s["y"] == 0.0 else -down_px) - fee * down_px
-                evs.append(ev)
-        if evs:
-            print(f"{thr:>6.2f} | {len(evs):>6} | {sum(evs)/len(evs):>+13.4f} | {sum(evs):>+8.2f}")
+        for w in by_win.values():
+            for s in w:
+                if s["remaining_s"] < 10:
+                    continue
+                p = fair(s["spot"], s["strike"], sg, s["remaining_s"], gm, s["score"])
+                up_px = s.get("up_ask") or (s["real"] + half_spread)
+                down_px = s.get("down_ask") or (1.0 - s["real"] + half_spread)
+                ev = None
+                if 0.01 < up_px < 0.99 and p - up_px > thr:          # acheter UP au ask
+                    ev = (1.0 - up_px if s["y"] == 1.0 else -up_px) - fee * up_px
+                elif 0.01 < down_px < 0.99 and (1.0 - p) - down_px > thr:  # acheter DOWN au ask
+                    ev = (1.0 - down_px if s["y"] == 0.0 else -down_px) - fee * down_px
+                if ev is not None:
+                    evs.append(ev)
+                    break  # UN SEUL trade par fenêtre — premier signal
+        if len(evs) >= 2:
+            m = sum(evs) / len(evs)
+            var = sum((e - m) ** 2 for e in evs) / (len(evs) - 1)
+            z = m / math.sqrt(var / len(evs)) if var > 0 else 0.0
+            verdict = "✅ significatif" if z > 1.96 else "bruit"
+            print(f"{thr:>6.2f} | {len(evs):>8} | {m:>+13.4f} | {z:>5.2f} | {verdict}")
         else:
-            print(f"{thr:>6.2f} | {0:>6} | {'—':>13} | {'—':>8}")
-    print("\nNB: samples ≠ trades indépendants (plusieurs samples/fenêtre). L'EV moyen est le bon")
-    print("    indicateur ; le total est optimiste. Conclure sur ≥300 fenêtres résolues (~25h).")
+            print(f"{thr:>6.2f} | {len(evs):>8} | {'—':>13} | {'—':>5} | échantillon vide")
+    print("\nRègle de décision : GO seulement si (a) Brier test < Brier PM, ET (b) une ligne d'EV")
+    print("z > 1.96 sur ≥100 fenêtres tradées, ET (c) EV ~monotone en fonction du seuil.")
 
 if __name__ == "__main__":
     main()

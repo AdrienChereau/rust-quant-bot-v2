@@ -413,7 +413,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             if strike_val > 0.0 {
                 let window_ts = ((now_ms / 1000) as i64 / 300) * 300;
                 win_rec.sample(now_ms, window_ts, remaining_s, spot, strike_val,
-                    sigma_blended, score, fair_up, real_up);
+                    sigma_blended, score, fair_up, real_up,
+                    up_book.best_ask().unwrap_or(0.0), down_book.best_ask().unwrap_or(0.0));
             }
 
             // Règlement des ordres en vol (latence simulée) contre le book PM courant.
