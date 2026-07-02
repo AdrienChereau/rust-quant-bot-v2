@@ -39,12 +39,12 @@ def bucket(rs):
     if rs > 60:  return "60-120s"
     return "0-60s"
 
+def taker_fee(px):
+    """Frais taker Polymarket 5-min : 0.07·p·(1−p) — ~1.75 % à p=0.5, →0 aux extrêmes."""
+    return 0.07 * px * (1.0 - px)
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "data/windows.jsonl"
-    fee_bps = 10.0
-    if "--fee-bps" in sys.argv:
-        fee_bps = float(sys.argv[sys.argv.index("--fee-bps") + 1])
-    fee = fee_bps / 10_000.0
 
     outcomes, samples = {}, []
     with open(path) as f:
@@ -61,7 +61,7 @@ def main():
     for s in rows:
         s["y"] = outcomes[s["window_ts"]]
     nw = len({s["window_ts"] for s in rows})
-    print(f"fenêtres résolues: {nw} | samples exploitables: {len(rows)} | frais: {fee_bps} bps")
+    print(f"fenêtres résolues: {nw} | samples exploitables: {len(rows)} | frais: 0.07·p(1−p)")
     if nw < 30:
         print(f"⚠️  <30 fenêtres — laisser tourner l'enregistreur avant de conclure.")
     if not rows:
@@ -110,22 +110,24 @@ def main():
     for w in by_win.values():
         w.sort(key=lambda s: s["ts"])
 
-    print(f"\n── EV hold-to-resolution (test, 1 trade/fenêtre, fill au ask, frais {fee_bps} bps) ──")
+    # Gardes de la stratégie v3 (docs/STRATEGY.md) : τ ∈ [30, 240] s, jamais acheter > 0.93,
+    # edge NET de frais 0.07·p(1−p) — le seuil devient p-dépendant automatiquement.
+    print(f"\n── EV hold-to-resolution (test, 1 trade/fenêtre, fill au ask, frais 0.07·p(1−p)) ──")
     print(f"{'seuil':>6} | {'fenêtres':>8} | {'EV moyen $/1$':>13} | {'z':>5} | verdict")
-    for thr in [0.03, 0.05, 0.08, 0.10, 0.15]:
+    for thr in [0.02, 0.03, 0.05, 0.08, 0.10]:
         evs = []
         for w in by_win.values():
             for s in w:
-                if s["remaining_s"] < 10:
+                if not (30 <= s["remaining_s"] <= 240):
                     continue
                 p = fair(s["spot"], s["strike"], sg, s["remaining_s"], gm, s["score"])
                 up_px = s.get("up_ask") or (s["real"] + half_spread)
                 down_px = s.get("down_ask") or (1.0 - s["real"] + half_spread)
                 ev = None
-                if 0.01 < up_px < 0.99 and p - up_px > thr:          # acheter UP au ask
-                    ev = (1.0 - up_px if s["y"] == 1.0 else -up_px) - fee * up_px
-                elif 0.01 < down_px < 0.99 and (1.0 - p) - down_px > thr:  # acheter DOWN au ask
-                    ev = (1.0 - down_px if s["y"] == 0.0 else -down_px) - fee * down_px
+                if 0.01 < up_px <= 0.93 and p - up_px - taker_fee(up_px) > thr:
+                    ev = (1.0 - up_px if s["y"] == 1.0 else -up_px) - taker_fee(up_px)
+                elif 0.01 < down_px <= 0.93 and (1.0 - p) - down_px - taker_fee(down_px) > thr:
+                    ev = (1.0 - down_px if s["y"] == 0.0 else -down_px) - taker_fee(down_px)
                 if ev is not None:
                     evs.append(ev)
                     break  # UN SEUL trade par fenêtre — premier signal
