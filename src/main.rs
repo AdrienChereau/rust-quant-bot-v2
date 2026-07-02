@@ -217,6 +217,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
     let mut ic_tracker = IcTracker::new(200);
     let mut last_fire_score: f64 = 0.0;
+    // Suivi v1 : 1 trade max par fenêtre + strike d'entrée (pour le règlement à la résolution).
+    let mut v1_last_window: i64 = 0;
+    let mut v1_entry_strike: f64 = 0.0;
 
     let kelly = KellyParams {
         kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
@@ -231,6 +234,10 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.sim_latency_ms = cfg.sim_latency_ms;   // latence simulée signal→ordre (400 ms prod)
     paper.taker_fee_coef = cfg.taker_fee_coef;   // frais taker 0.07·p(1−p) entrée+sortie
+    paper.resolution_mode = cfg.strategy_v1;     // v1 : hold-to-resolution (pas de TP/SL)
+    if cfg.strategy_v1 {
+        tracing::info!(theta = cfg.gap_min, "🧭 STRATÉGIE V1 active — edge net + hold-to-resolution");
+    }
     // Manager LIVE — symétrique au PaperEngine, persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,
@@ -341,6 +348,39 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         let liquidity_vacuum = velocity <= tp.vacuum_velocity && obi_b <= tp.vacuum_obi;
         let blocked = market.is_none() || strike.is_none() || remaining_s <= cfg.end_window_block_secs;
 
+        // ── STRATÉGIE V1 (paper) : entrée sur edge net + hold-to-resolution ──
+        // TRADE si p̂ − ask − frais(ask) > θ (= gap_min, réglable console), avec les gardes :
+        // τ ∈ [30, 240] s, ask ≤ 0.93, 1 trade/fenêtre. Latence 400 ms via submit/settle_pending.
+        let window_ts = ((now_ms / 1000) as i64 / 300) * 300;
+        if cfg.strategy_v1 && !blocked && !controls.is_breaker_tripped()
+            && !controls.is_paper_paused() && paper.position.is_none()
+            && window_ts != v1_last_window && (30..=240).contains(&remaining_s)
+            && strike_val > 0.0
+        {
+            if let Some(m) = &market {
+                let fee = |px: f64| cfg.taker_fee_coef * px * (1.0 - px);
+                let up_a = up_book.best_ask().unwrap_or(0.0);
+                let dn_a = down_book.best_ask().unwrap_or(0.0);
+                let e_up = if up_a > 0.01 && up_a <= 0.93 { fair_up - up_a - fee(up_a) } else { f64::NEG_INFINITY };
+                let e_dn = if dn_a > 0.01 && dn_a <= 0.93 { (1.0 - fair_up) - dn_a - fee(dn_a) } else { f64::NEG_INFINITY };
+                let (v1_side, v1_edge) = if e_up >= e_dn {
+                    (concurrency::bus::Side::Up, e_up)
+                } else {
+                    (concurrency::bus::Side::Down, e_dn)
+                };
+                if v1_edge > tp.gap_min {
+                    let token = if v1_side == concurrency::bus::Side::Up { &m.up_token_id } else { &m.down_token_id };
+                    if paper.submit(v1_side, token, v1_edge, now_ms) {
+                        v1_last_window = window_ts;
+                        v1_entry_strike = strike_val;
+                        last_fire_score = v1_edge;
+                        tracing::warn!(side = v1_side.as_str(), edge = format!("{v1_edge:.4}"),
+                            remaining_s, "🧭 v1 ENTRY — hold-to-resolution");
+                    }
+                }
+            }
+        }
+
         // ── FSM sniper : se déclenche sur chaque event OBI et Tick ──
         let is_live = controls.live_active();
         let input = TickInput { now_ms, score, score_sigma, basis_unc, fair_up, real_up,
@@ -390,8 +430,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                                 }
                             }
                         }
-                    } else if !controls.is_paper_paused() {
-                        // Soumission : le fill se règle 400 ms plus tard (settle_pending, bras Tick).
+                    } else if !controls.is_paper_paused() && !cfg.strategy_v1 {
+                        // Legacy uniquement (STRATEGY_V1=false) : l'entrée v1 se fait plus haut,
+                        // sur l'edge net — pas sur la FSM score.
                         let _ = book;
                         paper.submit(side, token, gap.abs(), now_ms);
                     }
@@ -411,7 +452,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
             // Enregistreur de calibration (1 Hz interne + outcome au rollover).
             if strike_val > 0.0 {
-                let window_ts = ((now_ms / 1000) as i64 / 300) * 300;
                 win_rec.sample(now_ms, window_ts, remaining_s, spot, strike_val,
                     sigma_blended, score, fair_up, real_up,
                     up_book.best_ask().unwrap_or(0.0), down_book.best_ask().unwrap_or(0.0));
@@ -429,6 +469,22 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             } else { None };
             let wins_before = paper.state.wins;
             let had_position = paper.position.is_some();
+
+            // v1 : règlement à la RÉSOLUTION — payoff 0/1 vs strike d'entrée (spot Binance,
+            // caveat Chainlink documenté). Déclenché à ≤1 s de la fin ou au rollover de fenêtre.
+            if cfg.strategy_v1 && v1_entry_strike > 0.0 {
+                if let Some(pos) = &paper.position {
+                    if remaining_s <= 1 || window_ts != v1_last_window {
+                        let won = match pos.side {
+                            concurrency::bus::Side::Up => spot > v1_entry_strike,
+                            concurrency::bus::Side::Down => spot < v1_entry_strike,
+                        };
+                        paper.settle_resolution(won);
+                        v1_entry_strike = 0.0;
+                    }
+                }
+            }
+
             paper.manage(mark_bid, now_ms, remaining_s);
             if had_position && paper.position.is_none() {
                 ic_tracker.record(last_fire_score, paper.state.wins > wins_before);

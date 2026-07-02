@@ -167,6 +167,10 @@ pub struct PaperEngine {
     pub taker_fee_coef: f64,
     /// Latence simulée signal→ordre (ms) : le fill se règle après ce délai contre le book courant.
     pub sim_latency_ms: u64,
+    /// Mode stratégie v1 : hold-to-resolution — `manage()` ne fait plus TP/SL/max-hold ;
+    /// la position se règle à la résolution via `settle_resolution()` (payoff 0/1, zéro frais
+    /// de sortie : 0.07·p(1−p) s'annule à p∈{0,1}).
+    pub resolution_mode: bool,
     pending: Option<PendingOrder>,
     params: KellyParams,
     state_path: String,
@@ -191,7 +195,7 @@ impl PaperEngine {
             .unwrap_or(SniperState { cash: start_cash, start_cash, peak_equity: start_cash, ..Default::default() });
         tracing::info!(cash = state.cash, shots = state.shots, wins = state.wins, "État sniper chargé");
         Self { state, position: None, fixed_order_usd: 0.0, taker_fee_coef: 0.0, sim_latency_ms: 0,
-            pending: None, params, state_path, trades_path }
+            resolution_mode: false, pending: None, params, state_path, trades_path }
     }
 
     pub fn equity(&self, mark: Option<f64>) -> f64 {
@@ -282,8 +286,18 @@ impl PaperEngine {
         true
     }
 
+    /// Règle la position à la résolution de la fenêtre : payoff 1$ (gagné) ou 0$ (perdu).
+    /// Pas de vente → pas de spread de sortie, et frais 0.07·p(1−p) nuls à p∈{0,1}.
+    pub fn settle_resolution(&mut self, won: bool) {
+        self.close_position(if won { 1.0 } else { 0.0 }, "resolution");
+    }
+
     /// Gère la position ouverte : TP atteint, stop-loss, max-hold. Renvoie true si fermée.
+    /// En `resolution_mode`, ne fait rien — la sortie passe par `settle_resolution()`.
     pub fn manage(&mut self, mark_bid: Option<f64>, now_ms: u64, remaining_s: i64) -> bool {
+        if self.resolution_mode {
+            return false;
+        }
         // Lecture par référence (pas de clone de la position à chaque tick) ; on extrait les
         // primitives Copy nécessaires avant d'appeler close_position (qui emprunte &mut self).
         let Some(p) = self.position.as_ref() else { return false };
@@ -516,6 +530,40 @@ mod tests {
         let expected_fee = 0.07 * p.entry_price * (1.0 - p.entry_price) * p.size;
         assert!((p.cost_basis - notional - expected_fee).abs() < 1e-9,
             "cost_basis doit inclure coef·p(1−p)·size");
+    }
+
+    #[test]
+    fn resolution_mode_holds_then_settles() {
+        let mut e = engine();
+        e.resolution_mode = true;
+        e.taker_fee_coef = 0.07;
+        let b = book();
+        e.submit(Side::Up, "tok", 0.10, 0);
+        e.settle_pending(0, &b, &b, 0.01, 5.0);
+        // TP/SL/max-hold désactivés : même un bid extrême ne clôture pas
+        assert!(!e.manage(Some(0.99), 1000, 200));
+        assert!(!e.manage(Some(0.01), 2000, 200));
+        assert!(e.position.is_some());
+        // résolution gagnée : payoff 1$/token, zéro frais de sortie (0.07·1·0 = 0)
+        let cash_before = e.state.cash;
+        let size = e.position.as_ref().unwrap().size;
+        e.settle_resolution(true);
+        assert!(e.position.is_none());
+        assert_eq!(e.state.wins, 1);
+        assert!((e.state.cash - cash_before - size).abs() < 1e-9, "payoff = 1$ × size, sans frais");
+    }
+
+    #[test]
+    fn resolution_lost_pays_zero() {
+        let mut e = engine();
+        e.resolution_mode = true;
+        let b = book();
+        e.submit(Side::Down, "tok", 0.10, 0);
+        e.settle_pending(0, &b, &b, 0.01, 5.0);
+        let cash_before = e.state.cash;
+        e.settle_resolution(false);
+        assert_eq!(e.state.losses, 1);
+        assert_eq!(e.state.cash, cash_before, "payoff 0$ : le cash ne bouge pas à la perte");
     }
 
     #[test]

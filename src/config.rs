@@ -51,6 +51,8 @@ pub struct Config {
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
     pub sim_latency_ms: u64,       // SIM_LATENCY_MS : latence simulée signal→ordre PM (paper) — 400 ms prod
     pub taker_fee_coef: f64,       // TAKER_FEE_COEF : frais taker = coef·p·(1−p)/share (0.07 Polymarket)
+    pub strategy_v1: bool,         // STRATEGY_V1 : moteur v1 (edge net + hold-to-resolution) — true.
+                                   // false = legacy score-gate + TP/SL (comparaison uniquement).
     pub vol_floor: f64,            // VOL_FLOOR : plancher σ annualisée (0.10 — l'ancien 0.80 était > σ*=0.35 !)
     pub ewma_lambda_slow: f64,     // EWMA_LAMBDA_SLOW : EWMA lente 1s (0.99) — max(rapide, lente)
     pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties SL/max_hold
@@ -125,6 +127,7 @@ impl Config {
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             sim_latency_ms: env_or("SIM_LATENCY_MS", 400u64),
             taker_fee_coef: env_or("TAKER_FEE_COEF", 0.07),
+            strategy_v1: env_or("STRATEGY_V1", true),
             vol_floor: env_or("VOL_FLOOR", 0.10),
             ewma_lambda_slow: env_or("EWMA_LAMBDA_SLOW", 0.99),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
