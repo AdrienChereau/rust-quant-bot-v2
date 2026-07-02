@@ -60,7 +60,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.sim_latency_ms = cfg.sim_latency_ms;
-    paper.taker_fee_bps = cfg.taker_fee_bps;
+    paper.taker_fee_coef = cfg.taker_fee_coef;
     if cfg.fixed_order_usd > 0.0 {
         tracing::warn!(usd = cfg.fixed_order_usd, "⚠️ FIXED_ORDER_USD actif — Kelly ignoré (tests)");
     }

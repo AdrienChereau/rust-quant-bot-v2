@@ -50,7 +50,9 @@ pub struct Config {
     pub fixed_order_usd: f64,      // FIXED_ORDER_USD > 0 : ignore Kelly, force un notionnel fixe ($)
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
     pub sim_latency_ms: u64,       // SIM_LATENCY_MS : latence simulée signal→ordre PM (paper) — 400 ms prod
-    pub taker_fee_bps: f64,        // TAKER_FEE_BPS : frais taker (bps) appliqués entrée+sortie (paper)
+    pub taker_fee_coef: f64,       // TAKER_FEE_COEF : frais taker = coef·p·(1−p)/share (0.07 Polymarket)
+    pub vol_floor: f64,            // VOL_FLOOR : plancher σ annualisée (0.10 — l'ancien 0.80 était > σ*=0.35 !)
+    pub ewma_lambda_slow: f64,     // EWMA_LAMBDA_SLOW : EWMA lente 1s (0.99) — max(rapide, lente)
     pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties SL/max_hold
                                    // (garantit le fill de la vente ; la FAK price-improve).
 
@@ -122,7 +124,9 @@ impl Config {
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             sim_latency_ms: env_or("SIM_LATENCY_MS", 400u64),
-            taker_fee_bps: env_or("TAKER_FEE_BPS", 0.0),
+            taker_fee_coef: env_or("TAKER_FEE_COEF", 0.07),
+            vol_floor: env_or("VOL_FLOOR", 0.10),
+            ewma_lambda_slow: env_or("EWMA_LAMBDA_SLOW", 0.99),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
@@ -131,7 +135,9 @@ impl Config {
 
             obi_multilevel_lambda: env_or("OBI_MULTILEVEL_LAMBDA", 0.5f64),
             score_fire_threshold: env_or("SCORE_FIRE_THRESHOLD", 0.35f64),
-            d2_gamma: env_or("D2_GAMMA", 0.50f64),
+            // v1 (docs/STRATEGY.md) : le score composite est HORS du chemin de décision.
+            // γ=0 → fair = Φ(d2) pur. Ne remonter γ que si le juge (calibrate.py) le valide.
+            d2_gamma: env_or("D2_GAMMA", 0.0f64),
             agg_trade_ws_url: env::var("AGG_TRADE_WS_URL")
                 .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws/btcusdt@aggTrade".into()),
             tfi_window_ms: env_or("TFI_WINDOW_MS", 5000u64),

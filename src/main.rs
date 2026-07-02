@@ -36,7 +36,7 @@ use binance::math_engine::VelocityTracker;
 use binance::trade_feed::run_agg_trade;
 use config::Config;
 use pricing::black_scholes::{d2 as bs_d2, fair_up_with_d2_shift, years_from_secs};
-use pricing::volatility::{EwmaVolatility, VolatilityTracker};
+use pricing::volatility::{DualEwmaVol, VolatilityTracker};
 use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials};
 use polymarket::pm_poller::{spawn_pm_poller, PmShared};
@@ -203,8 +203,10 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // Moteurs signal stack v2.
     let mut sniper = Sniper::new(cfg.obi_dwell_ms, cfg.cooldown_ms, cfg.gap_min, cfg.score_fire_threshold);
     let mut vel   = VelocityTracker::new(1000); // pour liquidity_vacuum (unités relatives)
-    let mut vol   = VolatilityTracker::new(2000, 0.80);
-    let mut ewma  = EwmaVolatility::new(cfg.ewma_lambda, 0.80);
+    // σ de DÉCISION : DualEwmaVol sur retours 1 s (STRATEGY.md §2). La tick-RV ci-dessous ne
+    // sert plus qu'au diagnostic dashboard (gonflée ×3-5 par le bruit bid-ask — bug prouvé).
+    let mut vol   = VolatilityTracker::new(2000, cfg.vol_floor);
+    let mut dvol  = DualEwmaVol::new(cfg.ewma_lambda, cfg.ewma_lambda_slow, cfg.vol_floor);
     let mut kalman = KalmanFilter::new(
         cfg.kalman_q00, cfg.kalman_q11, cfg.kalman_r,
         cfg.kalman_spike_sigma, cfg.kalman_reset_after_n,
@@ -214,7 +216,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // de tuning (console à chaud) — voir le hot loop plus bas.
     let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
     let mut ic_tracker = IcTracker::new(200);
-    let mut prev_spot: Option<f64> = None;
     let mut last_fire_score: f64 = 0.0;
 
     let kelly = KellyParams {
@@ -229,7 +230,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.sim_latency_ms = cfg.sim_latency_ms;   // latence simulée signal→ordre (400 ms prod)
-    paper.taker_fee_bps = cfg.taker_fee_bps;     // frais taker entrée+sortie
+    paper.taker_fee_coef = cfg.taker_fee_coef;   // frais taker 0.07·p(1−p) entrée+sortie
     // Manager LIVE — symétrique au PaperEngine, persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,
@@ -293,11 +294,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         vol.update(now_ms, spot);
         let velocity = vel.velocity();
 
-        // Vol EWMA sur log-return (variance par seconde — dt géré en interne).
-        if let Some(prev) = prev_spot {
-            if prev > 0.0 { ewma.update(now_ms, (spot / prev).ln()); }
-        }
-        prev_spot = Some(spot);
+        // σ de décision : échantillonnage 1 s interne (jamais de retours tick).
+        dvol.update(now_ms, spot);
 
         // Kalman sur microprice (USD/s).
         let micro = microprice_opt.unwrap_or(spot);
@@ -323,9 +321,11 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         // fair_up B&S avec décalage d2 par le score composite.
         let mut fair_up = 0.5;
         let mut gap = 0.0;
+        // σ de décision = DualEwmaVol seule. La tick-RV (sigma_realized) est un diagnostic :
+        // elle N'ENTRE PLUS dans le pricing (bruit bid-ask ×3-5 — c'était le vice caché).
         let sigma_realized = vol.annualized_sigma();
-        let sigma_ewma = ewma.annualized_sigma();
-        let sigma_blended = 0.5 * sigma_realized + 0.5 * sigma_ewma;
+        let sigma_ewma = dvol.fast_sigma();
+        let sigma_blended = dvol.annualized_sigma();
         let mut d2_base = 0.0;
         let mut d2_adj = 0.0;
         let mut strike_val = 0.0;
@@ -496,6 +496,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 d.sigma_realized = sigma_realized; d.sigma_ewma = sigma_ewma; d.sigma_blended = sigma_blended;
                 d.d2_base = d2_base; d.d2_adj = d2_adj; d.strike = strike_val;
                 d.ic = ic_tracker.ic();
+                // Edges nets v1 : p̂ − ask − frais(ask), au vrai prix d'exécution.
+                let fee = |px: f64| cfg.taker_fee_coef * px * (1.0 - px);
+                d.edge_net_up = up_book.best_ask()
+                    .filter(|&a| a > 0.0 && strike_val > 0.0)
+                    .map(|a| fair_up - a - fee(a));
+                d.edge_net_down = down_book.best_ask()
+                    .filter(|&a| a > 0.0 && strike_val > 0.0)
+                    .map(|a| (1.0 - fair_up) - a - fee(a));
                 d.fsm_state = fsm.into();
                 d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
                 d.remaining_s = remaining_s;

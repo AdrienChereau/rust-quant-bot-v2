@@ -86,6 +86,25 @@ async function refresh() {
         chk("c_gap", s.cond_gap); chk("c_ready", s.cond_ready);
         $("c_all").innerHTML = s.all_conditions ? '<span class="ok">🔥 FEU</span>' : '<span class="muted">en attente</span>';
 
+        // Stratégie v1 — edges nets de frais en direct (θ = 0.02).
+        const THETA = 0.02;
+        const edgeCell = (id, v) => {
+          const el = $(id);
+          if (v == null) { el.textContent = "—"; el.className = "muted"; return; }
+          el.textContent = (v >= 0 ? "+" : "") + fmt(v, 4);
+          el.className = v > THETA ? "ok" : (v > 0 ? "warn" : "ko");
+        };
+        edgeCell("edge_up", s.edge_net_up);
+        edgeCell("edge_down", s.edge_net_down);
+        const sig = $("v1_signal");
+        if (s.edge_net_up != null && s.edge_net_up > THETA) {
+          sig.innerHTML = '<span class="ok">ACHETER UP (hold to resolution)</span>';
+        } else if (s.edge_net_down != null && s.edge_net_down > THETA) {
+          sig.innerHTML = '<span class="ok">ACHETER DOWN (hold to resolution)</span>';
+        } else {
+          sig.innerHTML = '<span class="muted">pas d’edge net — abstention</span>';
+        }
+
         // Compartiment Maths — valeurs vivantes du signal stack.
         const plain = (id, v, d = 3) => { $(id).textContent = fmt(v, d); };
         obi($("m_obib"), s.obi_binance); obi($("m_obio"), s.obi_okx);

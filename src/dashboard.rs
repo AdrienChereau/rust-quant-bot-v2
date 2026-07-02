@@ -51,6 +51,9 @@ pub struct DashState {
     pub d2_adj: f64,          // d2 + γ·score (décalé)
     pub strike: f64,          // strike de la fenêtre (USD)
     pub ic: f64,              // information coefficient (Pearson, 200 trades)
+    // Stratégie v1 — edges nets de frais 0.07·p(1−p) au ask (None = book indisponible)
+    pub edge_net_up: Option<f64>,
+    pub edge_net_down: Option<f64>,
     // Sniper
     pub fsm_state: String,    // IDLE/ARMING/COOLDOWN
     pub market_slug: String,

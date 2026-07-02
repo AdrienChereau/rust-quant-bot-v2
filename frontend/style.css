@@ -140,6 +140,27 @@ code {
   padding: 1px 6px; border-radius: 5px;
 }
 
+/* ── Carte Stratégie v1 ───────────────────────────────────────── */
+#strategy-section { margin-bottom: 20px; }
+.strategy-card { border-left: 3px solid var(--accent); }
+.strategy-body {
+  display: grid; grid-template-columns: 1fr 340px; gap: 8px 28px;
+  padding: 12px 18px 14px;
+}
+@media (max-width: 900px) { .strategy-body { grid-template-columns: 1fr; } }
+.strategy-text p { margin: 0 0 10px; font-size: 0.88rem; line-height: 1.55; }
+.strategy-thesis { color: var(--text); }
+.strategy-guards { color: var(--muted); font-size: 0.8rem !important; }
+.strategy-formula {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem; line-height: 1.6;
+  background: var(--panel-alt); border: 1px solid var(--border-soft);
+  border-radius: 8px; padding: 10px 14px; margin: 0 0 10px;
+  color: var(--text);
+}
+.strategy-live { align-self: center; }
+.strategy-live .row { padding: 6px 0; }
+
 /* ── Compartiment Maths ───────────────────────────────────────── */
 .maths-card { grid-column: 1 / -1; }
 .maths-grid {

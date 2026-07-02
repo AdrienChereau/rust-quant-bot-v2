@@ -3,7 +3,7 @@
 
   "bounds": {
     "score_fire_threshold": { "min": 0.20, "max": 0.60,  "default": 0.35 },
-    "d2_gamma":             { "min": 0.0,  "max": 1.0,    "default": 0.50 },
+    "d2_gamma":             { "min": 0.0,  "max": 1.0,    "default": 0.0 },
     "vel_norm_factor":      { "min": 5.0,  "max": 200.0,  "default": 5.0 },
     "w_obi":                { "min": 0.0,  "max": 1.0,    "default": 0.40 },
     "w_tfi":                { "min": 0.0,  "max": 1.0,    "default": 0.30 },

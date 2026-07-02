@@ -65,8 +65,9 @@ impl KellyParams {
         if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
             return 0.0;
         }
-        let odds = (1.0 - price) / price;
-        let f_full = (edge / odds).clamp(0.0, 1.0);
+        // Kelly binaire exact : miser f à prix c, gain (1−c)/c si victoire →
+        // f* = (p−c)/(1−c) = edge/(1−c). (L'ancien edge·c/(1−c) sous-misait d'un facteur c.)
+        let f_full = (edge / (1.0 - price)).clamp(0.0, 1.0);
         let f = f_full * self.kelly_fraction;
         let budget = (equity * f).min(equity * self.max_size_pct);
         (budget / price).floor()
@@ -87,11 +88,12 @@ impl KellyParams {
         if price <= 0.0 || price >= 1.0 || equity <= 0.0 {
             return 0.0;
         }
+        // Clamp favoris : price_k plafonné → dénominateur (1−price_k) plus grand → taille réduite.
         let price_k = price.min(self.kelly_price_max);
-        let odds = (1.0 - price_k) / price_k;
         let uncertainty = (score_sigma / (score_abs + 1e-9) + 0.5 * basis_unc).min(1.0);
         let robustness = (1.0 - uncertainty).max(0.0);
-        let f_full = (edge / odds * robustness).clamp(0.0, 1.0);
+        // Kelly binaire exact : f* = edge/(1−c) (cf. kelly_size_for).
+        let f_full = (edge / (1.0 - price_k) * robustness).clamp(0.0, 1.0);
         let f = f_full * self.kelly_fraction;
         let budget = (equity * f).min(equity * self.max_size_pct);
         (budget / price).floor()
@@ -160,8 +162,9 @@ pub struct PaperEngine {
     pub position: Option<OpenPosition>,
     /// > 0 : notionnel fixe en $ par tir (ignore Kelly). 0 = sizing Kelly normal.
     pub fixed_order_usd: f64,
-    /// Frais taker (bps du notionnel), appliqués à l'entrée ET à la sortie.
-    pub taker_fee_bps: f64,
+    /// Coefficient de frais taker Polymarket : frais = coef·p·(1−p) par share (défaut 0.07 —
+    /// ~1.75 ¢/share à p=0.5, ~0 aux extrêmes). Appliqué à l'entrée ET à la sortie. 0 = désactivé.
+    pub taker_fee_coef: f64,
     /// Latence simulée signal→ordre (ms) : le fill se règle après ce délai contre le book courant.
     pub sim_latency_ms: u64,
     pending: Option<PendingOrder>,
@@ -187,7 +190,7 @@ impl PaperEngine {
             .and_then(|s| serde_json::from_str::<SniperState>(&s).ok())
             .unwrap_or(SniperState { cash: start_cash, start_cash, peak_equity: start_cash, ..Default::default() });
         tracing::info!(cash = state.cash, shots = state.shots, wins = state.wins, "État sniper chargé");
-        Self { state, position: None, fixed_order_usd: 0.0, taker_fee_bps: 0.0, sim_latency_ms: 0,
+        Self { state, position: None, fixed_order_usd: 0.0, taker_fee_coef: 0.0, sim_latency_ms: 0,
             pending: None, params, state_path, trades_path }
     }
 
@@ -258,7 +261,8 @@ impl PaperEngine {
             return false;
         }
         let notional = avg_price * filled;
-        let fee = notional * self.taker_fee_bps / 10_000.0;
+        // Frais taker Polymarket : coef·p·(1−p) par share — maximaux à p=0.5, ~nuls aux extrêmes.
+        let fee = self.taker_fee_coef * avg_price * (1.0 - avg_price) * filled;
         let cost = notional + fee;
         if self.state.cash < cost {
             return false;
@@ -303,10 +307,10 @@ impl PaperEngine {
 
     fn close_position(&mut self, exit_price: f64, reason: &str) {
         let Some(p) = self.position.take() else { return };
-        // Vente taker : frais sur le notionnel de sortie. PnL = produits nets − cost_basis
-        // (frais d'entrée déjà inclus dans cost_basis) → frais taker aller-retour comptés.
+        // Vente taker : frais coef·p·(1−p) par share sur la sortie. PnL = produits nets −
+        // cost_basis (frais d'entrée inclus dans cost_basis) → aller-retour compté.
         let gross = exit_price * p.size;
-        let fee = gross * self.taker_fee_bps / 10_000.0;
+        let fee = self.taker_fee_coef * exit_price * (1.0 - exit_price) * p.size;
         let proceeds = gross - fee;
         self.state.cash += proceeds;
         let pnl = proceeds - p.cost_basis;
@@ -502,13 +506,27 @@ mod tests {
     #[test]
     fn taker_fee_reduces_pnl() {
         let mut e = engine();
-        e.taker_fee_bps = 100.0; // 1 %
+        e.taker_fee_coef = 0.07; // courbe Polymarket réelle
         let b = book();
         e.submit(Side::Up, "tok", 0.10, 0);
         e.settle_pending(0, &b, &b, 0.01, 5.0);
-        let cb = e.position.as_ref().unwrap().cost_basis;
-        let notional = e.position.as_ref().unwrap().entry_price * e.position.as_ref().unwrap().size;
-        assert!(cb > notional, "cost_basis doit inclure les frais d'entrée");
+        let p = e.position.as_ref().unwrap();
+        let notional = p.entry_price * p.size;
+        // frais attendus = 0.07·0.5·0.5·size = 0.0175/share à p=0.5
+        let expected_fee = 0.07 * p.entry_price * (1.0 - p.entry_price) * p.size;
+        assert!((p.cost_basis - notional - expected_fee).abs() < 1e-9,
+            "cost_basis doit inclure coef·p(1−p)·size");
+    }
+
+    #[test]
+    fn kelly_binary_formula_exact() {
+        // f* = edge/(1−c) : edge=0.10, c=0.50 → f_full=0.20, half-Kelly → f=0.10,
+        // budget = min(200·0.10, 200·0.10)=20 → 40 tokens à 0.50.
+        let p = params(); // kelly_fraction 0.5, max_size_pct 0.10
+        assert_eq!(p.kelly_size_for(0.10, 0.50, 200.0), 40.0);
+        // Favori clampé : c=0.95 → price_k=0.90 → f_full = 0.02/0.10 = 0.20 (fini, pas explosif)
+        let sz = p.robust_kelly_size_for(0.02, 0.95, 200.0, 1.0, 0.0, 0.0);
+        assert!(sz > 0.0 && sz <= (200.0f64 * 0.10 / 0.95).ceil());
     }
 
     #[test]

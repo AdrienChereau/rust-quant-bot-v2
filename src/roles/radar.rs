@@ -19,7 +19,7 @@ use crate::net::udp::UdpSender;
 use crate::net::wire::WireSignal;
 use crate::polymarket::relayer::btc_price_at_window_open;
 use crate::pricing::black_scholes::{d2 as bs_d2, fair_up_with_d2_shift, years_from_secs};
-use crate::pricing::volatility::{EwmaVolatility, VolatilityTracker};
+use crate::pricing::volatility::{DualEwmaVol, VolatilityTracker};
 use crate::signal::basis::BasisSignal;
 use crate::signal::composite::{self, CompositeWeights};
 use crate::signal::kalman::KalmanFilter;
@@ -122,12 +122,12 @@ fn spawn_signal_task(
             cfg.kalman_q00, cfg.kalman_q11, cfg.kalman_r,
             cfg.kalman_spike_sigma, cfg.kalman_reset_after_n,
         );
-        let mut vol   = VolatilityTracker::new(2000, 0.80);
-        let mut ewma  = EwmaVolatility::new(cfg.ewma_lambda, 0.80);
+        // σ de décision : DualEwmaVol (retours 1 s). La tick-RV = diagnostic seulement.
+        let mut vol   = VolatilityTracker::new(2000, cfg.vol_floor);
+        let mut dvol  = DualEwmaVol::new(cfg.ewma_lambda, cfg.ewma_lambda_slow, cfg.vol_floor);
         let mut vel   = VelocityTracker::new(1000);
         let mut basis = BasisSignal::new(cfg.basis_stale_ms, cfg.basis_threshold_usd, cfg.basis_lambda);
         let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
-        let mut prev_spot: Option<f64> = None;
         let mut log_throttle: u32 = 0;
 
         loop {
@@ -148,10 +148,7 @@ fn spawn_signal_task(
             let micro = microprice_opt.unwrap_or(spot);
             kalman.update(now_ms, micro);
 
-            if let Some(prev) = prev_spot {
-                if prev > 0.0 { ewma.update(now_ms, (spot / prev).ln()); }
-            }
-            prev_spot = Some(spot);
+            dvol.update(now_ms, spot); // échantillonnage 1 s interne
 
             let tfi    = f64::from_bits(tfi_atomic.load(Ordering::Relaxed));
             let okx_ts = okx_ts_atomic.load(Ordering::Relaxed);
@@ -168,9 +165,9 @@ fn spawn_signal_task(
             let remaining_s = window_ts + WINDOW_SEC - now_s;
             let strike_opt = { let s = strike.lock().unwrap(); if s.window_ts == window_ts { s.strike } else { None } };
 
-            let sigma_realized = vol.annualized_sigma();
-            let sigma_ewma = ewma.annualized_sigma();
-            let sigma_blended = 0.5 * sigma_realized + 0.5 * sigma_ewma;
+            let sigma_realized = vol.annualized_sigma(); // diagnostic (tick-RV gonflée)
+            let sigma_ewma = dvol.fast_sigma();
+            let sigma_blended = dvol.annualized_sigma(); // σ de décision
             let (mut d2_base, mut d2_adj, mut strike_val) = (0.0, 0.0, 0.0);
             let fair_up = if let Some(strk) = strike_opt {
                 let t_years = years_from_secs(remaining_s.max(0) as f64);

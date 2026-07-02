@@ -22,6 +22,32 @@
 
   <div id="breaker-banner" class="breaker-banner" hidden>🛑 CIRCUIT BREAKER DÉCLENCHÉ — exécution coupée <button class="btn-reset" onclick="ctl('/breaker/reset')">↺ Réinitialiser</button></div>
 
+  <!-- STRATÉGIE v1 — value calibrée, hold-to-resolution (docs/STRATEGY.md) -->
+  <section id="strategy-section">
+    <div class="card strategy-card">
+      <h2>Stratégie v1 — Value calibrée, hold-to-resolution</h2>
+      <div class="strategy-body">
+        <div class="strategy-text">
+          <p class="strategy-thesis">Acheter le token dont notre probabilité calibrée dépasse le prix ask
+          d'une marge <b>nette de frais</b>, et <b>tenir jusqu'à la résolution</b>. Pas de TP/SL,
+          pas de score composite, pas de course de vitesse — une course de calibration.</p>
+          <div class="strategy-formula">p̂ = Φ(d2) · d2 = [ln(S/K) − ½σ̂²τ] / (σ̂√τ) · σ̂ = max(EWMA 1s rapide, lente)<br/>
+          edge = p̂ − ask − 0.07·ask·(1−ask) → <b>TRADE si edge &gt; θ = 0.02</b></div>
+          <p class="strategy-guards"><b>Gardes :</b> τ ∈ [30 s, 240 s] · jamais acheter &gt; 0.93 (queues grasses) ·
+          zone grise Chainlink près du strike · 1 trade/fenêtre · breaker drawdown.
+          <b>Verdict :</b> juge Brier/z-score sur ≥ 300 fenêtres (<code>scripts/calibrate.py</code>) —
+          GO seulement si on bat le prix PM.</p>
+        </div>
+        <div class="strategy-live">
+          <div class="row"><span>Edge net UP (p̂ − ask − frais)</span><b id="edge_up">—</b></div>
+          <div class="row"><span>Edge net DOWN</span><b id="edge_down">—</b></div>
+          <div class="row"><span>Seuil de trade θ</span><b>0.02</b></div>
+          <div class="row"><span>Signal v1</span><b id="v1_signal">—</b></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ORDER TERMINAL (TOKYO) -->
   <section id="order-terminal" class="grid" style="display: none;">
     <div class="card">
