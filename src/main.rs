@@ -17,6 +17,7 @@ mod okx;
 mod polymarket;
 mod pricing;
 mod recorder;
+mod resolution;
 mod roles;
 mod series;
 mod signal;
@@ -217,9 +218,16 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let mut ema_stat = EmaScoreStat::new(cfg.ewma_score_lambda);
     let mut ic_tracker = IcTracker::new(200);
     let mut last_fire_score: f64 = 0.0;
-    // Suivi v1 : 1 trade max par fenêtre + strike d'entrée (pour le règlement à la résolution).
+    // Suivi v1 : 1 trade max par fenêtre + strike d'entrée (pour le fallback Binance).
     let mut v1_last_window: i64 = 0;
     let mut v1_entry_strike: f64 = 0.0;
+    // Règlement v1 par résolution OFFICIELLE : (window_ts, label_binance_fallback, depuis_ms).
+    let mut v1_awaiting: Option<(i64, bool, u64)> = None;
+    let (res_req_tx, mut res_res_rx) = resolution::spawn();
+    // Watchdog feed : le spot Binance figé (WS à moitié mort) a produit 41 % d'issues fausses.
+    // Si le spot ne change pas pendant > 10 s → feed suspect → aucune entrée, dashboard alerté.
+    let mut last_spot_val: f64 = 0.0;
+    let mut last_spot_change_ms: u64 = 0;
 
     let kelly = KellyParams {
         kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
@@ -301,6 +309,14 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         vol.update(now_ms, spot);
         let velocity = vel.velocity();
 
+        // Watchdog feed Binance : spot inchangé > 10 s = WS à moitié mort → tout est suspect.
+        if spot != last_spot_val {
+            last_spot_val = spot;
+            last_spot_change_ms = now_ms;
+        }
+        let feed_stale = last_spot_change_ms > 0
+            && now_ms.saturating_sub(last_spot_change_ms) > 10_000;
+
         // σ de décision : échantillonnage 1 s interne (jamais de retours tick).
         dvol.update(now_ms, spot);
 
@@ -352,8 +368,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         // TRADE si p̂ − ask − frais(ask) > θ (= gap_min, réglable console), avec les gardes :
         // τ ∈ [30, 240] s, ask ≤ 0.93, 1 trade/fenêtre. Latence 400 ms via submit/settle_pending.
         let window_ts = ((now_ms / 1000) as i64 / 300) * 300;
-        if cfg.strategy_v1 && !blocked && !controls.is_breaker_tripped()
-            && !controls.is_paper_paused() && paper.position.is_none()
+        if cfg.strategy_v1 && !blocked && !feed_stale && !controls.is_breaker_tripped()
+            && !controls.is_paper_paused() && paper.position.is_none() && v1_awaiting.is_none()
             && window_ts != v1_last_window && (30..=240).contains(&remaining_s)
             && strike_val > 0.0
         {
@@ -451,7 +467,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             }
 
             // Enregistreur de calibration (1 Hz interne + outcome au rollover).
-            if strike_val > 0.0 {
+            // Feed stale → on n'écrit RIEN (mieux vaut un trou que des données empoisonnées).
+            if strike_val > 0.0 && !feed_stale {
                 win_rec.sample(now_ms, window_ts, remaining_s, spot, strike_val,
                     sigma_blended, score, fair_up, real_up,
                     up_book.best_ask().unwrap_or(0.0), down_book.best_ask().unwrap_or(0.0));
@@ -470,18 +487,68 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             let wins_before = paper.state.wins;
             let had_position = paper.position.is_some();
 
-            // v1 : règlement à la RÉSOLUTION — payoff 0/1 vs strike d'entrée (spot Binance,
-            // caveat Chainlink documenté). Déclenché à ≤1 s de la fin ou au rollover de fenêtre.
-            if cfg.strategy_v1 && v1_entry_strike > 0.0 {
+            // v1 — fin de fenêtre : on N'ARBITRE PLUS avec le spot Binance (le feed figé a
+            // produit 41 % d'issues fausses). On demande la résolution OFFICIELLE Polymarket ;
+            // le label Binance devient un simple fallback signalé.
+            if cfg.strategy_v1 && v1_entry_strike > 0.0 && v1_awaiting.is_none() {
                 if let Some(pos) = &paper.position {
                     if remaining_s <= 1 || window_ts != v1_last_window {
-                        let won = match pos.side {
+                        let binance_won = match pos.side {
                             concurrency::bus::Side::Up => spot > v1_entry_strike,
                             concurrency::bus::Side::Down => spot < v1_entry_strike,
                         };
-                        paper.settle_resolution(won);
+                        v1_awaiting = Some((v1_last_window, binance_won, now_ms));
+                        let _ = res_req_tx.try_send(v1_last_window);
+                        tracing::info!(window = v1_last_window, binance_won, feed_stale,
+                            "⏳ fenêtre finie — attente résolution officielle Polymarket");
+                    }
+                }
+            }
+
+            // Arrivée d'une résolution officielle → règlement définitif.
+            while let Ok(r) = res_res_rx.try_recv() {
+                if let Some((wts, binance_won, _t0)) = v1_awaiting {
+                    if r.window_ts == wts {
+                        if let Some(pos) = &paper.position {
+                            match r.up {
+                                Some(up_official) => {
+                                    let our = (pos.side == concurrency::bus::Side::Up) == up_official;
+                                    if our != binance_won {
+                                        tracing::warn!(window = wts, our_side = pos.side.as_str(),
+                                            up_official, "⚖️ label Binance CONTREDIT par l'officiel — officiel retenu");
+                                    }
+                                    win_rec.record_official(wts, up_official);
+                                    paper.settle_resolution(our);
+                                }
+                                // Officiel indisponible après tous les essais → on n'invente pas
+                                // l'issue : annulation (remboursement), jamais un faux gagnant.
+                                None => {
+                                    tracing::warn!(window = wts, "résolution officielle introuvable → ANNULATION");
+                                    paper.void_position("void_no_resolution");
+                                }
+                            }
+                        }
+                        v1_awaiting = None;
                         v1_entry_strike = 0.0;
                     }
+                }
+            }
+            // Garde-fou : si l'API reste muette > 14 min (résolution UMA = 3-8 min normalement).
+            // Fallback SÛR : feed sain → label Binance fiable ; feed mort → ANNULATION (jamais
+            // deviner l'issue). C'est ce qui a produit les faux gagnants — on ne recommence pas.
+            if let Some((wts, binance_won, t0)) = v1_awaiting {
+                if now_ms.saturating_sub(t0) > 840_000 {
+                    if paper.position.is_some() {
+                        if feed_stale {
+                            tracing::warn!(window = wts, "⏱ timeout résolution + feed mort → ANNULATION (pas de faux gagnant)");
+                            paper.void_position("void_no_resolution");
+                        } else {
+                            tracing::warn!(window = wts, "⏱ timeout résolution — fallback label Binance (feed sain)");
+                            paper.settle_resolution(binance_won);
+                        }
+                    }
+                    v1_awaiting = None;
+                    v1_entry_strike = 0.0;
                 }
             }
 
@@ -539,7 +606,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             let lat_snap = lat.lock().unwrap().clone();
             {
                 let mut d = dash.write().await;
-                d.binance_connected = spot > 0.0;
+                d.binance_connected = spot > 0.0 && !feed_stale; // rouge si feed figé
                 d.okx_connected = obi_o != 0.0;
                 d.btc_spot = spot;
                 d.obi_binance = obi_b; d.obi_okx = obi_o; d.obi_consolidated = score;
@@ -572,7 +639,13 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
                 } else if let Some(p) = &paper.position {
                     d.in_position = true;
-                    d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+                    d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price;
+                    // v1 : pas de TP/SL — la position vit jusqu'à la résolution (0 = masqué).
+                    if cfg.strategy_v1 {
+                        d.pos_tp = 0.0; d.pos_sl = 0.0;
+                    } else {
+                        d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+                    }
                 } else {
                     d.in_position = false;
                 }

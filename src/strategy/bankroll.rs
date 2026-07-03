@@ -292,6 +292,18 @@ impl PaperEngine {
         self.close_position(if won { 1.0 } else { 0.0 }, "resolution");
     }
 
+    /// ANNULE la position sans compter W/L : rembourse le cost_basis (entrée + frais).
+    /// Utilisé quand l'issue est INCONNAISSABLE (feed mort + résolution officielle indisponible)
+    /// — mieux vaut un trade neutre qu'un faux gagnant. Ne fausse ni le hit rate ni le PnL.
+    pub fn void_position(&mut self, reason: &str) {
+        let Some(p) = self.position.take() else { return };
+        self.state.cash += p.cost_basis; // remboursement intégral
+        self.state.realized_pnl = self.state.cash - self.state.start_cash;
+        self.append(reason, p.side.as_str(), p.entry_price, p.size, 0.0);
+        tracing::warn!(reason, token_id = p.token_id, "⊘ position ANNULÉE (issue inconnaissable) — remboursée");
+        self.persist();
+    }
+
     /// Gère la position ouverte : TP atteint, stop-loss, max-hold. Renvoie true si fermée.
     /// En `resolution_mode`, ne fait rien — la sortie passe par `settle_resolution()`.
     pub fn manage(&mut self, mark_bid: Option<f64>, now_ms: u64, remaining_s: i64) -> bool {

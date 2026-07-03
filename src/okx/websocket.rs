@@ -71,7 +71,16 @@ async fn connect_and_stream(
     write.send(Message::Text(sub.to_string())).await?;
     tracing::info!(%url, "OKX WS connecté + abonné books BTC-USDT");
 
-    while let Some(msg) = read.next().await {
+    loop {
+        // Watchdog anti connexion à moitié morte : OKX pousse books + pings en continu.
+        let msg = match tokio::time::timeout(Duration::from_secs(45), read.next()).await {
+            Err(_) => {
+                tracing::warn!("OKX WS silencieux 45 s — reconnexion forcée");
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => m,
+        };
         let txt = match msg? {
             Message::Text(t) => t,
             Message::Ping(p) => { let _ = write.send(Message::Pong(p)).await; continue; }
@@ -99,5 +108,4 @@ async fn connect_and_stream(
         okx_ts_atomic.store(now_ms, Ordering::Relaxed);
         let _ = obi_tx.send((obi_o, mid_okx));
     }
-    Ok(())
 }

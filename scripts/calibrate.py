@@ -46,17 +46,35 @@ def taker_fee(px):
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "data/windows.jsonl"
 
-    outcomes, samples = {}, []
+    outcomes, official, samples = {}, {}, []
     with open(path) as f:
         for line in f:
             try: r = json.loads(line)
             except json.JSONDecodeError: continue
             if r.get("kind") == "outcome":
                 outcomes[r["window_ts"]] = 1.0 if r["up"] else 0.0
+            elif r.get("kind") == "outcome_official":
+                official[r["window_ts"]] = 1.0 if r["up"] else 0.0
             elif r.get("kind") == "sample":
                 samples.append(r)
 
-    rows = [s for s in samples if s["window_ts"] in outcomes
+    # L'issue OFFICIELLE (résolution Polymarket/Chainlink) prime sur le label Binance.
+    both = [w for w in official if w in outcomes]
+    mismatch = [w for w in both if official[w] != outcomes[w]]
+    if both:
+        print(f"labels : {len(official)} officiels, {len(outcomes)} Binance | "
+              f"désaccord sur {len(mismatch)}/{len(both)} fenêtres communes")
+    outcomes.update(official)
+
+    # Fenêtres à spot FIGÉ (feed Binance mort) = données empoisonnées → exclues.
+    from collections import defaultdict as _dd
+    spots = _dd(set)
+    for s in samples: spots[s["window_ts"]].add(round(s["spot"], 2))
+    frozen = {w for w, sp in spots.items() if len(sp) <= 1}
+    if frozen:
+        print(f"⚠️  {len(frozen)} fenêtres à spot figé (feed mort) exclues de la calibration")
+
+    rows = [s for s in samples if s["window_ts"] in outcomes and s["window_ts"] not in frozen
             and s["spot"] > 0 and s["strike"] > 0 and 0.01 <= s["real"] <= 0.99]
     for s in rows:
         s["y"] = outcomes[s["window_ts"]]

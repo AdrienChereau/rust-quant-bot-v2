@@ -86,6 +86,16 @@ impl WindowRecorder {
         }));
     }
 
+    /// Issue OFFICIELLE (résolution Polymarket/Chainlink) — prioritaire sur le label Binance
+    /// dans `calibrate.py`.
+    pub fn record_official(&self, window_ts: i64, up: bool) {
+        self.append(&serde_json::json!({
+            "kind": "outcome_official",
+            "window_ts": window_ts,
+            "up": up,
+        }));
+    }
+
     fn append(&self, v: &serde_json::Value) {
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = writeln!(f, "{v}");

@@ -82,7 +82,16 @@ async fn stream_once(
     let (_, mut read) = ws.split();
     tracing::info!(%url, "aggTrade WS connecté (Task B)");
     let mut tracker = TFITracker::new(window_ms);
-    while let Some(msg) = read.next().await {
+    loop {
+        // Watchdog anti connexion à moitié morte : 60 s sans trade BTC = jamais → reconnexion.
+        let msg = match tokio::time::timeout(Duration::from_secs(60), read.next()).await {
+            Err(_) => {
+                tracing::warn!("aggTrade WS silencieux 60 s — reconnexion forcée");
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => m,
+        };
         let txt = match msg? {
             Message::Text(t) => t,
             Message::Close(_) => return Ok(()),
@@ -99,7 +108,6 @@ async fn stream_once(
         tracker.update(t.ts_ms, qty, !t.is_buyer_maker);
         tfi_atomic.store(tracker.tfi().to_bits(), Ordering::Relaxed);
     }
-    Ok(())
 }
 
 #[cfg(test)]

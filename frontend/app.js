@@ -158,7 +158,10 @@ async function refresh() {
 
         if (s.in_position) {
           $("pos").innerHTML = `<span class="warn">${s.pos_side.toUpperCase()} ouverte</span>`;
-          $("ets").textContent = `${fmt(s.pos_entry,2)} / ${fmt(s.pos_tp,2)} / ${fmt(s.pos_sl,2)}`;
+          // v1 (hold-to-resolution) : pas de TP/SL — le backend les met à 0.
+          $("ets").textContent = s.pos_tp > 0
+            ? `${fmt(s.pos_entry,2)} / ${fmt(s.pos_tp,2)} / ${fmt(s.pos_sl,2)}`
+            : `${fmt(s.pos_entry,2)} → tenue jusqu'à la résolution`;
         } else { $("pos").textContent = "à plat"; $("ets").textContent = "—"; }
         $("cash").textContent = fmt(s.cash, 2);
         $("equity").textContent = fmt(s.equity, 2);

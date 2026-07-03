@@ -92,7 +92,18 @@ async fn connect_and_stream(
     }
 
     let mut synced = false;
-    while let Some(msg) = read.next().await {
+    loop {
+        // Watchdog : le flux @depth livre >10 msg/s en continu. 30 s de silence = connexion
+        // à moitié morte (pas de frame Close) → on force la reconnexion. C'est CE bug qui a
+        // figé le spot pendant des heures et produit 41 % d'issues fausses.
+        let msg = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
+            Err(_) => {
+                tracing::warn!("Binance WS silencieux 30 s — reconnexion forcée");
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => m,
+        };
         let txt = match msg? {
             Message::Text(t) => t,
             Message::Ping(_) | Message::Pong(_) => continue,
@@ -133,5 +144,4 @@ async fn connect_and_stream(
         };
         let _ = obi_tx.send(snap);
     }
-    Ok(())
 }
