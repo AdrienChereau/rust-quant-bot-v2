@@ -133,7 +133,7 @@ function frame(now) {
   cx.fillRect(0, 0, W, H);
   cx.globalCompositeOperation = 'lighter';
 
-  const mL = W * 0.06, mR = W * 0.06; // marges symétriques
+  const mL = W * 0.15, mR = W * 0.15; // le signal occupe le CENTRE (70 % de la largeur)
   const span = W - mL - mR;
   const steps = 160;
 
