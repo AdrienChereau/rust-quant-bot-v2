@@ -64,8 +64,15 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                         d.paused = true;
                     }
                     Ok(Signal::Tick(t)) => {
-                        if t.seq != 0 && t.seq <= last_seq {
+                        // Garde anti-réordonnancement : on jette les seq en retard…
+                        // SAUF si le recul est massif = le radar a REDÉMARRÉ (seq
+                        // repart à 1) — bug du 7 juil. : après chaque redeploy Tokyo,
+                        // Dublin jetait tout le flux et restait sourd.
+                        if t.seq != 0 && t.seq <= last_seq && last_seq - t.seq < 300 {
                             continue; // réordonné/dupliqué → poubelle
+                        }
+                        if t.seq < last_seq {
+                            tracing::warn!(old = last_seq, new = t.seq, "seq radar réinitialisé (redémarrage Tokyo) — flux réaccepté");
                         }
                         last_seq = t.seq;
                         let _ = remote_tx
