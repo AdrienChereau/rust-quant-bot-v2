@@ -1,48 +1,53 @@
-// TOKYO · SIGNAL — le signal EST la page. Un fleuve d'énergie traverse l'écran
-// du cœur émetteur vers Dublin ; tout est piloté par les vraies données :
-//   vitesse du flux  ∝ ticks/s émis        amplitude des ondes ∝ σ + |OBI|
-//   teinte           ∝ signe du drift       KILL → flash rouge plein écran
-//   feed mort        → ligne plate grise (électrocardiogramme à l'arrêt)
-// Le HUD est éphémère : il apparaît au mouvement de souris, s'évanouit après 3,5 s ;
-// les événements du journal surgissent en toasts qui se dissolvent.
+// TOKYO · SIGNAL v3 — composition CENTRÉE qui raconte le pipeline :
+//   gauche  → bruit brut du marché (particules chaotiques) qui converge vers…
+//   centre  → le CŒUR Tokyo (calcul du signal), qui pulse au rythme d'émission
+//   droite  → le signal MIS EN FORME (tresse ordonnée) propulsé vers Dublin
+// Le chaos entre, l'ordre sort : c'est exactement le travail du radar.
+// Données réelles : vitesse=ticks/s, amplitude=σ+|OBI|, teinte=drift, KILL=flash.
 
 const $ = (id) => document.getElementById(id);
 const cv = $('scene');
 const cx = cv.getContext('2d');
-let W = 0, H = 0;
+let W = 0, H = 0, CX = 0, CY = 0;
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   W = window.innerWidth; H = window.innerHeight;
+  CX = W / 2; CY = H / 2;
   cv.width = W * dpr; cv.height = H * dpr;
   cx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 resize(); window.addEventListener('resize', resize);
 
-// ── HUD éphémère ──
-let sleepTimer = null;
-function awake() {
-  document.body.classList.add('awake');
-  clearTimeout(sleepTimer);
-  sleepTimer = setTimeout(() => document.body.classList.remove('awake'), 3500);
+// ── état réel ──
+const S = { connected: false, micro: 0, obi: 0, ofi: 0, drift: 0, sigma: 0, seq: 0, kills: 0, rate: 0 };
+let lastSeq = 0, lastSeqT = Date.now(), lastKills = -1, shock = 0;
+
+// traductions humaines
+function trendLabel(d) {
+  const x = Math.tanh(d * 6000);
+  if (x > 0.5) return ['▲ HAUSSIER', 'up'];
+  if (x > 0.12) return ['↗ haussier léger', 'up'];
+  if (x < -0.5) return ['▼ BAISSIER', 'dn'];
+  if (x < -0.12) return ['↘ baissier léger', 'dn'];
+  return ['— neutre', 'mid'];
 }
-window.addEventListener('mousemove', awake);
-window.addEventListener('touchstart', awake);
-
-// ── état réel (poll /state 1 Hz) ──
-const S = {
-  connected: false, micro: 0, obi: 0, ofi: 0, drift: 0, sigma: 0,
-  seq: 0, kills: 0, rate: 0,
-};
-let lastSeq = 0, lastSeqT = Date.now(), lastKills = -1, lastLogLen = 0;
-let shock = 0; // flash KILL
-
-function toast(t, m) {
-  const cls = m.includes('KILL') ? 'kill' : m.startsWith('✓') || m.startsWith('◉') ? 'ok' : 'warn';
-  const el = document.createElement('div');
-  el.className = 'toast';
-  el.innerHTML = `<span class="t" style="color:var(--mut);margin-right:8px">${t}</span><span class="${cls}">${m}</span>`;
-  $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 7200);
+function pressLabel(v) {
+  if (v > 0.5) return ['ACHAT fort', 'up'];
+  if (v > 0.15) return ['achat', 'up'];
+  if (v < -0.5) return ['VENTE forte', 'dn'];
+  if (v < -0.15) return ['vente', 'dn'];
+  return ['équilibré', 'mid'];
+}
+function sigLabel(s) {
+  const pc = s * 100;
+  if (pc < 45) return [pc.toFixed(0) + '% · calme', 'mid'];
+  if (pc < 90) return [pc.toFixed(0) + '% · actif', 'up'];
+  return [pc.toFixed(0) + '% · NERVEUX', 'warn'];
+}
+function setRead(id, [txt, cls]) {
+  const el = $(id);
+  el.textContent = txt;
+  el.style.color = cls === 'up' ? 'var(--gr)' : cls === 'dn' ? 'var(--rd)' : cls === 'warn' ? 'var(--amb)' : 'var(--mut)';
 }
 
 async function poll() {
@@ -60,15 +65,16 @@ async function poll() {
 
     $('px').textContent = S.micro > 0 ? S.micro.toLocaleString('fr-FR', { maximumFractionDigits: 0 }) + ' $' : '–';
     $('status').className = S.connected ? 'on' : '';
-    $('statustxt').textContent = S.connected ? 'FEED BINANCE ACTIF · ÉMISSION 10 HZ' : 'FEED PERDU · RECONNEXION';
-    $('mdrift').textContent = (S.drift >= 0 ? '+' : '') + S.drift.toExponential(1);
-    $('mdrift').style.color = S.drift >= 0 ? 'var(--gr)' : 'var(--rd)';
-    $('mobi').textContent = (S.obi >= 0 ? '+' : '') + S.obi.toFixed(2);
-    $('mofi').textContent = (S.ofi >= 0 ? '+' : '') + S.ofi.toFixed(2);
-    $('msigma').textContent = (S.sigma * 100).toFixed(0) + ' %';
-    $('rate').textContent = S.rate.toFixed(0) + ' ticks/s';
+    $('statustxt').textContent = S.connected
+      ? 'OPÉRATIONNEL — BINANCE ÉCOUTÉ, DUBLIN ALIMENTÉ'
+      : 'FEED BINANCE PERDU — RECONNEXION EN COURS';
+    $('rate').textContent = S.rate.toFixed(0);
     $('seq').textContent = S.seq.toLocaleString('fr-FR');
     $('kills').textContent = S.kills;
+    setRead('rdrift', trendLabel(S.drift));
+    setRead('robi', pressLabel(S.obi));
+    setRead('rofi', pressLabel(S.ofi));
+    setRead('rsig', sigLabel(S.sigma));
 
     const logs = d.radar_log || [];
     const html = logs.slice().reverse().map(([t, m]) => {
@@ -77,121 +83,131 @@ async function poll() {
     }).join('');
     const el = $('log');
     if (el.__last !== html) { el.__last = html; el.innerHTML = html; }
-    // nouveaux événements → toasts éphémères
-    if (lastLogLen > 0 && logs.length > lastLogLen) {
-      logs.slice(lastLogLen).forEach(([t, m]) => toast(t, m));
-    }
-    lastLogLen = logs.length;
   } catch (e) { S.connected = false; }
 }
 poll(); setInterval(poll, 1000);
 
-// ── LE SIGNAL : fleuve de rubans ondulants + particules, blending additif ──
-const RIBBONS = 7;
-const ribbons = Array.from({ length: RIBBONS }, (_, i) => ({
-  seed: Math.random() * 1000,
-  f1: 0.8 + Math.random() * 1.4,   // fréquences spatiales
-  f2: 2.2 + Math.random() * 2.6,
-  off: (i - (RIBBONS - 1) / 2) / ((RIBBONS - 1) / 2), // -1..1 (écartement)
-  w: 1 + Math.random() * 1.6,
-}));
-const parts = [];
+// ── scène ──
+const V = { rate: 0, sigma: 0, obi: 0, drift: 0, alive: 0 }; // valeurs lissées
 let flow = 0, t0 = performance.now();
 
-// lissage visuel des données (évite les sauts au poll)
-const V = { rate: 0, sigma: 0, obi: 0, drift: 0, alive: 0 };
+// particules chaos (entrée, gauche) et tresse (sortie, droite)
+const chaos = [];
+const RIB = 6;
+const ribbons = Array.from({ length: RIB }, (_, i) => ({
+  seed: Math.random() * 9,
+  f: 1.6 + Math.random() * 2.2,
+  off: (i - (RIB - 1) / 2) / ((RIB - 1) / 2),
+}));
+const packets = [];
 
-function yRiver(xn, rb, tphase, amp) {
-  // xn ∈ 0..1 le long de l'écran ; enveloppe qui pince aux extrémités
-  const env = Math.sin(Math.PI * Math.min(1, xn * 1.15)) ** 0.7;
-  const wave =
-    Math.sin(xn * Math.PI * 2 * rb.f1 + tphase + rb.seed) * 0.62 +
-    Math.sin(xn * Math.PI * 2 * rb.f2 - tphase * 1.7 + rb.seed * 2) * 0.38;
-  return H / 2 + env * (wave * amp + rb.off * amp * 0.55);
+function braidY(xn, rb, amp) {
+  // xn ∈ 0..1 entre le cœur et le bord droit ; la tresse naît serrée et s'ouvre
+  const open = Math.sin(Math.PI * Math.min(1, xn * 1.06)) ** 0.8;
+  const wave = Math.sin(xn * Math.PI * 2 * rb.f - flow * 2 + rb.seed);
+  return CY + open * (wave * amp * 0.5 + rb.off * amp * 0.75);
 }
 
 function frame(now) {
   const dt = Math.min(0.05, (now - t0) / 1000); t0 = now;
-  const k = 1 - Math.exp(-dt * 2.2); // constante de lissage
+  const k = 1 - Math.exp(-dt * 2.2);
   V.rate += (S.rate - V.rate) * k;
   V.sigma += (S.sigma - V.sigma) * k;
   V.obi += (S.obi - V.obi) * k;
   V.drift += (S.drift - V.drift) * k;
   V.alive += ((S.connected && S.rate > 0.5 ? 1 : 0) - V.alive) * k;
-
-  // fond : traînée persistante (le fleuve laisse un sillage)
-  cx.globalCompositeOperation = 'source-over';
-  cx.fillStyle = 'rgba(3,5,9,0.32)';
-  cx.fillRect(0, 0, W, H);
-
   const alive = V.alive;
-  flow += dt * (0.6 + Math.min(2.2, V.rate / 6)) * (0.15 + alive);
-  // amplitude : σ (40%→) + |OBI| ; morte → ligne plate
-  const amp = alive * (H * 0.10) * (0.55 + Math.min(1.6, V.sigma) + Math.abs(V.obi) * 0.5) + (1 - alive) * 3;
-  // teinte : cyan neutre, tirée vers le vert (drift+) ou le rouge (drift−)
-  const dir = Math.tanh(V.drift * 6000); // -1..1
-  const hue = 190 + dir * (dir > 0 ? -35 : -186 + 190); // 190→155 (vert) ou →4 (rouge)
-  const baseHue = dir >= 0 ? 190 - dir * 35 : 190 + dir * 186;
+  flow += dt * (0.5 + Math.min(2.0, V.rate / 7)) * (0.15 + alive);
 
-  // rubans (additif : les croisements s'illuminent)
+  const dir = Math.tanh(V.drift * 6000);
+  const hue = dir >= 0 ? 190 - dir * 35 : 190 + dir * 186; // cyan→vert / cyan→rouge
+  const amp = alive * H * 0.09 * (0.5 + Math.min(1.5, V.sigma) + Math.abs(V.obi) * 0.4) + (1 - alive) * 2;
+
+  // sillage persistant
+  cx.globalCompositeOperation = 'source-over';
+  cx.fillStyle = 'rgba(3,5,9,0.30)';
+  cx.fillRect(0, 0, W, H);
   cx.globalCompositeOperation = 'lighter';
-  const steps = 90;
+
+  // ── ① CHAOS ENTRANT (gauche → cœur) : bruit de marché ──
+  if (alive > 0.3 && Math.random() < 0.5 + V.sigma) {
+    chaos.push({
+      x: -5, y: CY + (Math.random() - 0.5) * H * 0.7,
+      vx: 1.4 + Math.random() * 1.8, vy: (Math.random() - 0.5) * 1.6,
+      j: 0.4 + Math.random() * 1.2, // nervosité
+    });
+  }
+  for (let i = chaos.length - 1; i >= 0; i--) {
+    const p = chaos[i];
+    // attiré par le cœur, avec du jitter (c'est du bruit)
+    const dx = CX - p.x, dy = CY - p.y;
+    const dist = Math.hypot(dx, dy) + 1;
+    p.vx += (dx / dist) * 0.10 * (1 + 200 / dist);
+    p.vy += (dy / dist) * 0.10 * (1 + 200 / dist) + (Math.random() - 0.5) * p.j * (0.5 + V.sigma);
+    p.x += p.vx; p.y += p.vy;
+    if (dist < 30 || p.x > CX) { chaos.splice(i, 1); continue; }
+    const a = Math.min(0.5, 40 / dist + 0.12) * alive;
+    cx.fillStyle = `hsla(215,30%,70%,${a})`;
+    cx.fillRect(p.x, p.y, 1.8, 1.8);
+  }
+
+  // ── ② LE CŒUR (centre) : pulse au rythme d'émission ──
+  const pulse = 1 + 0.16 * Math.sin(now / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
+  const R = (30 + amp * 0.15) * pulse;
+  const core = alive > 0.5 ? `${hue},95%,64%` : '215,10%,45%';
+  const g1 = cx.createRadialGradient(CX, CY, 1, CX, CY, R * 4.2);
+  g1.addColorStop(0, `hsla(${core},0.95)`);
+  g1.addColorStop(0.25, `hsla(${core},0.30)`);
+  g1.addColorStop(1, 'hsla(0,0%,0%,0)');
+  cx.fillStyle = g1;
+  cx.beginPath(); cx.arc(CX, CY, R * 4.2, 0, 7); cx.fill();
+  // anneau de traitement qui tourne
+  cx.strokeStyle = `hsla(${core},${0.5 * alive})`;
+  cx.lineWidth = 1.5;
+  cx.beginPath();
+  cx.arc(CX, CY, R * 1.7, flow * 1.3, flow * 1.3 + 4.2);
+  cx.stroke();
+
+  // ── ③ TRESSE SORTANTE (cœur → droite) : le signal mis en forme ──
+  const steps = 70;
   for (const rb of ribbons) {
     cx.beginPath();
     for (let s = 0; s <= steps; s++) {
       const xn = s / steps;
-      const x = xn * W;
-      const y = yRiver(xn, rb, flow * (1 + rb.off * 0.18), amp);
+      const x = CX + xn * (W - CX);
+      const y = braidY(xn, rb, amp);
       s === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
     }
-    const a = alive * 0.16 + 0.02;
-    const grad = cx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, `hsla(${baseHue},90%,60%,0)`);
-    grad.addColorStop(0.18, `hsla(${baseHue},90%,62%,${a})`);
-    grad.addColorStop(0.72, `hsla(${(baseHue + 250) % 360},85%,66%,${a * 0.9})`);
-    grad.addColorStop(1, `hsla(258,85%,70%,${a * 1.3})`);
+    const a = alive * 0.20 + 0.02;
+    const grad = cx.createLinearGradient(CX, 0, W, 0);
+    grad.addColorStop(0, `hsla(${hue},92%,64%,${a})`);
+    grad.addColorStop(1, `hsla(258,85%,70%,${a * 1.25})`);
     cx.strokeStyle = grad;
-    cx.lineWidth = rb.w * (1 + alive);
+    cx.lineWidth = 1.6 + alive;
     cx.stroke();
   }
-
-  // cœur émetteur (gauche) : pulse au rythme des ticks
-  const cxr = W * 0.06, cyr = H / 2;
-  const pulse = 1 + 0.15 * Math.sin(now / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
-  const R = (26 + amp * 0.12) * pulse;
-  const core = alive > 0.5 ? `${baseHue},95%,65%` : '215,10%,45%';
-  const g1 = cx.createRadialGradient(cxr, cyr, 1, cxr, cyr, R * 4);
-  g1.addColorStop(0, `hsla(${core},0.9)`);
-  g1.addColorStop(0.3, `hsla(${core},0.25)`);
-  g1.addColorStop(1, 'hsla(0,0%,0%,0)');
-  cx.fillStyle = g1;
-  cx.beginPath(); cx.arc(cxr, cyr, R * 4, 0, 7); cx.fill();
-
-  // réception Dublin (droite) : halo violet qui bat en écho (léger retard)
-  const g2 = cx.createRadialGradient(W - W * 0.03, cyr, 1, W - W * 0.03, cyr, R * 3.2);
-  const echo = 1 + 0.15 * Math.sin((now - 480) / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
-  g2.addColorStop(0, `hsla(258,85%,70%,${0.55 * alive * echo})`);
+  // paquets UDP qui filent vers Dublin
+  if (alive > 0.4 && Math.random() < 0.35 + V.rate / 22) {
+    packets.push({ xn: 0.01, rb: ribbons[(Math.random() * RIB) | 0], sp: 0.24 + Math.random() * 0.14 + V.rate / 70 });
+  }
+  for (let i = packets.length - 1; i >= 0; i--) {
+    const p = packets[i];
+    p.xn += p.sp * dt * (1 + p.xn);
+    if (p.xn >= 1) { packets.splice(i, 1); continue; }
+    const x = CX + p.xn * (W - CX);
+    const y = braidY(p.xn, p.rb, amp);
+    cx.fillStyle = `hsla(${hue},95%,78%,${0.9 * alive})`;
+    cx.beginPath(); cx.arc(x, y, 1.8 + p.xn * 1.6, 0, 7); cx.fill();
+  }
+  // halo Dublin (bord droit) qui bat en écho
+  const echo = 1 + 0.16 * Math.sin((now - 480) / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
+  const g2 = cx.createRadialGradient(W - 6, CY, 1, W - 6, CY, 110 * echo);
+  g2.addColorStop(0, `hsla(258,85%,70%,${0.5 * alive})`);
   g2.addColorStop(1, 'hsla(0,0%,0%,0)');
   cx.fillStyle = g2;
-  cx.beginPath(); cx.arc(W - W * 0.03, cyr, R * 3.2 * echo, 0, 7); cx.fill();
+  cx.fillRect(W - 220, CY - 220, 220, 440);
 
-  // particules : des paquets de données qui remontent le fleuve
-  if (alive > 0.4 && Math.random() < 0.35 + V.rate / 25) {
-    const rb = ribbons[(Math.random() * RIBBONS) | 0];
-    parts.push({ xn: 0.02, rb, sp: (0.10 + Math.random() * 0.10 + V.rate / 90) });
-  }
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const p = parts[i];
-    p.xn += p.sp * dt * (1 + p.xn * 1.6); // accélère vers Dublin
-    if (p.xn >= 1) { parts.splice(i, 1); continue; }
-    const x = p.xn * W;
-    const y = yRiver(p.xn, p.rb, flow * (1 + p.rb.off * 0.18), amp);
-    const a = Math.sin(Math.PI * p.xn) * 0.9;
-    cx.fillStyle = `hsla(${baseHue},95%,75%,${a})`;
-    cx.beginPath(); cx.arc(x, y, 1.6 + p.xn * 1.8, 0, 7); cx.fill();
-  }
-
-  // flash KILL : le fleuve vire au rouge, voile plein écran
+  // KILL : voile rouge
   if (shock > 0) {
     cx.globalCompositeOperation = 'source-over';
     cx.fillStyle = `rgba(255,60,60,${shock * 0.18})`;
