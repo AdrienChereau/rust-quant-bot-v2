@@ -104,12 +104,71 @@ impl BookUpdate {
     }
 }
 
-/// Signaux HFT transcontinentaux (1 octet sur le réseau).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
+/// Signaux HFT transcontinentaux (1 ou 65 octets sur le réseau).
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Signal {
-    Kill = 0x4B,      // 'K'
-    Heartbeat = 0x48, // 'H'
+    Kill,      // 0x4B 'K' sur le fil
+    Heartbeat, // 0x48 'H'
+    /// Tick signal complet Tokyo → Dublin (drift/OFI/OBI calculés AU RADAR,
+    /// au plus près de Binance) : 0x54 'T' + 64 octets LE.
+    Tick(WireTick),
+}
+
+/// Charge utile du tick radar (10 Hz). `seq` croît strictement : l'exécuteur
+/// jette les datagrammes réordonnés/dupliqués (garde-fou UDP n°2 du plan).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WireTick {
+    pub seq: u64,
+    pub ts_ms: u64,   // horodatage émission (staleness côté exécuteur)
+    pub spot: f64,    // micro-price Binance
+    pub sigma: f64,   // volatilité annualisée EWMA
+    pub drift: f64,   // drift log PAR SECONDE (l'exécuteur applique horizon+clamp)
+    pub ofi: f64,     // order flow imbalance normalisé
+    pub obi: f64,
+    pub velocity: f64,
+}
+
+impl WireTick {
+    pub fn encode(&self) -> [u8; 65] {
+        let mut b = [0u8; 65];
+        b[0] = 0x54;
+        for (i, v) in [
+            self.seq,
+            self.ts_ms,
+            self.spot.to_bits(),
+            self.sigma.to_bits(),
+            self.drift.to_bits(),
+            self.ofi.to_bits(),
+            self.obi.to_bits(),
+            self.velocity.to_bits(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            b[1 + i * 8..9 + i * 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < 65 || b[0] != 0x54 {
+            return None;
+        }
+        let mut w = [0u64; 8];
+        for (i, slot) in w.iter_mut().enumerate() {
+            *slot = u64::from_le_bytes(b[1 + i * 8..9 + i * 8].try_into().ok()?);
+        }
+        Some(Self {
+            seq: w[0],
+            ts_ms: w[1],
+            spot: f64::from_bits(w[2]),
+            sigma: f64::from_bits(w[3]),
+            drift: f64::from_bits(w[4]),
+            ofi: f64::from_bits(w[5]),
+            obi: f64::from_bits(w[6]),
+            velocity: f64::from_bits(w[7]),
+        })
+    }
 }
 
 /// Quote produite par le moteur de risque (côté exécuteur).
@@ -129,4 +188,32 @@ pub struct BotInventory {
     pub cash_usdc: f64,
     pub real_pnl: f64,
     pub latent_pnl: f64,
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn wiretick_roundtrip() {
+        let t = WireTick {
+            seq: 42,
+            ts_ms: 1_783_353_000_123,
+            spot: 63483.99,
+            sigma: 0.85,
+            drift: -0.000123,
+            ofi: 0.77,
+            obi: -0.31,
+            velocity: 1.0,
+        };
+        let b = t.encode();
+        assert_eq!(b.len(), 65);
+        assert_eq!(b[0], 0x54);
+        assert_eq!(WireTick::decode(&b), Some(t));
+        // trames invalides
+        assert_eq!(WireTick::decode(&b[..64]), None);
+        let mut bad = b;
+        bad[0] = 0x4B;
+        assert_eq!(WireTick::decode(&bad), None);
+    }
 }

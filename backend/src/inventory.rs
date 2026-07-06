@@ -169,6 +169,34 @@ impl PaperEngine {
         mergeable
     }
 
+    /// **Garde-fou 3 (TTE Killswitch)** — aplatit la jambe NETTE non-matchée près de
+    /// l'expiry en la vendant (taker) au bid de son carnet.
+    ///
+    /// Les paires matchées `min(up, down)` valent 1 USDC à la résolution : on les laisse
+    /// intactes (ou la fusion CTF s'en charge). On ne liquide que le **résidu
+    /// directionnel** `|up − down|`, sinon il roule jusqu'à la résolution et paie 0 si
+    /// c'est le côté perdant (bug observé : jambe nue tenue jusqu'au bout → perte sèche).
+    /// Retourne la taille aplatie.
+    pub fn flatten_net(&mut self, up_bid: Option<f64>, down_bid: Option<f64>) -> f64 {
+        let net = self.state.up_balance - self.state.down_balance;
+        if net > 1e-9 {
+            if let Some(px) = up_bid {
+                let qty = net.min(self.state.up_balance);
+                if self.try_sell("up", px.max(0.0), qty, "taker") {
+                    return qty;
+                }
+            }
+        } else if net < -1e-9 {
+            if let Some(px) = down_bid {
+                let qty = (-net).min(self.state.down_balance);
+                if self.try_sell("down", px.max(0.0), qty, "taker") {
+                    return qty;
+                }
+            }
+        }
+        0.0
+    }
+
     /// Résolution à l'échéance : le côté gagnant vaut 1 USDC/token, l'autre 0.
     pub fn resolve(&mut self, up_won: bool) {
         let payout = if up_won {
@@ -310,6 +338,39 @@ mod tests {
         e.state.up_balance = 3.0; // < min_merge_threshold (5)
         e.state.down_balance = 3.0;
         assert_eq!(e.check_and_merge(1.0), 0.0);
+    }
+
+    #[test]
+    fn flatten_sells_naked_excess_only() {
+        // 100 Up / 30 Down → 70 Up nus. Flatten vend 70 Up au bid, laisse 30 paires.
+        let mut e = engine();
+        e.state.cash_usdc = 0.0;
+        e.state.up_balance = 100.0;
+        e.state.down_balance = 30.0;
+        let flat = e.flatten_net(Some(0.90), Some(0.05));
+        assert!((flat - 70.0).abs() < 1e-9);
+        assert!((e.state.up_balance - 30.0).abs() < 1e-9);
+        assert!((e.state.down_balance - 30.0).abs() < 1e-9); // paires intactes
+        assert!((e.state.cash_usdc - 63.0).abs() < 1e-9); // 70 × 0.90
+        assert_eq!(e.state.taker_fills, 1);
+    }
+
+    #[test]
+    fn flatten_short_down_excess() {
+        let mut e = engine();
+        e.state.up_balance = 20.0;
+        e.state.down_balance = 127.0; // net = −107 Down nus
+        let flat = e.flatten_net(Some(0.98), Some(0.02));
+        assert!((flat - 107.0).abs() < 1e-9);
+        assert!((e.state.down_balance - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flatten_noop_when_flat() {
+        let mut e = engine();
+        e.state.up_balance = 40.0;
+        e.state.down_balance = 40.0;
+        assert_eq!(e.flatten_net(Some(0.5), Some(0.5)), 0.0);
     }
 
     #[test]

@@ -59,8 +59,14 @@ async fn main() -> anyhow::Result<()> {
         let exec_cfg = cfg.clone();
         let exec_transport = transport.clone();
         let exec_shared = shared.clone();
+        let gtc = cfg.strategy.eq_ignore_ascii_case("gtc");
         let exec = tokio::spawn(async move {
-            if let Err(e) = roles::executor::run(exec_cfg, exec_transport, exec_shared).await {
+            let res = if gtc {
+                roles::executor_gtc::run(exec_cfg, exec_transport, exec_shared).await
+            } else {
+                roles::executor::run(exec_cfg, exec_transport, exec_shared).await
+            };
+            if let Err(e) = res {
                 tracing::error!(error = %e, "executor terminé en erreur");
             }
         });
@@ -87,7 +93,11 @@ async fn main() -> anyhow::Result<()> {
         BotRole::Executor => {
             let transport: Arc<dyn SignalTransport> =
                 Arc::new(UdpSignalTransport::new_bind(cfg.signal_addr).await?);
-            roles::executor::run(cfg, transport, shared).await
+            if cfg.strategy.eq_ignore_ascii_case("gtc") {
+                roles::executor_gtc::run(cfg, transport, shared).await
+            } else {
+                roles::executor::run(cfg, transport, shared).await
+            }
         }
     }
 }

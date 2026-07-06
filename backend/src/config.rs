@@ -47,6 +47,59 @@ pub struct Config {
     // Volatilité (J4)
     pub volatility_floor: f64,
 
+    // Signal MM (drift + OBI) — câblés dans la décision de cotation
+    pub drift_halflife_secs: f64, // halflife EMA du drift (s)
+    pub drift_clamp_k: f64,       // borne du drift à ±k·σ·√t
+    pub obi_skew: f64,            // gain du skew OBI sur la fair de cotation
+
+    // Pull anti-sélection-adverse : retirer le bid du côté qui décroche
+    pub pull_net_min: f64,   // seuil de position nette (parts) avant de pull
+    pub pull_slope: f64,     // baisse de mid/tick qui déclenche le pull
+    pub loser_thresh: f64,   // fair < ce seuil ⇒ côté perdant quasi-certain ⇒ pull
+
+    // Spread-capture taker (plan v5) — priors du guide, calibrés Phase A/C
+    pub sc_c_raw: f64,
+    pub sc_fee_per_pair: f64,
+    pub sc_opening_leg_max: f64,
+    pub sc_max_imbalance: f64,
+    pub sc_base_clip: f64,
+    pub sc_max_clip: f64,
+    pub sc_depth_gain: f64,
+    pub sc_max_clip_usdc: f64,
+    pub sc_max_capital_per_market: f64,
+    pub sc_min_seconds: i64,
+    pub sc_clip_interval_s: i64,
+    pub sc_gate_margin: f64,
+    pub sc_min_window_age_s: i64,  // pas d'entrée avant N s d'âge de fenêtre
+    pub sc_completion_reserve: f64, // fraction du capital réservée à la complétion
+    pub sc_drift_horizon_s: f64,   // horizon max (s) d'extrapolation du drift dans la fair
+    // v7 — rétro-ingénierie 0xb27b
+    pub sc_trend_filter: bool,        // directionnel seulement dans le sens de la tendance
+    pub sc_pullback_filter: bool,     // directionnel seulement sur micro-repli 5 s
+    pub sc_pullback_s: i64,           // horizon du micro-repli (s)
+    pub sc_completion_max_price: f64, // prix max d'une jambe de complétion
+    pub sc_completion_max_pair: f64,  // plafond de paire pour la complétion
+    // v8 maker (copie complète, recalibrée sur 234 fenêtres)
+    pub sc_directional_max: f64,   // borne absolue du prix directionnel (0.90 — il charge jusqu'à 87c)
+    pub sc_directional_min: f64,   // bid directionnel INTERDIT si best_bid < ce seuil (la cible accumule le favori 66-72c, jamais le couteau)
+    pub sc_trend_confirm_s: i64,   // le drift doit garder son signe N s avant d'armer le directionnel (anti flip-flop)
+    pub sc_rebate_rate: f64,       // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
+    pub sc_streak_soft: u32,       // pertes consécutives → taille ×0.25
+    pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
+
+    // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
+    pub sc_sleep_hours_utc: Vec<u32>,
+    // Sélecteur de stratégie ("sc" = spread-capture taker · "gtc" = pair-GTC utilisateur)
+    pub strategy: String,
+    // Pair-GTC (bot parallèle port 8700)
+    pub pg_size: f64,               // X parts par ordre GTC
+    pub pg_band: f64,               // |mid_up − 0,5| ≤ band pour entrer
+    pub pg_entry_min_remaining: i64, // temps mini restant pour entrer (s)
+    pub pg_entry_deadline: i64,     // annule les GTC non fillés sous N s
+    pub pg_pair_target: f64,        // complète si avg + ask_opp + fee ≤ target
+    pub pg_require_rising: bool,    // règle : compléter seulement sur un REBOND de l'opposé
+    pub pg_rising_lookback_s: i64,  // lookback (s) pour juger « en train de remonter »
+
     // Avellaneda-Stoikov + reward (J7)
     pub gamma: f64,
     pub kappa: f64,
@@ -61,7 +114,9 @@ pub struct Config {
     pub max_window_loss_pct: f64,  // stop si window_pnl/window_start < -X
     pub max_order_size: f64,       // plafond absolu tokens/ordre
     pub max_position: f64,         // plafond absolu de position par côté
+    pub max_net_shares: f64,       // plafond de la jambe NETTE en parts (bug fix cap)
     pub paired_buy_margin: f64,    // achat pairé si up_ask+down_ask < 1 - margin
+    pub flip_size: f64,            // taille cible du flip sur alarme Binance (parts)
 
     // Exécution maker (R3)
     pub maker_fill_prob: f64, // proba de fill maker par tick
@@ -70,6 +125,7 @@ pub struct Config {
     // KILL / panic stop (R5)
     pub kill_pause_secs: i64,
     pub panic_stop_secs: i64,
+    pub flatten_secs: i64, // garde-fou 3 (TTE) : aplatir la jambe nette sous ce TTE
 
     // Paper / inventaire (J8)
     pub start_cash: f64,
@@ -120,6 +176,56 @@ impl Config {
             // R1 (truth protocol) : floor MONTÉ — un σ plus élevé rapproche le fair du mid.
             volatility_floor: env_or("VOLATILITY_FLOOR", 0.80),
 
+            drift_halflife_secs: env_or("DRIFT_HALFLIFE_SECS", 25.0),
+            drift_clamp_k: env_or("DRIFT_CLAMP_K", 2.0),
+            obi_skew: env_or("OBI_SKEW", 0.05),
+            pull_net_min: env_or("PULL_NET_MIN", 12.0),
+            pull_slope: env_or("PULL_SLOPE", 0.008),
+            loser_thresh: env_or("LOSER_THRESH", 0.12),
+
+            sc_c_raw: env_or("SC_C_RAW", 0.95),
+            sc_fee_per_pair: env_or("SC_FEE_PER_PAIR", 0.03),
+            sc_opening_leg_max: env_or("SC_OPENING_LEG_MAX", 0.55),
+            sc_max_imbalance: env_or("SC_MAX_IMBALANCE", 40.0),
+            sc_base_clip: env_or("SC_BASE_CLIP", 10.0),
+            sc_max_clip: env_or("SC_MAX_CLIP", 20.0),
+            sc_depth_gain: env_or("SC_DEPTH_GAIN", 60.0),
+            sc_max_clip_usdc: env_or("SC_MAX_CLIP_USDC", 6.0),
+            sc_max_capital_per_market: env_or("SC_MAX_CAPITAL_PER_MARKET", 20.0),
+            sc_min_seconds: env_or("SC_MIN_SECONDS", 10),
+            sc_clip_interval_s: env_or("SC_CLIP_INTERVAL_S", 15),
+            sc_gate_margin: env_or("SC_GATE_MARGIN", 0.04),
+            sc_min_window_age_s: env_or("SC_MIN_WINDOW_AGE_S", 15),
+            sc_completion_reserve: env_or("SC_COMPLETION_RESERVE", 0.5),
+            sc_drift_horizon_s: env_or("SC_DRIFT_HORIZON_S", 60.0),
+            sc_trend_filter: std::env::var("SC_TREND_FILTER").map(|v| v != "false").unwrap_or(true),
+            sc_pullback_filter: std::env::var("SC_PULLBACK_FILTER").map(|v| v != "false").unwrap_or(true),
+            sc_pullback_s: env_or("SC_PULLBACK_S", 5),
+            sc_completion_max_price: env_or("SC_COMPLETION_MAX_PRICE", 0.65),
+            sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.05),
+            sc_directional_max: env_or("SC_DIRECTIONAL_MAX", 0.90),
+            sc_directional_min: env_or("SC_DIRECTIONAL_MIN", 0.40),
+            sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),
+            sc_rebate_rate: env_or("SC_REBATE_RATE", 0.20),
+            sc_streak_soft: env_or("SC_STREAK_SOFT", 4),
+            sc_streak_hard: env_or("SC_STREAK_HARD", 6),
+
+            sc_sleep_hours_utc: std::env::var("SC_SLEEP_HOURS_UTC")
+                .unwrap_or_else(|_| "22,23,0,1,2,3,8".into())
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect(),
+            strategy: std::env::var("STRATEGY").unwrap_or_else(|_| "sc".into()),
+            pg_size: env_or("PG_SIZE", 20.0),
+            pg_band: env_or("PG_BAND", 0.10),
+            pg_entry_min_remaining: env_or("PG_ENTRY_MIN_REMAINING", 180),
+            pg_entry_deadline: env_or("PG_ENTRY_DEADLINE", 60),
+            pg_pair_target: env_or("PG_PAIR_TARGET", 0.94),
+            pg_require_rising: std::env::var("PG_REQUIRE_RISING")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+            pg_rising_lookback_s: env_or("PG_RISING_LOOKBACK_S", 10),
+
             gamma: env_or("AS_GAMMA", 0.1),
             kappa: env_or("AS_KAPPA", 1.5),
             our_size: env_or("OUR_SIZE", 50.0),
@@ -133,13 +239,16 @@ impl Config {
             max_window_loss_pct: env_or("MAX_WINDOW_LOSS_PCT", 0.10),
             max_order_size: env_or("MAX_ORDER_SIZE", 100.0),
             max_position: env_or("MAX_POSITION", 500.0),
+            max_net_shares: env_or("MAX_NET_SHARES", 40.0),
             paired_buy_margin: env_or("PAIRED_BUY_MARGIN", 0.01),
+            flip_size: env_or("FLIP_SIZE", 40.0),
 
             maker_fill_prob: env_or("MAKER_FILL_PROB", 0.2),
             maker_only: env_or("MAKER_ONLY", true),
 
             kill_pause_secs: env_or("KILL_PAUSE_SECS", 5),
             panic_stop_secs: env_or("PANIC_STOP_SECS", 30),
+            flatten_secs: env_or("FLATTEN_SECS", 20),
 
             start_cash: env_or("START_CASH", 100.0),
             state_path: env::var("STATE_PATH").unwrap_or_else(|_| "paper_state.json".into()),

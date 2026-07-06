@@ -102,7 +102,13 @@ async fn connect_and_stream(
     tracing::info!(%url, "Binance WS connecté");
     let (_write, mut read) = ws.split();
 
-    while let Some(msg) = read.next().await {
+    // depth20@100ms envoie ~10 msg/s : 15 s de silence = connexion zombie
+    // (morte sans FIN TCP — cause du gel du 6 juil. : spot figé 1h15, fair morte,
+    // résolutions fausses). On coupe et on laisse la boucle externe reconnecter.
+    while let Some(msg) = tokio::time::timeout(Duration::from_secs(15), read.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("flux Binance silencieux >15 s (connexion zombie)"))?
+    {
         match msg? {
             Message::Text(txt) => {
                 match serde_json::from_str::<PartialDepth>(&txt) {

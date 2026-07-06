@@ -1,66 +1,142 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Polymarket MM — Monitoring</title>
-  <link rel="stylesheet" href="/style.css" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copy Maker V8</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <h1>Polymarket MM Bot <span id="dry" class="badge">—</span></h1>
-    <span id="clock" class="muted"></span>
-  </header>
-
-  <section class="grid">
-    <div class="card" id="card-radar">
-      <h2>🧠 Radar (Tokyo)</h2>
-      <div class="row"><span>Binance</span><b id="binance">—</b></div>
-      <div class="row"><span>BTC micro-price</span><b id="micro">—</b></div>
-      <div class="row"><span>OBI</span><b id="obi">—</b></div>
-      <div class="row"><span>KILL émis</span><b id="kills">—</b></div>
+<header>
+  <div class="title">Copy Maker V8 <span class="badge" id="mode">PAPER</span></div>
+  <div class="hl">
+    <div><div class="l">Fenêtres</div><div class="v" id="hw">0</div></div>
+    <div><div class="l">PnL trading</div><div class="v" id="hp">–</div></div>
+    <div><div class="l">Rebate estimé</div><div class="v" id="hr">–</div></div>
+    <div><div class="l">Total (trading+rebate)</div><div class="v" id="ht">–</div></div>
+    <div><div class="l">Gagnantes</div><div class="v" id="hwin">–</div></div>
+    <div><div class="l">Précision dir.</div><div class="v" id="hdir">–</div></div>
+    <div class="clock" id="clock">–</div>
+  </div>
+</header>
+<main>
+<div class="grid2">
+  <div class="panel">
+    <div class="ph">Fenêtre en cours — <span id="lslug" class="mut">…</span> · <span id="lelapsed"></span> · <span id="lstate" class="mut"></span></div>
+    <div class="livegrid">
+      <div class="card"><div class="cl">fills</div><div class="cv" id="lf">0</div></div>
+      <div class="card"><div class="cl">Up / Down</div><div class="cv" id="lud">0/0</div></div>
+      <div class="card"><div class="cl">imbalance</div><div class="cv" id="li">0</div></div>
+      <div class="card"><div class="cl">coût paire</div><div class="cv" id="lpc">–</div></div>
+      <div class="card"><div class="cl">déployé</div><div class="cv" id="ld">0$</div></div>
+      <div class="card"><div class="cl">rebate fen.</div><div class="cv" id="lr">0$</div></div>
+      <div class="card"><div class="cl">facteur taille</div><div class="cv" id="lsf">×1</div></div>
+      <div class="card"><div class="cl">cash</div><div class="cv" id="lc">–</div></div>
     </div>
-
-    <div class="card" id="card-exec">
-      <h2>🔫 Exécuteur (Dublin)</h2>
-      <div class="row"><span>Marché</span><b id="slug">—</b></div>
-      <div class="row"><span>Temps restant</span><b id="rem">—</b></div>
-      <div class="row"><span>σ (annualisé)</span><b id="sigma">—</b></div>
-      <div class="row"><span>Fair (Up)</span><b id="fair">—</b></div>
-      <div class="row"><span>Mid (Up)</span><b id="mid">—</b></div>
-      <div class="row"><span>Nos quotes</span><b id="quotes">—</b></div>
-      <div class="row"><span>Bande reward</span><b id="band">—</b></div>
-      <div class="row"><span>État</span><b id="execstate">—</b></div>
-      <div class="row"><span>Bloqué (raison)</span><b id="block">—</b></div>
-      <div class="row"><span>Signaux reçus</span><b id="signals">—</b></div>
+    <div class="ph" style="margin-top:12px">Monitor prix — Up (vert) / Down (rouge) · ▲ achats · ● merges</div>
+    <canvas id="pxmon" height="210"></canvas>
+    <div class="ph" style="margin-top:12px">Exposition nette (Up − Down)</div>
+    <canvas id="imb" height="80"></canvas>
+  </div>
+  <div class="panel">
+    <div class="ph">Coût de paire par fenêtre (¢) · vert &lt; 100¢</div>
+    <canvas id="pc" height="100"></canvas>
+    <div class="ph" style="margin-top:12px">Cumul : trading (orange) · trading+rebate (violet)</div>
+    <canvas id="cum" height="120"></canvas>
+    <div class="ph" style="margin-top:12px">Derniers fills</div>
+    <div class="feed" id="feed"></div>
+  </div>
+</div>
+<div class="panel">
+  <div class="ph">Bilan par jour</div>
+  <table id="daily"></table>
+</div>
+<div class="panel">
+  <div class="ph">Dernières fenêtres (40)</div>
+  <table id="tbl"></table>
+</div>
+<div class="panel">
+  <details id="strategyPanel" open>
+    <summary class="ph" style="cursor:pointer;margin-bottom:0">1. Stratégie actuelle — Copy Maker V8.2 (copie 0xb27b…, cliquer pour plier)</summary>
+    <div class="strat">
+      <p><b>◆ Signal amont — 100&nbsp;% Binance temps réel</b> (WS depth20@100ms) :<br>
+      · <b>Spot</b> = micro-price du carnet BTC (pas le mid — pondéré par les tailles bid/ask).<br>
+      · <b>Variations / juste valeur</b> : <code>fair_up = N(d2)</code>, prob. Black-Scholes binaire que
+      close &gt; strike, avec σ = volatilité EWMA temps réel et <b>μ = drift</b> (EMA des log-returns,
+      demi-vie 25&nbsp;s) injecté dans d2 — en tendance la fair suit le mouvement au lieu d'ancrer à 50/50.<br>
+      · <b>Tendance</b> (choix du côté directionnel) = signe du drift, <b>CONFIRMÉ ≥20&nbsp;s</b>
+      (drift instable → complétion seule, zéro pari). <b>Directionnel interdit sous 40¢</b> : on
+      accumule le favori comme la cible (ses fills : 66-72¢), jamais le couteau qui tombe.<br>
+      · <b>OBI + vélocité Binance</b> (radar) = <b>KILL</b> : carnet déséquilibré + mouvement brutal →
+      retrait immédiat des deux bids quelques secondes. C'est un garde-fou, pas un signal d'achat.<br>
+      · <b>OFI</b> : calculé et loggé mais <b>PAS branché</b> sur la décision (candidat de test n°2).</p>
+      <p><b>◆ Exécution MAKER</b> — deux bids restants, fills par règle de cross (le best ask traverse
+      notre bid), reprice si &gt;1 tick, cooldown 2&nbsp;s, clips 10-30 parts ≤10$ :<br>
+      · <b>Directionnel</b> (côté de la tendance) : prix ≤ min(best_bid+tick, fair−4¢, 90¢).<br>
+      · <b>Complétion</b> (côté déficitaire) : prix ≤ min(best_bid+tick, 99¢, <b>99,5¢−coût moyen opposé</b>)
+      — ne construit que des paires &lt;99,5¢ (cible : gagnantes à 94,7¢), taille = le déficit.<br>
+      · <b>Assurance</b> : à 45&nbsp;s de la fin, déficit restant complété en TAKER à l'ask, coût de paire
+      ignoré (jusqu'à 123¢ comme la cible) — jamais une fenêtre à un seul côté.<br>
+      · <b>Merges par blocs</b> : jamais avant 90&nbsp;s, seuil 30 paires (cible : méd 164&nbsp;s, 805$/merge) ;
+      le budget mergé est recyclé. · <b>Jamais de vente.</b></p>
+      <p><b>◆ Risque</b> : capital 1&nbsp;000$, 80$/fenêtre (recyclable), imbalance ≤150 parts,
+      <b>disjoncteur binaire</b> (2 pertes jouées → saute 1 fenêtre → retour taille pleine), 24h/24.
+      <b>Rebate</b> = 20&nbsp;% × Σ 0,07·p(1−p)·taille sur les fills maker (formule officielle) — le
+      profit attendu est LÀ, le trading vise le break-even.</p>
     </div>
-
-    <div class="card" id="card-book">
-      <h2>📖 Carnet Up + nos ordres</h2>
-      <div id="book" class="book"><div class="muted">en attente…</div></div>
-      <div class="book-legend">
-        <span><i class="dot-bid"></i> bids</span>
-        <span><i class="dot-ask"></i> asks</span>
-        <span><i class="dot-mine"></i> nos quotes</span>
-      </div>
+  </details>
+</div>
+<div class="panel">
+  <details>
+    <summary class="ph" style="cursor:pointer;margin-bottom:0">2. À tester absolument avant le live (backlog, cliquer pour déplier)</summary>
+    <div class="strat">
+      <p><b>① Filtre de régime tendance/calme</b> — LA question n°1. La cible fait +131$/fen. en tendance
+      et −45$/fen. en calme ; on l'a vue perdre 7&nbsp;700$ en une nuit hachée. Tester : ne jouer que si
+      |drift| dépasse un seuil, et/ou couper les heures mortes (à mesurer sur la campagne, pas supposer).</p>
+      <p><b>② OFI dans le choix directionnel</b> — il est calculé, jamais branché. A/B sur replay :
+      précision directionnelle drift seul vs drift+OFI vs OFI seul. La cible fait 64&nbsp;%, nous ~40-50&nbsp;%
+      cette nuit : c'est le plus gros levier de PnL trading.</p>
+      <p><b>③ Hystérésis de tendance</b> — ✅ FAIT (5 juil.) : drift stable ≥20&nbsp;s exigé + directionnel interdit sous 40¢. Reste à calibrer le délai (10/20/30&nbsp;s) sur replay.</p>
+      <p><b>④ Balayage de la marge M</b> (gate fair−4¢) : 2/4/6/8¢ sur replay des fenêtres archivées.</p>
+      <p><b>⑤ Timing de complétion</b> : cap paire 99,5¢ constant vs phases (directionnel pur → 100&nbsp;s,
+      complétion ensuite — le phasage exact de la cible).</p>
+      <p><b>⑥ Sensibilité du disjoncteur</b> : déclenchement à 2 vs 3 pertes, pause 1 vs 2 fenêtres.</p>
+      <p><b>⑦ Multi-actifs</b> (ETH/SOL/XRP-updown-5m) : la cible tourne 4 marchés en parallèle —
+      variance divisée, volume rebate ×4. À n'ouvrir qu'une fois BTC validé.</p>
+      <p><b>⑧ GATE FINAL paper→live</b> : ≥300 fenêtres avec total (trading+rebate) positif, 3 sessions
+      consécutives positives, drawdown max &lt;15&nbsp;% du capital, précision dir. ≥55&nbsp;%. Tant que ces 4
+      cases ne sont pas vertes, PAS de live.</p>
     </div>
-
-    <div class="card" id="card-pnl">
-      <h2>💰 Bankroll & PnL (paper)</h2>
-      <div class="row"><span>Equity</span><b id="equity">—</b></div>
-      <div class="row"><span>Cash USDC</span><b id="cash">—</b></div>
-      <div class="row"><span>Position (val.)</span><b id="posval">—</b></div>
-      <div class="row"><span>Expo nette (net)</span><b id="net">—</b></div>
-      <div class="row"><span>PnL fenêtre</span><b id="wpnl">—</b></div>
-      <div class="row"><span>Drawdown</span><b id="dd">—</b></div>
-      <div class="row"><span>PnL réalisé</span><b id="realized">—</b></div>
-      <div class="row"><span>Up / Down</span><b id="updn">—</b></div>
-      <div class="row"><span>Fills (maker/taker)</span><b id="mtfills">—</b></div>
-      <div class="row"><span>Ventes / Fusions</span><b id="sm">—</b></div>
+  </details>
+</div>
+<div class="panel">
+  <details>
+    <summary class="ph" style="cursor:pointer;margin-bottom:0">3. Checklist LIVE (à vérifier le jour J, cliquer pour déplier)</summary>
+    <div class="strat">
+      <p><b>Avant le 1er ordre</b> :<br>
+      ☐ Build live sur AWS (rustc ≥1.91 — le local 1.86 ne compile pas la feature <code>live</code>).<br>
+      ☐ Auth <b>sig_type 3</b> (deposit wallet) + <code>POLY_SIG_TYPE=3</code> dans le .env.<br>
+      ☐ <code>/balance-allowance/update</code> au boot, et <b>refresh du cache CONDITIONAL après chaque
+      BUY</b> (sinon merge/SELL rejeté « balance 0 » — ne jamais abandonner sur cette erreur).<br>
+      ☐ Tailles à <b>2 décimales max</b> (LOT_SIZE_SCALE=2 du SDK — ne jamais augmenter pour « corriger le dust »).<br>
+      ☐ Clips micro (1-2$) pour toute la 1re journée.</p>
+      <p><b>À mesurer dès les premières heures</b> :<br>
+      ☐ <b>Taux de fill maker réel vs paper</b> — notre règle de cross sous-estime les fills (file
+      d'attente invisible en paper) : c'est LE chiffre qui valide ou tue la simu.<br>
+      ☐ <b>Latence place→ACK→cancel</b> et rate limits CLOB (le reprice &gt;1 tick doit passer sous la limite).<br>
+      ☐ Réconciliation des fills : WS user + poll <code>/data/order</code> (les fills maker « orphelins »
+      du poll serveur — bug déjà rencontré).<br>
+      ☐ <b>Rebate réel du 1er versement quotidien</b> vs notre estimation 20&nbsp;% — recaler SC_REBATE_RATE
+      sur le chiffre réel.<br>
+      ☐ Coût réel du merge on-chain (gas) vs merger moins souvent.</p>
+      <p><b>Garde-fous permanents</b> :<br>
+      ☐ Kill switch manuel testé (cancel all + flatten) AVANT le 1er ordre.<br>
+      ☐ Jamais de <code>rm</code> sur les fichiers d'état — pkill + relaunch uniquement.<br>
+      ☐ Stop dur : −15&nbsp;% du capital live → retour paper + autopsie.</p>
     </div>
-  </section>
-
-  <footer class="muted">Connexion : <span id="status">…</span> · maj <span id="age">—</span></footer>
-  <script src="/app.js"></script>
+  </details>
+</div>
+</main>
+<script src="/app.js"></script>
 </body>
 </html>

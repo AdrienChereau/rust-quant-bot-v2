@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::types::Signal;
+use crate::types::{Signal, WireTick};
 
 #[async_trait]
 pub trait SignalTransport: Send + Sync {
@@ -81,23 +81,26 @@ impl UdpSignalTransport {
 #[async_trait]
 impl SignalTransport for UdpSignalTransport {
     async fn send_signal(&self, signal: Signal) -> anyhow::Result<()> {
-        if let Some(target) = self.target_addr {
-            let byte_payload = [signal as u8];
-            self.socket.send_to(&byte_payload, target).await?;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Mode récepteur uniquement : adresse cible manquante"
-            ))
+        let Some(target) = self.target_addr else {
+            return Err(anyhow::anyhow!("Mode récepteur uniquement : adresse cible manquante"));
+        };
+        match signal {
+            Signal::Kill => { self.socket.send_to(&[0x4B], target).await?; }
+            Signal::Heartbeat => { self.socket.send_to(&[0x48], target).await?; }
+            Signal::Tick(t) => { self.socket.send_to(&t.encode(), target).await?; }
         }
+        Ok(())
     }
 
     async fn recv_signal(&self) -> anyhow::Result<Signal> {
-        let mut buf = [0u8; 1];
-        let _ = self.socket.recv_from(&mut buf).await?;
+        let mut buf = [0u8; 128];
+        let (n, _) = self.socket.recv_from(&mut buf).await?;
         match buf[0] {
             0x4B => Ok(Signal::Kill),
             0x48 => Ok(Signal::Heartbeat),
+            0x54 => WireTick::decode(&buf[..n])
+                .map(Signal::Tick)
+                .ok_or_else(|| anyhow::anyhow!("trame Tick tronquée ({n} octets)")),
             other => Err(anyhow::anyhow!(
                 "Octet de signalisation corrompu ou inconnu : 0x{:02X}",
                 other

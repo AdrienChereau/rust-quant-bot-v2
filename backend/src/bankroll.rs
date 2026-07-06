@@ -34,6 +34,7 @@ pub struct BankrollEngine {
     max_window_loss_pct: f64,
     max_order_size: f64,
     max_position: f64,
+    max_net_shares: f64, // cap de la jambe NETTE en parts (bug fix : |net|×mid s'effondrait)
     paired_buy_margin: f64,
     end_window_secs: i64,
 
@@ -50,6 +51,7 @@ impl BankrollEngine {
             max_window_loss_pct: cfg.max_window_loss_pct,
             max_order_size: cfg.max_order_size,
             max_position: cfg.max_position,
+            max_net_shares: cfg.max_net_shares,
             paired_buy_margin: cfg.paired_buy_margin,
             end_window_secs: 60,
             window_start_equity: cfg.start_cash,
@@ -120,13 +122,13 @@ impl BankrollEngine {
         if self.window_pnl(equity) < -self.max_window_loss_pct * self.window_start_equity.max(1.0) {
             return TradeDecision::Blocked { reason: BlockReason::MaxWindowLoss };
         }
-        // Plafond d'exposition nette (si l'ordre l'aggrave).
-        if adds_to_net_abs {
-            let net_val = Self::net_exposure(s).abs() * side_mid;
-            if net_val >= self.max_net_exposure_pct * equity.max(1.0) {
-                return TradeDecision::Blocked { reason: BlockReason::MaxNetExposure };
-            }
+        // Plafond d'exposition nette EN PARTS (si l'ordre l'aggrave). Le risque d'une
+        // jambe nue est son nombre de parts (elle vaut 0 ou 1 à la résolution), PAS
+        // `|net|×mid` qui s'effondre pour un côté cheap et autorisait ~200 parts nues.
+        if adds_to_net_abs && Self::net_exposure(s).abs() >= self.max_net_shares {
+            return TradeDecision::Blocked { reason: BlockReason::MaxNetExposure };
         }
+        let _ = (side_mid, self.max_net_exposure_pct); // conservés pour compat/monitoring
         if side_balance >= self.max_position {
             return TradeDecision::Blocked { reason: BlockReason::MaxPosition };
         }

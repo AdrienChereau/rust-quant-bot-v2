@@ -66,60 +66,43 @@ fn clamp_tick(p: f64, tick: f64) -> f64 {
     snapped.clamp(0.01, 0.99)
 }
 
-/// Calcule les quotes A-S reward-adjusted.
+/// Quotes **inside-spread** (façon poly-maker `get_order_prices`) : on se pose juste à
+/// l'intérieur du touch — `bid = best_bid + tick`, `ask = best_ask − tick` — donc on
+/// **achète près du bid (sous le mid)** → les paires coûtent < 1 $ → la fusion à 1 $
+/// est rentable. **Pas de subvention reward** (edge pur) ni de skew de prix A-S
+/// (l'inventaire se gère par la taille/les gates côté exécuteur, pas par le prix).
 pub fn compute_quote(inp: &QuoteInputs, book: &PolyBook) -> QuoteResult {
-    let var_t = inp.sigma * inp.sigma * inp.t_years;
+    let tick = if inp.tick > 0.0 { inp.tick } else { 0.01 };
+    let top_bid = book.best_bid().unwrap_or((inp.mid - tick).clamp(0.01, 0.99));
+    let top_ask = book.best_ask().unwrap_or((inp.mid + tick).clamp(0.01, 0.99));
 
-    // 1. Prix de réservation. MM NEUTRE : on cote autour du **mid du marché**
-    //    (et non du fair — on ne parie pas sur notre modèle), décalé par le skew
-    //    d'inventaire A-S (sur l'inventaire NET, R1). +net (long Up) → réservation
-    //    sous le mid → on penche vendeur Up pour revenir à plat. Le `fair` reste
-    //    calculé pour le monitoring (divergence fair vs mid) mais ne pilote pas la quote.
-    let reservation = inp.mid - inp.inventory * inp.gamma * var_t;
+    // On améliore chaque côté du touch d'un tick (on devient le meilleur bid/ask).
+    let mut bid = top_bid + tick;
+    let mut ask = top_ask - tick;
 
-    // R2 : le terme d'arrivée A-S (1/γ)·ln(1+γ/κ) est mal échelonné en [0,1]
-    //   (≈0.645, toujours écrasé au plafond) → on le remplace par un demi-spread de
-    //   BASE configurable (cents), élargi marginalement par le risque (½γσ²t) et par
-    //   l'inventaire (offloader plus large quand on est chargé).
-    let base = inp.base_half_spread_cents / 100.0;
-    let inv_widen = inp.gamma * var_t * inp.inventory.abs();
-    let half_spread_as = base + 0.5 * inp.gamma * var_t + inv_widen;
+    // Anti-croisement : ne jamais traverser le touch adverse.
+    if bid >= top_ask - 1e-9 {
+        bid = top_bid;
+    }
+    if ask <= top_bid + 1e-9 {
+        ask = top_ask;
+    }
+    // Anti self-cross : si nos deux prix se rejoignent, on revient au touch.
+    if (bid - ask).abs() < tick - 1e-9 {
+        bid = top_bid;
+        ask = top_ask;
+    }
 
-    // 2. Subvention reward : on estime NOTRE score à notre spread (maintenant en cents).
+    let bid = clamp_tick(bid, tick);
+    let ask = clamp_tick(ask, tick);
     let v = inp.rewards_max_spread_cents;
-    let s_ref_cents = (half_spread_as * 100.0).min(v * 0.5).max(0.0);
-    let our_score = reward_score(v, s_ref_cents) * inp.our_size * 2.0; // deux côtés
-    let comp_q = competitor_q(book, inp.mid, v);
-    let share = if our_score + comp_q > 0.0 {
-        our_score / (our_score + comp_q)
-    } else {
-        0.0
-    };
-    let expected_reward = share * inp.reward_pool_per_min;
-
-    // Plus l'ExpectedReward est élevé, plus on resserre (en unités de prix).
-    // Calibrage simple : 1 $/min de reward attendu ⇒ jusqu'à `reward_k` de
-    // resserrement, borné pour ne jamais croiser le mid.
-    let reward_k = 0.02; // sensibilité (à calibrer en paper)
-    let subsidy = (expected_reward * reward_k).min(half_spread_as.max(0.0));
-    // Plafonné à la bande de reward : coter plus large n'éligibilise aucun reward
-    // et le spread A-S brut n'est pas fiable à l'échelle d'un marché de probabilité
-    // (calibration γ/κ à affiner en paper — cf. plan).
-    let band_price = inp.rewards_max_spread_cents / 100.0;
-    let half_spread_final = (half_spread_as - subsidy).clamp(inp.tick, band_price);
-
-    // 3. Quotes autour du prix de réservation, clampées.
-    let bid = clamp_tick(reservation - half_spread_final, inp.tick);
-    let ask = clamp_tick(reservation + half_spread_final, inp.tick);
-
-    // Dans la bande de reward si les deux côtés sont à ≤ v cents du mid.
     let in_reward_band = (bid - inp.mid).abs() * 100.0 <= v && (ask - inp.mid).abs() * 100.0 <= v;
 
     QuoteResult {
-        reservation,
-        half_spread_as,
-        expected_reward,
-        half_spread_final,
+        reservation: inp.mid,
+        half_spread_as: (ask - bid) / 2.0,
+        expected_reward: 0.0,
+        half_spread_final: (ask - bid) / 2.0,
         bid,
         ask,
         in_reward_band,
@@ -164,14 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn long_inventory_skews_down() {
-        let mut inp = base_inputs();
-        inp.inventory = 100.0; // long Up → on veut vendre → réservation sous le fair
-        let q = compute_quote(&inp, &empty_book());
-        assert!(q.reservation < 0.50, "reservation={}", q.reservation);
-    }
-
-    #[test]
     fn reward_score_peaks_at_mid() {
         assert!((reward_score(4.5, 0.0) - 1.0).abs() < 1e-9);
         assert!(reward_score(4.5, 2.25) < reward_score(4.5, 0.5));
@@ -179,29 +154,28 @@ mod tests {
     }
 
     #[test]
-    fn higher_reward_tightens_spread() {
-        let mut inp = base_inputs();
-        inp.reward_pool_per_min = 0.0;
-        let no_reward = compute_quote(&inp, &empty_book()).half_spread_final;
-        inp.reward_pool_per_min = 100.0; // gros pool, on est seuls → grosse subvention
-        let with_reward = compute_quote(&inp, &empty_book()).half_spread_final;
-        assert!(with_reward <= no_reward, "{with_reward} vs {no_reward}");
+    fn quotes_inside_the_spread() {
+        // Spread large (0.47/0.53) → on améliore d'un tick des deux côtés.
+        let inp = base_inputs();
+        let mut book = PolyBook::default();
+        book.bids.push(Level { price: 0.47, size: 100.0 });
+        book.asks.push(Level { price: 0.53, size: 100.0 });
+        let q = compute_quote(&inp, &book);
+        assert!((q.bid - 0.48).abs() < 1e-9, "bid={}", q.bid);
+        assert!((q.ask - 0.52).abs() < 1e-9, "ask={}", q.ask);
+        // On achète SOUS le mid et on vend AU-DESSUS → paire < 1$.
+        assert!(q.bid < inp.mid && q.ask > inp.mid);
     }
 
     #[test]
-    fn competitor_liquidity_reduces_our_share() {
-        let mut inp = base_inputs();
-        inp.reward_pool_per_min = 100.0;
-        // Carnet vide → grosse subvention.
-        let alone = compute_quote(&inp, &empty_book()).expected_reward;
-        // Carnet dense près du mid → notre part chute.
-        let mut crowded = PolyBook::default();
-        for i in 1..=4 {
-            let off = i as f64 * 0.01;
-            crowded.bids.push(Level { price: 0.50 - off, size: 5000.0 });
-            crowded.asks.push(Level { price: 0.50 + off, size: 5000.0 });
-        }
-        let contested = compute_quote(&inp, &crowded).expected_reward;
-        assert!(contested < alone, "contested={contested} alone={alone}");
+    fn tight_spread_falls_back_to_touch() {
+        // Spread de 2 ticks (0.49/0.51) : améliorer croiserait → on revient au touch.
+        let inp = base_inputs();
+        let mut book = PolyBook::default();
+        book.bids.push(Level { price: 0.49, size: 100.0 });
+        book.asks.push(Level { price: 0.51, size: 100.0 });
+        let q = compute_quote(&inp, &book);
+        assert!((q.bid - 0.49).abs() < 1e-9, "bid={}", q.bid);
+        assert!((q.ask - 0.51).abs() < 1e-9, "ask={}", q.ask);
     }
 }

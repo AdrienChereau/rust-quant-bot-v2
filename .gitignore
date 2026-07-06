@@ -15,3 +15,8 @@
 
 # NB : backend/data/ est suivi VOLONTAIREMENT (état paper, trades, logs)
 # pour permettre l'analyse des résultats. Aucun secret n'y figure.
+
+# Logs de run locaux (volumineux) + états paper locaux (le serveur a les siens)
+backend/*.log
+backend/paper_*.json*
+backend/paper_*.jsonl*

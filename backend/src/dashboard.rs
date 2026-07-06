@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -32,10 +32,28 @@ pub struct DashboardState {
     pub remaining_s: i64,
     pub sigma: f64,
     pub fair: f64,
+    pub drift: f64,     // drift log/s injecté dans p_up (correctif tendance)
+    pub obi_exec: f64,  // OBI carnet Binance côté exécuteur (skew de cotation)
+    pub ofi: f64,       // OFI normalisé [-1,1] (flux d'ordres Binance)
     pub up_mid: f64,
     pub up_bid: f64,
     pub up_ask: f64,
+    pub down_mid: f64,
+    pub down_bid: f64,
+    pub down_ask: f64,
+    pub pulled_up: bool,   // bid Up retiré (côté qui décroche)
+    pub pulled_down: bool, // bid Down retiré
     pub in_band: bool,
+    // Spread-capture v5
+    pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
+    pub deployed: f64,  // $ déployés sur la fenêtre courante
+    pub window_start: i64, // unix s du début de la fenêtre courante (graphique)
+    pub rebate_window: f64, // rebate estimé de la fenêtre courante
+    pub rebate_total: f64,  // rebate estimé cumulé depuis le lancement
+    pub size_factor: f64,   // disjoncteur de séries perdantes (1.0 / 0.25 / 0)
+    pub loss_streak: u32,   // pertes consécutives en cours
+    // Paramètres de stratégie réellement chargés (affichés dans le panneau « Stratégie »).
+    pub params: StrategyParams,
     pub signals_received: u64,
     // Inventaire / PnL
     pub cash: f64,
@@ -59,12 +77,102 @@ pub struct DashboardState {
     // Carnet Up (quelques niveaux autour du mid) pour visualisation.
     pub book_bids: Vec<BookLevel>, // tri décroissant (meilleur en premier)
     pub book_asks: Vec<BookLevel>, // tri croissant
+    // Séries temporelles (ring) pour les graphiques.
+    pub series: Vec<SeriesPoint>,
+    // Résultat réalisé par fenêtre résolue (rentabilité).
+    pub windows: Vec<WindowResult>,
+    // Chemin du journal de trades (pour l'endpoint /events) — non sérialisé.
+    #[serde(skip)]
+    pub trades_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BookLevel {
     pub price: f64,
     pub size: f64,
+}
+
+/// Point de série temporelle (1/s) pour le graphique de fenêtre (façon monitor).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SeriesPoint {
+    pub t: i64,        // unix ms
+    pub up_mid: f64,   // share Up (vert)
+    pub down_mid: f64, // share Down (rouge)
+    pub spot: f64,     // BTC spot Binance (bleu, axe gauche)
+    pub up_bid: f64,   // notre bid maker restant Up (0 si aucun)
+    pub up_ask: f64,
+    pub equity: f64,
+    pub realized: f64,
+    pub imb: f64, // imbalance de la fenêtre courante (courbe symlog)
+}
+
+/// Résultat d'une fenêtre résolue (format riche, aligné sur l'observatoire).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowResult {
+    pub start: i64,
+    pub res: String, // "Up" | "Down"
+    pub fills: u32,
+    pub avg_up: f64,
+    pub avg_dn: f64,
+    pub pair_cost: f64,
+    pub imb_max: f64,
+    pub imb_final: f64,
+    pub deployed: f64,
+    pub merged: f64,
+    pub rebate: f64, // rebate maker estimé (rate × Σ 0,07·p(1−p)·taille)
+    pub pnl: f64,    // PnL trading réalisé de la fenêtre (hors rebate)
+}
+
+/// Paramètres de stratégie chargés au démarrage (source : .env / défauts).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StrategyParams {
+    pub c_raw: f64,
+    pub fee_per_pair: f64,
+    pub opening_leg_max: f64,
+    pub gate_margin: f64,
+    pub max_imbalance: f64,
+    pub base_clip: f64,
+    pub max_clip: f64,
+    pub depth_gain: f64,
+    pub max_clip_usdc: f64,
+    pub max_capital_per_market: f64,
+    pub min_seconds: i64,
+    pub clip_interval_s: i64,
+    pub min_window_age_s: i64,
+    pub completion_reserve: f64,
+    pub drift_horizon_s: f64,
+    // v7
+    pub trend_filter: bool,
+    pub pullback_s: i64,
+    pub completion_max_price: f64,
+    pub completion_max_pair: f64,
+    pub drift_halflife_secs: f64,
+    pub drift_clamp_k: f64,
+    pub volatility_floor: f64,
+}
+
+/// Renvoie les `max` dernières lignes du journal JSONL comme tableau JSON.
+fn tail_json(path: &str, max: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return "[]".into();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let read_from = len.saturating_sub(64 * 1024);
+    if f.seek(SeekFrom::Start(read_from)).is_err() {
+        return "[]".into();
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return "[]".into();
+    }
+    let mut lines: Vec<&str> = buf.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Si on a démarré au milieu du fichier, la 1re ligne est probablement tronquée.
+    if read_from > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(max);
+    format!("[{}]", lines[start..].join(","))
 }
 
 pub type Shared = Arc<RwLock<DashboardState>>;
@@ -113,9 +221,14 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                         serde_json::to_string(&*s).unwrap_or_else(|_| "{}".into()),
                     )
                 }
+                "/events" => {
+                    let tp = { state.read().await.trades_path.clone() };
+                    ("application/json", tail_json(&tp, 250))
+                }
                 _ => ("text/plain", "not found".to_string()),
             };
             let status = if path == "/state"
+                || path == "/events"
                 || path == "/"
                 || path == "/index.html"
                 || path == "/style.css"
