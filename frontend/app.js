@@ -5,6 +5,9 @@ const money = (n) => (n >= 0 ? '+' : '') + f(n, 2) + '$';
 const cents = (n) => (n == null || isNaN(n) || n === 0) ? '–' : f(n * 100, 1) + '¢';
 const symlog = (v) => Math.sign(v) * Math.log10(1 + Math.abs(v));
 const CH = { pxmon: 210, imb: 80, pc: 100, cum: 120 };
+// Réécrit un innerHTML seulement s'il change : supprime le "rafraîchissement"
+// visible toutes les 2 s (le DOM n'était pas sale, on le réécrivait quand même).
+function setHtml(id, html) { const el = $(id); if (el.__last !== html) { el.__last = html; el.innerHTML = html; } }
 
 let series = [], evData = [], winStart = 0;
 
@@ -181,16 +184,16 @@ async function tick() {
     days[d].pnl += w.pnl || 0; days[d].reb += w.rebate || 0; days[d].dep += w.deployed || 0;
     if ((w.pnl || 0) > 0) days[d].win++;
   });
-  $('daily').innerHTML = `<tr><th>jour</th><th>fenêtres</th><th>gagnantes</th><th>déployé$</th><th>PnL$</th><th>rebate$</th><th>total$</th></tr>` +
+  setHtml('daily', `<tr><th>jour</th><th>fenêtres</th><th>gagnantes</th><th>déployé$</th><th>PnL$</th><th>rebate$</th><th>total$</th></tr>` +
     Object.entries(days).map(([d, v]) => {
       const t = v.pnl + v.reb; const cls = t >= 0 ? 'pos' : 'neg';
       return `<tr><td>${d}</td><td>${v.n}</td><td>${v.win}</td><td>${f(v.dep, 0)}</td>` +
         `<td class="${v.pnl >= 0 ? 'pos' : 'neg'}">${money(v.pnl)}</td><td class="pos">${money(v.reb)}</td>` +
         `<td class="${cls}">${money(t)}</td></tr>`;
-    }).join('');
+    }).join(''));
 
   // tableau fenêtres
-  $('tbl').innerHTML = `<tr><th>fenêtre</th><th>res</th><th>fills</th><th>Up@</th><th>Down@</th><th>paire</th><th>imb max</th><th>imb fin</th><th>mergé$</th><th>rebate$</th><th>PnL$</th></tr>` +
+  setHtml('tbl', `<tr><th>fenêtre</th><th>res</th><th>fills</th><th>Up@</th><th>Down@</th><th>paire</th><th>imb max</th><th>imb fin</th><th>mergé$</th><th>rebate$</th><th>PnL$</th></tr>` +
     ws.slice(-40).reverse().map((w) => {
       const hh = new Date(w.start * 1000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
       const cls = (w.pnl || 0) >= 0 ? 'pos' : 'neg';
@@ -198,7 +201,7 @@ async function tick() {
         `<td>${w.fills}</td><td>${cents(w.avg_up)}</td><td>${cents(w.avg_dn)}</td><td>${cents(w.pair_cost)}</td>` +
         `<td>${w.imb_max > 0 ? '+' : ''}${f(w.imb_max, 0)}</td><td>${w.imb_final > 0 ? '+' : ''}${f(w.imb_final, 0)}</td>` +
         `<td>${f(w.merged, 0)}</td><td class="pos">${f(w.rebate, 2)}</td><td class="${cls}">${money(w.pnl)}</td></tr>`;
-    }).join('') || '<tr><td class="empty">en attente…</td></tr>';
+    }).join('') || '<tr><td class="empty">en attente…</td></tr>');
 
   drawPxMonitor(s); drawImb(); drawWindows(ws);
 }
@@ -208,16 +211,16 @@ async function tickEvents() {
   if (!ev) return;
   evData = ev;
   const kc = { buy: '#4aa3ff', merge: '#a78bfa', resolve: '#6fe0a0', sell: '#e0a24a' };
-  $('feed').innerHTML = ev.slice().reverse().slice(0, 25).map((t) => {
+  setHtml('feed', ev.slice().reverse().slice(0, 25).map((t) => {
     const time = (t.ts || '').slice(11, 19);
     const det = t.kind === 'merge' ? `${f(t.size, 0)} paires → +${f(t.size, 0)}$`
       : t.kind === 'resolve' ? `${t.side} gagne · payout ${f(t.size, 0)}$`
       : `${t.side} ${f(t.size, 0)} @ ${cents(t.price)}`;
     return `<div><span class="mut">${time}</span> <span style="color:${kc[t.kind] || '#fff'}">${t.kind}</span> ${det}</div>`;
-  }).join('');
+  }).join(''));
 }
 
 tick(); tickEvents();
-setInterval(tick, 2500);
-setInterval(tickEvents, 3000);
+setInterval(tick, 1000);
+setInterval(tickEvents, 2000);
 window.addEventListener('resize', () => tick());
