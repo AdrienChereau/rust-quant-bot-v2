@@ -14,6 +14,9 @@ function resize() {
   W = window.innerWidth; H = window.innerHeight;
   CX = W / 2; CY = H / 2;
   cv.width = W * dpr; cv.height = H * dpr;
+  // CRUCIAL : taille CSS = fenêtre, sinon sur écran Retina (dpr=2) le canvas
+  // fait 2× l'écran et "le centre" se retrouve en bas à droite du viewport.
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
   cx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 resize(); window.addEventListener('resize', resize);
