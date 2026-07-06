@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use crate::bankroll::BankrollEngine;
 use crate::config::Config;
 use crate::connectors::binance;
+use crate::connectors::pm_ws;
 use crate::connectors::polymarket::{Market, PolyBook, PolymarketClient};
 use crate::dashboard::{Shared, SeriesPoint, WindowResult};
 use crate::engines::spread_capture::{Side, SpreadCaptureConfig, SpreadCaptureEngine};
@@ -121,6 +122,13 @@ async fn quote_loop(
     kill: Arc<KillState>,
 ) -> anyhow::Result<()> {
     let client = PolymarketClient::new();
+    // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
+    // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
+    let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
+        pm_ws::PmWsState::default(),
+    ));
+    let pm_tokens = pm_ws::spawn(pm_state.clone());
+    let mut last_slow_tick_s: i64 = 0; // throttle 1 Hz (log + série + REST secours)
     let bankroll = {
         // placeholder, recréé juste après avec equity initiale
         BankrollEngine::new(&cfg)
@@ -180,7 +188,7 @@ async fn quote_loop(
     let mut strike: Option<f64> = None;
     let mut last_spot: Option<f64> = None;
     let mut last_window_slug: Option<String> = None;
-    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    let mut poll = tokio::time::interval(Duration::from_millis(250));
     let mut persist_ctr: u32 = 0;
 
     // Signal directionnel (Radar Tokyo). En mode `combined`, on le calcule localement
@@ -301,6 +309,7 @@ async fn quote_loop(
                         slug = %m.slug, remaining_s = m.time_remaining_sec(),
                         strike = ?strike, size_factor, loss_streak, "=== Nouveau marché BTC 5min ==="
                     );
+                    let _ = pm_tokens.send(vec![m.up_token_id.clone(), m.down_token_id.clone()]);
                     current = Some(m);
                 }
                 Ok(None) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
@@ -378,13 +387,25 @@ async fn quote_loop(
         // Juste valeur avec DRIFT (correctif tendance, validé en replay) → gate ⚡.
         let fair_up = pricing::fair_up_probability_drift(spot, strike, sigma, t_years, drift_log);
 
-        // Carnets Up et Down (les deux côtés → permet la fusion CTF).
-        let (up_book, down_book) = match (
-            client.get_book(&m.up_token_id).await,
-            client.get_book(&m.down_token_id).await,
-        ) {
-            (Ok(u), Ok(d)) => (u, d),
-            _ => continue,
+        // Carnets Up et Down : WS temps réel d'abord, REST en secours (1 Hz max).
+        let now_ms_books = chrono::Utc::now().timestamp_millis() as u64;
+        let ws_up = pm_ws::fresh_book(&pm_state, &m.up_token_id, now_ms_books, 5_000);
+        let ws_dn = pm_ws::fresh_book(&pm_state, &m.down_token_id, now_ms_books, 5_000);
+        let slow_tick = (now_ms_books / 1000) as i64 != last_slow_tick_s; // vrai ~1×/s
+        let (up_book, down_book) = match (ws_up, ws_dn) {
+            (Some(u), Some(d)) => (u, d),
+            _ => {
+                if !slow_tick {
+                    continue; // pas de spam REST à 4 Hz quand le WS est muet
+                }
+                match (
+                    client.get_book(&m.up_token_id).await,
+                    client.get_book(&m.down_token_id).await,
+                ) {
+                    (Ok(u), Ok(d)) => (u, d),
+                    _ => continue,
+                }
+            }
         };
         let (Some(up_mid), Some(down_mid)) = (up_book.mid(), down_book.mid()) else { continue };
 
@@ -419,6 +440,14 @@ async fn quote_loop(
             Some(sign_now)
         } else {
             None // tendance non confirmée → complétion seule
+        };
+        // Veto OFI (v9) : le flux d'ordres Binance (fenêtre 5 s, calculé à Tokyo
+        // en split) contredit franchement le drift → pas de pari directionnel ce
+        // tick, la complétion continue. |OFI| < seuil = bruit, on n'agit pas.
+        let trend_up = match trend_up {
+            Some(true) if cfg.sc_ofi_confirm && ofi <= -cfg.sc_ofi_min => None,
+            Some(false) if cfg.sc_ofi_confirm && ofi >= cfg.sc_ofi_min => None,
+            t => t,
         };
 
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
@@ -604,6 +633,7 @@ async fn quote_loop(
                 .map(|l| crate::dashboard::BookLevel { price: l.price, size: l.size }).collect();
 
             // Série temporelle (ring ~10 min à 1/s) pour le graphique de fenêtre.
+            if slow_tick {
             d.series.push(SeriesPoint {
                 t: chrono::Utc::now().timestamp_millis(),
                 up_mid,
@@ -619,8 +649,10 @@ async fn quote_loop(
             if n > 600 {
                 d.series.drain(0..n - 600);
             }
+            }
         }
 
+        if slow_tick {
         tracing::info!(
             rem_s = m.time_remaining_sec(),
             fair = format!("{:.3}", fair_up),
@@ -639,10 +671,12 @@ async fn quote_loop(
             state = if sleeping { "sleep" } else if paused { "kill(obs)" } else { "scan" },
             "sc"
         );
+        }
+        last_slow_tick_s = (now_ms_books / 1000) as i64;
 
         persist_ctr += 1;
-        if persist_ctr % 5 == 0 {
-            paper.persist();
+        if persist_ctr % 20 == 0 {
+            paper.persist(); // ~1×/5 s, comme avant le passage à 4 Hz
         }
     }
 }

@@ -84,6 +84,8 @@ pub struct Config {
     pub sc_directional_max: f64,   // borne absolue du prix directionnel (0.90 — il charge jusqu'à 87c)
     pub sc_directional_min: f64,   // bid directionnel INTERDIT si best_bid < ce seuil (la cible accumule le favori 66-72c, jamais le couteau)
     pub sc_trend_confirm_s: i64,   // le drift doit garder son signe N s avant d'armer le directionnel (anti flip-flop)
+    pub sc_ofi_confirm: bool,      // veto OFI : pas de directionnel si le flux d'ordres Binance contredit le drift
+    pub sc_ofi_min: f64,           // seuil de contradiction (|OFI| ≥ min contre nous → veto ; en-dessous = bruit, on laisse)
     pub sc_rebate_rate: f64,       // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
     pub sc_streak_soft: u32,       // pertes consécutives → taille ×0.25
     pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
@@ -207,6 +209,8 @@ impl Config {
             sc_directional_max: env_or("SC_DIRECTIONAL_MAX", 0.90),
             sc_directional_min: env_or("SC_DIRECTIONAL_MIN", 0.40),
             sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),
+            sc_ofi_confirm: env_or("SC_OFI_CONFIRM", true),
+            sc_ofi_min: env_or("SC_OFI_MIN", 0.15),
             sc_rebate_rate: env_or("SC_REBATE_RATE", 0.20),
             sc_streak_soft: env_or("SC_STREAK_SOFT", 4),
             sc_streak_hard: env_or("SC_STREAK_HARD", 6),

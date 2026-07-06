@@ -57,7 +57,7 @@
 </div>
 <div class="panel">
   <details id="strategyPanel" open>
-    <summary class="ph" style="cursor:pointer;margin-bottom:0">1. Stratégie actuelle — Copy Maker V8.2 (copie 0xb27b…, cliquer pour plier)</summary>
+    <summary class="ph" style="cursor:pointer;margin-bottom:0">1. Stratégie actuelle — Copy Maker V9 (copie 0xb27b…, cliquer pour plier)</summary>
     <div class="strat">
       <p><b>◆ Signal amont — 100&nbsp;% Binance temps réel</b> (WS depth20@100ms) :<br>
       · <b>Spot</b> = micro-price du carnet BTC (pas le mid — pondéré par les tailles bid/ask).<br>
@@ -69,9 +69,11 @@
       accumule le favori comme la cible (ses fills : 66-72¢), jamais le couteau qui tombe.<br>
       · <b>OBI + vélocité Binance</b> (radar) = <b>KILL</b> : carnet déséquilibré + mouvement brutal →
       retrait immédiat des deux bids quelques secondes. C'est un garde-fou, pas un signal d'achat.<br>
-      · <b>OFI</b> : calculé et loggé mais <b>PAS branché</b> sur la décision (candidat de test n°2).</p>
-      <p><b>◆ Exécution MAKER</b> — deux bids restants, fills par règle de cross (le best ask traverse
-      notre bid), reprice si &gt;1 tick, cooldown 2&nbsp;s, clips 10-30 parts ≤10$ :<br>
+      · <b>OFI (branché v9)</b> : veto directionnel — si le flux d'ordres Binance (fenêtre 5&nbsp;s)
+      contredit franchement le drift (|OFI| ≥ 0,15 contre nous), pas de pari ce tick, complétion seule.</p>
+      <p><b>◆ Exécution MAKER</b> — <b>carnets Polymarket en WebSocket temps réel</b> (v9, boucle 4&nbsp;Hz,
+      REST en secours si le flux se coupe) ; deux bids restants, fills par règle de cross (le best ask
+      traverse notre bid), reprice si &gt;1 tick, cooldown 2&nbsp;s, clips 10-30 parts ≤10$ :<br>
       · <b>Directionnel</b> (côté de la tendance) : prix ≤ min(best_bid+tick, fair−4¢, 90¢).<br>
       · <b>Complétion</b> (côté déficitaire) : prix ≤ min(best_bid+tick, 99¢, <b>99,5¢−coût moyen opposé</b>)
       — ne construit que des paires &lt;99,5¢ (cible : gagnantes à 94,7¢), taille = le déficit.<br>
@@ -93,9 +95,8 @@
       <p><b>① Filtre de régime tendance/calme</b> — LA question n°1. La cible fait +131$/fen. en tendance
       et −45$/fen. en calme ; on l'a vue perdre 7&nbsp;700$ en une nuit hachée. Tester : ne jouer que si
       |drift| dépasse un seuil, et/ou couper les heures mortes (à mesurer sur la campagne, pas supposer).</p>
-      <p><b>② OFI dans le choix directionnel</b> — il est calculé, jamais branché. A/B sur replay :
-      précision directionnelle drift seul vs drift+OFI vs OFI seul. La cible fait 64&nbsp;%, nous ~40-50&nbsp;%
-      cette nuit : c'est le plus gros levier de PnL trading.</p>
+      <p><b>② OFI dans le choix directionnel</b> — ✅ FAIT (7 juil., v9) : veto OFI sur le directionnel
+      (SC_OFI_CONFIRM, seuil SC_OFI_MIN=0,15). À surveiller : précision dir. avant/après sur le bilan par jour.</p>
       <p><b>③ Hystérésis de tendance</b> — ✅ FAIT (5 juil.) : drift stable ≥20&nbsp;s exigé + directionnel interdit sous 40¢. Reste à calibrer le délai (10/20/30&nbsp;s) sur replay.</p>
       <p><b>④ Balayage de la marge M</b> (gate fair−4¢) : 2/4/6/8¢ sur replay des fenêtres archivées.</p>
       <p><b>⑤ Timing de complétion</b> : cap paire 99,5¢ constant vs phases (directionnel pur → 100&nbsp;s,
