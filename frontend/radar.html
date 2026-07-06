@@ -3,75 +3,81 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TOKYO — Radar</title>
+<title>TOKYO — Signal</title>
 <style>
-:root{--bg:#05070c;--txt:#dfe6ee;--mut:#5c6878;--cy:#33e0ff;--vi:#8b7cf7;--gr:#3ddc84;--rd:#ff5252;}
+:root{--txt:#dfe6ee;--mut:#66738a;--cy:#38e1ff;--vi:#8b7cf7;--gr:#3ddc84;--rd:#ff5252;}
 *{box-sizing:border-box;margin:0}
 html,body{height:100%}
-body{background:var(--bg);color:var(--txt);font-family:ui-monospace,'SF Mono',Menlo,monospace;overflow:hidden}
+body{background:#030509;color:var(--txt);font-family:ui-monospace,'SF Mono',Menlo,monospace;overflow:hidden;cursor:default}
 #scene{position:fixed;inset:0;display:block}
-.hud{position:fixed;z-index:2;pointer-events:none}
-/* titre */
-#title{top:22px;left:26px}
-#title .t1{font-size:20px;letter-spacing:.35em;color:var(--cy);text-shadow:0 0 18px rgba(51,224,255,.55)}
-#title .t2{font-size:10px;letter-spacing:.22em;color:var(--mut);margin-top:6px}
-#status{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--rd);margin-right:7px;vertical-align:1px}
-#status.on{background:var(--gr);box-shadow:0 0 10px var(--gr)}
-/* prix */
-#price{top:22px;right:26px;text-align:right}
-#price .p{font-size:34px;font-weight:600;color:var(--txt);text-shadow:0 0 24px rgba(51,224,255,.25)}
-#price .l{font-size:10px;letter-spacing:.25em;color:var(--mut);margin-top:4px}
-/* métriques gauche */
-#metrics{left:26px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:18px}
-.m .k{font-size:9px;letter-spacing:.25em;color:var(--mut)}
-.m .v{font-size:19px;margin-top:3px}
-.m .bar{width:120px;height:3px;background:#141a24;border-radius:2px;margin-top:6px;position:relative;overflow:hidden}
-.m .bar i{position:absolute;top:0;bottom:0;left:50%;background:var(--cy);border-radius:2px;transition:all .4s}
-/* lien Dublin */
-#link{right:26px;top:50%;transform:translateY(-50%);text-align:right}
-#link .k{font-size:9px;letter-spacing:.25em;color:var(--mut)}
-#link .v{font-size:15px;color:var(--vi);margin-top:4px;text-shadow:0 0 14px rgba(139,124,247,.5)}
-#link .s{font-size:10px;color:var(--mut);margin-top:3px}
-/* journal bas droite */
-#logbox{right:0;bottom:0;width:min(560px,46vw);max-height:38vh;padding:14px 18px 16px;
- background:linear-gradient(160deg,rgba(9,13,20,.55),rgba(9,13,20,.92));
- border-top:1px solid rgba(51,224,255,.18);border-left:1px solid rgba(51,224,255,.18);
- border-top-left-radius:12px;backdrop-filter:blur(8px);pointer-events:auto}
-#logbox .k{font-size:9px;letter-spacing:.3em;color:var(--cy);margin-bottom:9px}
-#log{font-size:11.5px;line-height:1.75;overflow:auto;max-height:calc(38vh - 44px)}
+
+/* ── couche éphémère : visible au mouvement, s'évanouit ensuite ── */
+#hud{position:fixed;inset:0;z-index:3;pointer-events:none;opacity:0;transition:opacity .8s ease}
+body.awake #hud{opacity:1;transition:opacity .25s ease}
+
+/* prix fantôme — seule présence permanente, à peine là */
+#ghost{position:fixed;top:34px;left:50%;transform:translateX(-50%);z-index:2;text-align:center;
+ opacity:.28;transition:opacity .6s;pointer-events:none}
+body.awake #ghost{opacity:.9}
+#ghost .p{font-size:44px;font-weight:200;letter-spacing:.06em;color:var(--txt)}
+#ghost .l{font-size:9px;letter-spacing:.5em;color:var(--mut);margin-top:6px}
+
+#corner{position:absolute;top:26px;left:30px}
+#corner .t1{font-size:15px;letter-spacing:.42em;color:var(--cy)}
+#corner .t2{font-size:9px;letter-spacing:.24em;color:var(--mut);margin-top:7px}
+#status{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--rd);margin-right:7px;vertical-align:1px}
+#status.on{background:var(--gr);box-shadow:0 0 9px var(--gr)}
+
+#metrics{position:absolute;left:30px;bottom:30px;display:flex;gap:34px}
+.m .k{font-size:8.5px;letter-spacing:.28em;color:var(--mut)}
+.m .v{font-size:17px;margin-top:5px;font-weight:300}
+
+#link{position:absolute;top:26px;right:30px;text-align:right}
+#link .k{font-size:8.5px;letter-spacing:.28em;color:var(--mut)}
+#link .v{font-size:13px;color:var(--vi);margin-top:5px}
+#link .s{font-size:10px;color:var(--mut);margin-top:4px}
+
+/* journal complet — au réveil seulement */
+#logbox{position:absolute;right:0;bottom:0;width:min(520px,44vw);max-height:34vh;padding:14px 20px 16px;
+ background:linear-gradient(160deg,rgba(6,10,17,.35),rgba(6,10,17,.9));
+ border-top:1px solid rgba(56,225,255,.14);border-left:1px solid rgba(56,225,255,.14);
+ border-top-left-radius:14px;backdrop-filter:blur(10px)}
+#logbox .k{font-size:8.5px;letter-spacing:.34em;color:var(--cy);margin-bottom:9px}
+#log{font-size:11px;line-height:1.8;overflow:auto;max-height:calc(34vh - 46px)}
 #log .t{color:var(--mut);margin-right:9px}
-#log .kill{color:var(--rd)}#log .ok{color:var(--gr)}#log .warn{color:#ffb454}
-/* footer gauche */
-#foot{left:26px;bottom:18px;font-size:10px;letter-spacing:.18em;color:var(--mut)}
+.kill{color:var(--rd)}.ok{color:var(--gr)}.warn{color:#ffb454}
+
+/* toasts éphémères — un événement surgit puis se dissout, même écran endormi */
+#toasts{position:fixed;right:26px;bottom:24px;z-index:4;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast{font-size:11.5px;padding:9px 14px;border-radius:9px;max-width:56vw;
+ background:rgba(8,12,20,.82);border:1px solid rgba(56,225,255,.22);backdrop-filter:blur(6px);
+ animation:toast 7s forwards}
+@keyframes toast{0%{opacity:0;transform:translateY(8px)}6%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0;transform:translateY(-6px)}}
+body.awake #toasts{opacity:0}
 </style>
 </head>
 <body>
 <canvas id="scene"></canvas>
-<div class="hud" id="title">
-  <div class="t1">TOKYO · RADAR</div>
-  <div class="t2"><span id="status"></span><span id="statustxt">CONNEXION…</span></div>
+<div id="ghost"><div class="p" id="px">–</div><div class="l">BTC · TOKYO</div></div>
+<div id="hud">
+  <div id="corner">
+    <div class="t1">TOKYO · SIGNAL</div>
+    <div class="t2"><span id="status"></span><span id="statustxt">CONNEXION…</span></div>
+  </div>
+  <div id="link">
+    <div class="k">LIAISON UDP ⟶ DUBLIN</div>
+    <div class="v" id="rate">0 ticks/s</div>
+    <div class="s">seq <span id="seq">0</span> · kills <span id="kills" style="color:var(--rd)">0</span></div>
+  </div>
+  <div id="metrics">
+    <div class="m"><div class="k">DRIFT /s</div><div class="v" id="mdrift">–</div></div>
+    <div class="m"><div class="k">OBI</div><div class="v" id="mobi">–</div></div>
+    <div class="m"><div class="k">OFI</div><div class="v" id="mofi">–</div></div>
+    <div class="m"><div class="k">σ</div><div class="v" id="msigma">–</div></div>
+  </div>
+  <div id="logbox"><div class="k">◢ JOURNAL TOKYO</div><div id="log"></div></div>
 </div>
-<div class="hud" id="price">
-  <div class="p" id="px">–</div>
-  <div class="l">BTC · MICRO-PRICE BINANCE</div>
-</div>
-<div class="hud" id="metrics">
-  <div class="m"><div class="k">DRIFT /s</div><div class="v" id="mdrift">–</div><div class="bar"><i id="bdrift"></i></div></div>
-  <div class="m"><div class="k">OBI</div><div class="v" id="mobi">–</div><div class="bar"><i id="bobi"></i></div></div>
-  <div class="m"><div class="k">OFI</div><div class="v" id="mofi">–</div><div class="bar"><i id="bofi"></i></div></div>
-  <div class="m"><div class="k">σ ANNUALISÉE</div><div class="v" id="msigma">–</div></div>
-</div>
-<div class="hud" id="link">
-  <div class="k">LIAISON UDP</div>
-  <div class="v">⟶ DUBLIN :8080</div>
-  <div class="s"><span id="rate">0</span> ticks/s · seq <span id="seq">0</span></div>
-  <div class="s" style="margin-top:10px">KILLS ÉMIS · <span id="kills" style="color:var(--rd)">0</span></div>
-</div>
-<div class="hud" id="logbox">
-  <div class="k">◢ JOURNAL TOKYO</div>
-  <div id="log"></div>
-</div>
-<div class="hud" id="foot">SIGNAL MADE IN TOKYO — DRIFT · OFI · OBI · σ — 10 Hz</div>
+<div id="toasts"></div>
 <script src="/radar.js"></script>
 </body>
 </html>
