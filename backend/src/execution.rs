@@ -7,6 +7,7 @@
 //!   notre quote doit être *strictement* meilleure que le TOB.
 //! - KILL (R5) : `KillState` partagé ; pendant la pause, AUCUN fill ni quote.
 
+#![allow(dead_code)] // module hérité (fill probabiliste v1, remplacé par la règle de cross)
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::bankroll::{BankrollEngine, BlockReason, TradeDecision};

@@ -65,6 +65,7 @@ impl Side {
 }
 
 /// Décision d'achat taker (marketable limit à `price`, fee incluse).
+#[allow(dead_code)] // chemin taker v5 conservé pour les tests
 #[derive(Debug, Clone)]
 pub struct BuyDecision {
     pub side: Side,
@@ -157,6 +158,7 @@ impl SpreadCaptureEngine {
         self.cost_up + self.cost_dn
     }
 
+    #[allow(dead_code)] // chemin taker v5 (tests)
     fn fee_share(&self) -> f64 {
         self.cfg.fee_per_pair / 2.0
     }
@@ -165,6 +167,7 @@ impl SpreadCaptureEngine {
     /// `fair` = juste valeur Binance de CE côté. `trend_up` = signe de la tendance
     /// 30-60 s Binance ; `pullback` = micro-repli 5 s contre CE côté (timing H1).
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // chemin taker v5 (tests)
     fn decide_side(
         &self,
         side: Side,
@@ -356,6 +359,7 @@ impl SpreadCaptureEngine {
 
     /// Évalue les deux côtés pour ce tick.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // chemin taker v5 (tests)
     pub fn decide(
         &self,
         ask_up: f64,

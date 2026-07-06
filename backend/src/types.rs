@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Alias de prix pour la clarté des signatures.
+#[allow(dead_code)] // hérité
 pub type Price = OrderedFloat;
 
 /// Wrapper `f64` totalement ordonné, utilisable comme clé de `BTreeMap`.
@@ -173,6 +174,7 @@ impl WireTick {
 
 /// Quote produite par le moteur de risque (côté exécuteur).
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)] // hérité v1
 pub struct Quote {
     pub bid_price: f64,
     pub ask_price: f64,
@@ -182,6 +184,7 @@ pub struct Quote {
 
 /// Inventaire et PnL du bot (mode paper au J8).
 #[derive(Debug, Clone, Default, Serialize)]
+#[allow(dead_code)] // hérité v1
 pub struct BotInventory {
     pub yes_balance: f64,
     pub no_balance: f64,

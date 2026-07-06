@@ -147,9 +147,6 @@ async fn quote_loop(
         completion_max_price: cfg.sc_completion_max_price,
         completion_max_pair: cfg.sc_completion_max_pair,
     });
-    // Buffer spot pour le micro-repli 5 s (timing H1 : acheter le pullback).
-    let mut spot_hist: std::collections::VecDeque<(i64, f64)> =
-        std::collections::VecDeque::with_capacity(32);
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash, cfg.max_position, cfg.min_merge_threshold, cfg.safety_mult,
         cfg.state_path.clone(), cfg.trades_path.clone(),
@@ -203,7 +200,6 @@ async fn quote_loop(
     let mut win_imb_max = 0.0f64;
     let mut rebate_total = 0.0f64;
     let mut loss_streak: u32 = 0;
-    let mut skip_ctr: u32 = 0; // fenêtres écoulées en régime "hard"
     let mut size_factor = 1.0f64;
     // Anti flip-flop : le drift doit garder son signe sc_trend_confirm_s avant
     // d'armer le directionnel (le couteau se pariait sur des micro-replis de 2 s).
@@ -269,7 +265,6 @@ async fn quote_loop(
                         } else {
                             1.0 // retour taille pleine
                         };
-                        let _ = skip_ctr;
                         rebate_total += win_rebate;
                         let final_rec = WindowResult { pnl: delta, ..rec };
                         // Persiste la fenêtre (append-only) avant de l'ajouter à l'affichage.
@@ -425,7 +420,6 @@ async fn quote_loop(
         } else {
             None // tendance non confirmée → complétion seule
         };
-        let _ = &spot_hist; // (buffer pullback conservé pour le mode taker/tests)
 
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
         let desired = if sleeping || paused {

@@ -21,6 +21,7 @@ const WINDOW_SEC: i64 = 300;
 
 /// Marché Up/Down résolu.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // métadonnées marché complètes (rewards/neg_risk servent au live)
 pub struct Market {
     pub condition_id: String,
     pub slug: String,

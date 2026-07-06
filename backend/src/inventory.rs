@@ -120,6 +120,7 @@ impl PaperEngine {
 
     /// Applique une VENTE de `size` tokens à `price`. Pas de vente à découvert :
     /// on ne vend que ce qu'on détient.
+    #[allow(dead_code)] // réservé au chemin live
     pub fn try_sell(&mut self, side: &str, price: f64, size: f64, liquidity_type: &str) -> bool {
         let held = self.side_balance(side);
         let qty = size.min(held);
@@ -177,6 +178,7 @@ impl PaperEngine {
     /// directionnel** `|up − down|`, sinon il roule jusqu'à la résolution et paie 0 si
     /// c'est le côté perdant (bug observé : jambe nue tenue jusqu'au bout → perte sèche).
     /// Retourne la taille aplatie.
+    #[allow(dead_code)] // réservé au chemin live
     pub fn flatten_net(&mut self, up_bid: Option<f64>, down_bid: Option<f64>) -> f64 {
         let net = self.state.up_balance - self.state.down_balance;
         if net > 1e-9 {
@@ -218,6 +220,7 @@ impl PaperEngine {
     }
 
     /// PnL latent : valeur de marché des positions (mid) − déjà payé est implicite.
+    #[allow(dead_code)] // réservé au chemin live
     pub fn mark_to_market(&self, up_mid: f64, down_mid: f64) -> f64 {
         self.state.up_balance * up_mid + self.state.down_balance * down_mid
     }

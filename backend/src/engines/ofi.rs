@@ -60,6 +60,7 @@ impl OfiEngine {
     }
 
     /// OFI brut : somme signée des incréments sur la fenêtre (unités de taille).
+    #[allow(dead_code)] // diagnostic
     pub fn value_raw(&self) -> f64 {
         self.history.iter().map(|(_, v)| v).sum()
     }

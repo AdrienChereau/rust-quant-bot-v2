@@ -28,6 +28,7 @@ impl BotRole {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // champs hérités v1-v5 conservés (réactivables par env)
 pub struct Config {
     pub role: BotRole,
     pub dry_run: bool,

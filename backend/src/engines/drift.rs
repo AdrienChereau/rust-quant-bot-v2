@@ -56,6 +56,7 @@ impl DriftEngine {
 
     /// Déplacement log attendu sur `secs` secondes (μ · secs), **non clampé** :
     /// l'appelant borne via [`super::pricing::clamp_drift`].
+    #[allow(dead_code)] // utilisé par les tests
     pub fn drift_over(&self, secs: f64) -> f64 {
         self.mu * secs.max(0.0)
     }

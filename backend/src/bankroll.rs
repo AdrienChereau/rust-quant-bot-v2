@@ -4,6 +4,7 @@
 //! déterminent si — et de quelle taille — un ordre est autorisé. MM **neutre** :
 //! AUCUN gate d'edge directionnel ; on borne l'exposition, le cash et la perte.
 
+#![allow(dead_code)] // module hérité (gates R4 conservés pour l'armement live)
 use crate::config::Config;
 use crate::connectors::polymarket::Market;
 use crate::inventory::PaperState;

@@ -10,6 +10,7 @@
 //!
 //! Tous les prix sont des probabilités Polymarket dans [0.01, 0.99].
 
+#![allow(dead_code)] // module hérité (quoting Avellaneda-Stoikov v1, remplacé par le maker v8)
 use crate::connectors::polymarket::PolyBook;
 
 #[derive(Debug, Clone)]

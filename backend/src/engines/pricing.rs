@@ -15,6 +15,7 @@ fn normal_cdf(x: f64) -> f64 {
 }
 
 /// Probabilité "Up" = N(d2), sans drift. Robuste aux cas dégénérés (t→0, σ→0).
+#[allow(dead_code)] // version sans drift, gardée pour les tests A/B
 pub fn fair_up_probability(spot: f64, strike: f64, sigma_annual: f64, t_years: f64) -> f64 {
     fair_up_probability_drift(spot, strike, sigma_annual, t_years, 0.0)
 }

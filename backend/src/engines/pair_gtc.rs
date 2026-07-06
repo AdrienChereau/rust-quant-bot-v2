@@ -90,6 +90,7 @@ impl PairGtcEngine {
     }
 
     /// Coût de paire si on complétait maintenant à `ask_opp` (fee-inclusive).
+    #[allow(dead_code)] // utilisé par les tests
     pub fn completion_cost(&self, ask_opp: f64) -> Option<f64> {
         if let Phase::HoldingLeg { avg, .. } = self.phase {
             Some(avg + ask_opp + self.fee_share())
