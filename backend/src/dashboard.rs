@@ -186,8 +186,10 @@ pub fn shared(dry_run: bool) -> Shared {
 
 /// Lance le serveur HTTP de monitoring (boucle infinie).
 pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    tracing::info!(port, "Dashboard sur http://127.0.0.1:{port}");
+    // DASH_BIND=0.0.0.0 pour l'accès distant (Tailscale) ; défaut local-only.
+    let bind = std::env::var("DASH_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let listener = TcpListener::bind((bind.as_str(), port)).await?;
+    tracing::info!(port, bind, "Dashboard sur http://{bind}:{port}");
 
     loop {
         let (mut sock, _) = match listener.accept().await {
