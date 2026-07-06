@@ -34,9 +34,9 @@ body{background:#07090d;color:var(--txt);overflow:hidden;
 #status{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--rd);margin-right:7px;vertical-align:1px}
 #status.on{background:var(--gr);box-shadow:0 0 6px rgba(142,201,168,.6)}
 
-/* ── étage 2 : lecture du signal (sous le cœur, centré) ── */
-#read{left:50%;bottom:26px;transform:translateX(-50%);display:flex;gap:14px;background:none;border:none;
- backdrop-filter:none;padding:0}
+/* ── étage 2 : lecture du signal — bas gauche (jamais sur le journal) ── */
+#read{left:24px;bottom:26px;display:flex;flex-wrap:wrap;gap:12px;background:none;border:none;
+ backdrop-filter:none;padding:0;max-width:calc(100vw - 34vw - 90px)}
 #read .cell{background:var(--panel);border:1px solid var(--edge);border-radius:16px;padding:13px 20px;
  min-width:152px;text-align:center;backdrop-filter:blur(14px)}
 #read .v{font-size:16.5px;font-weight:300;margin-top:6px;letter-spacing:.02em}
@@ -49,11 +49,9 @@ body{background:#07090d;color:var(--txt);overflow:hidden;
 #log .t{color:var(--mut);margin-right:8px}
 .kill{color:var(--rd)}.ok{color:var(--gr)}.warn{color:var(--amb)}
 
-/* étiquettes de zone dessinées SOUS la scène */
-.zone{position:fixed;z-index:2;font-size:9px;letter-spacing:.3em;color:var(--mut);opacity:.55;pointer-events:none;font-weight:300}
-#z-in{left:24px;top:50%;transform:translateY(90px)}
-#z-core{left:50%;top:50%;transform:translate(-50%,110px);text-align:center;color:var(--cy);opacity:.5;line-height:1.9}
-#z-out{right:24px;top:50%;transform:translateY(90px);text-align:right}
+/* légende du signal, discrète, sous l'onde */
+#caption{position:fixed;left:50%;top:calc(50% + 120px);transform:translateX(-50%);z-index:2;
+ font-size:9px;letter-spacing:.4em;color:var(--mut);opacity:.5;pointer-events:none;font-weight:300}
 @media(max-height:760px){#read .cell{padding:9px 13px;min-width:128px}}
 </style>
 </head>
@@ -93,10 +91,7 @@ body{background:#07090d;color:var(--txt);overflow:hidden;
   <div id="log"></div>
 </div>
 
-<div class="zone" id="z-in">FLUX BRUT ⟶</div>
-<div class="zone" id="z-core">TOKYO<br>CALCUL DU SIGNAL</div>
-<div class="zone" id="z-out">⟶ DUBLIN · EXÉCUTION</div>
-
+<div id="caption">SIGNAL · TOKYO ⟶ DUBLIN</div>
 <script src="/radar.js"></script>
 </body>
 </html>

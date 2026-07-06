@@ -87,25 +87,29 @@ async function poll() {
 }
 poll(); setInterval(poll, 1000);
 
-// ── scène ──
-const V = { rate: 0, sigma: 0, obi: 0, drift: 0, alive: 0 }; // valeurs lissées
+// ── scène : UNE onde, centrée, symétrique — pas de cœur, pas de battement ──
+// La forme est un signal pur au milieu de l'écran :
+//   amplitude ∝ σ + |OBI|   vitesse de défilement ∝ ticks/s émis
+//   teinte    ∝ drift (cyan neutre → sauge en hausse, rosé en baisse)
+//   feed mort → ligne plate grise   KILL → voile rosé
+const V = { rate: 0, sigma: 0, obi: 0, drift: 0, alive: 0 };
 let flow = 0, t0 = performance.now();
 
-// particules chaos (entrée, gauche) et tresse (sortie, droite)
-const chaos = [];
-const RIB = 5;
-const ribbons = Array.from({ length: RIB }, (_, i) => ({
+const HARM = 4; // harmoniques superposées (fines) qui composent l'onde
+const harms = Array.from({ length: HARM }, (_, i) => ({
+  f: 1.5 + i * 1.15 + Math.random() * 0.4, // fréquence spatiale
+  sp: 1 + i * 0.35,                         // vitesse relative
+  w: 1 - i * 0.16,                          // poids dans l'amplitude
   seed: Math.random() * 9,
-  f: 1.6 + Math.random() * 2.2,
-  off: (i - (RIB - 1) / 2) / ((RIB - 1) / 2),
 }));
 const packets = [];
 
-function braidY(xn, rb, amp) {
-  // xn ∈ 0..1 entre le cœur et le bord droit ; la tresse naît serrée et s'ouvre
-  const open = Math.sin(Math.PI * Math.min(1, xn * 1.06)) ** 0.8;
-  const wave = Math.sin(xn * Math.PI * 2 * rb.f - flow * 2 + rb.seed);
-  return CY + open * (wave * amp * 0.5 + rb.off * amp * 0.75);
+function waveY(xn, amp, ph) {
+  // enveloppe symétrique : l'onde naît et meurt aux bords, ample au CENTRE
+  const env = Math.sin(Math.PI * xn) ** 1.4;
+  let y = 0;
+  for (const h of harms) y += Math.sin(xn * Math.PI * 2 * h.f - ph * h.sp + h.seed) * h.w;
+  return CY + env * y * amp * 0.42;
 }
 
 function frame(now) {
@@ -117,97 +121,73 @@ function frame(now) {
   V.drift += (S.drift - V.drift) * k;
   V.alive += ((S.connected && S.rate > 0.5 ? 1 : 0) - V.alive) * k;
   const alive = V.alive;
-  flow += dt * (0.35 + Math.min(1.2, V.rate / 10)) * (0.15 + alive);
+  flow += dt * (0.5 + Math.min(1.6, V.rate / 8)) * (0.15 + alive);
 
   const dir = Math.tanh(V.drift * 6000);
-  const hue = dir >= 0 ? 190 - dir * 35 : 190 + dir * 186; // cyan→vert / cyan→rouge
-  const amp = alive * H * 0.07 * (0.5 + Math.min(1.2, V.sigma) + Math.abs(V.obi) * 0.3) + (1 - alive) * 2;
+  const hue = dir >= 0 ? 190 - dir * 35 : 190 + dir * 186;
+  const amp = alive * H * 0.11 * (0.5 + Math.min(1.2, V.sigma) + Math.abs(V.obi) * 0.3) + (1 - alive) * 2;
 
-  // sillage persistant
+  // sillage soyeux
   cx.globalCompositeOperation = 'source-over';
-  cx.fillStyle = 'rgba(7,9,13,0.22)';
+  cx.fillStyle = 'rgba(7,9,13,0.20)';
   cx.fillRect(0, 0, W, H);
   cx.globalCompositeOperation = 'lighter';
 
-  // ── ① CHAOS ENTRANT (gauche → cœur) : bruit de marché ──
-  if (alive > 0.3 && Math.random() < 0.22 + V.sigma * 0.5) {
-    chaos.push({
-      x: -5, y: CY + (Math.random() - 0.5) * H * 0.7,
-      vx: 1.4 + Math.random() * 1.8, vy: (Math.random() - 0.5) * 1.6,
-      j: 0.4 + Math.random() * 1.2, // nervosité
-    });
-  }
-  for (let i = chaos.length - 1; i >= 0; i--) {
-    const p = chaos[i];
-    // attiré par le cœur, avec du jitter (c'est du bruit)
-    const dx = CX - p.x, dy = CY - p.y;
-    const dist = Math.hypot(dx, dy) + 1;
-    p.vx += (dx / dist) * 0.10 * (1 + 200 / dist);
-    p.vy += (dy / dist) * 0.10 * (1 + 200 / dist) + (Math.random() - 0.5) * p.j * (0.5 + V.sigma);
-    p.x += p.vx; p.y += p.vy;
-    if (dist < 30 || p.x > CX) { chaos.splice(i, 1); continue; }
-    const a = Math.min(0.3, 30 / dist + 0.07) * alive;
-    cx.fillStyle = `hsla(215,18%,72%,${a})`;
-    cx.fillRect(p.x, p.y, 1.8, 1.8);
-  }
+  const mL = W * 0.06, mR = W * 0.06; // marges symétriques
+  const span = W - mL - mR;
+  const steps = 160;
 
-  // ── ② LE CŒUR (centre) : pulse au rythme d'émission ──
-  const pulse = 1 + 0.09 * Math.sin(now / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
-  const R = (24 + amp * 0.12) * pulse;
-  const core = alive > 0.5 ? `${hue},52%,68%` : '215,8%,42%';
-  const g1 = cx.createRadialGradient(CX, CY, 1, CX, CY, R * 4.2);
-  g1.addColorStop(0, `hsla(${core},0.75)`);
-  g1.addColorStop(0.25, `hsla(${core},0.16)`);
-  g1.addColorStop(1, 'hsla(0,0%,0%,0)');
-  cx.fillStyle = g1;
-  cx.beginPath(); cx.arc(CX, CY, R * 4.2, 0, 7); cx.fill();
-  // anneau de traitement qui tourne
-  cx.strokeStyle = `hsla(${core},${0.28 * alive})`;
+  // ligne médiane, à peine là (l'axe du signal)
+  cx.strokeStyle = 'rgba(255,255,255,0.045)';
   cx.lineWidth = 1;
-  cx.beginPath();
-  cx.arc(CX, CY, R * 1.7, flow * 0.9, flow * 0.9 + 4.2);
-  cx.stroke();
+  cx.beginPath(); cx.moveTo(mL, CY); cx.lineTo(W - mR, CY); cx.stroke();
 
-  // ── ③ TRESSE SORTANTE (cœur → droite) : le signal mis en forme ──
-  const steps = 70;
-  for (const rb of ribbons) {
+  // l'onde : 3 passes du même tracé (halo large → cœur fin) pour un glow doux
+  const passes = [
+    { lw: 7, a: 0.05 },
+    { lw: 2.6, a: 0.14 },
+    { lw: 1.1, a: 0.5 },
+  ];
+  for (const pass of passes) {
     cx.beginPath();
-    for (let s = 0; s <= steps; s++) {
-      const xn = s / steps;
-      const x = CX + xn * (W - CX);
-      const y = braidY(xn, rb, amp);
-      s === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
+    for (let i = 0; i <= steps; i++) {
+      const xn = i / steps;
+      const x = mL + xn * span;
+      const y = waveY(xn, amp, flow * 2);
+      i === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
     }
-    const a = alive * 0.13 + 0.015;
-    const grad = cx.createLinearGradient(CX, 0, W, 0);
-    grad.addColorStop(0, `hsla(${hue},55%,66%,${a})`);
-    grad.addColorStop(1, `hsla(255,45%,72%,${a * 1.2})`);
-    cx.strokeStyle = grad;
-    cx.lineWidth = 0.9 + alive * 0.6;
+    const sat = 30 + alive * 25;
+    cx.strokeStyle = `hsla(${hue},${sat}%,70%,${pass.a * (0.25 + alive * 0.75)})`;
+    cx.lineWidth = pass.lw;
     cx.stroke();
   }
-  // paquets UDP qui filent vers Dublin
-  if (alive > 0.4 && Math.random() < 0.16 + V.rate / 40) {
-    packets.push({ xn: 0.01, rb: ribbons[(Math.random() * RIB) | 0], sp: 0.24 + Math.random() * 0.14 + V.rate / 70 });
+  // onde miroir, fantôme (profondeur, symétrie verticale)
+  cx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const xn = i / steps;
+    const x = mL + xn * span;
+    const y = 2 * CY - waveY(xn, amp * 0.8, flow * 2 + 1.3);
+    i === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
+  }
+  cx.strokeStyle = `hsla(${hue},30%,70%,${0.06 * (0.3 + alive)})`;
+  cx.lineWidth = 1;
+  cx.stroke();
+
+  // paquets de données qui parcourent l'onde vers la droite (Dublin)
+  if (alive > 0.4 && Math.random() < 0.12 + V.rate / 45) {
+    packets.push({ xn: 0, sp: 0.10 + Math.random() * 0.06 + V.rate / 120 });
   }
   for (let i = packets.length - 1; i >= 0; i--) {
     const p = packets[i];
-    p.xn += p.sp * dt * (1 + p.xn);
+    p.xn += p.sp * dt * 1.6;
     if (p.xn >= 1) { packets.splice(i, 1); continue; }
-    const x = CX + p.xn * (W - CX);
-    const y = braidY(p.xn, p.rb, amp);
-    cx.fillStyle = `hsla(${hue},60%,80%,${0.65 * alive})`;
-    cx.beginPath(); cx.arc(x, y, 1.8 + p.xn * 1.6, 0, 7); cx.fill();
+    const x = mL + p.xn * span;
+    const y = waveY(p.xn, amp, flow * 2);
+    cx.fillStyle = `hsla(${hue},55%,82%,${0.7 * alive * Math.sin(Math.PI * p.xn)})`;
+    cx.beginPath(); cx.arc(x, y, 1.7, 0, 7); cx.fill();
   }
-  // halo Dublin (bord droit) qui bat en écho
-  const echo = 1 + 0.09 * Math.sin((now - 480) / 1000 * Math.PI * Math.max(1, Math.min(7, V.rate / 1.6))) * alive;
-  const g2 = cx.createRadialGradient(W - 6, CY, 1, W - 6, CY, 110 * echo);
-  g2.addColorStop(0, `hsla(255,45%,72%,${0.3 * alive})`);
-  g2.addColorStop(1, 'hsla(0,0%,0%,0)');
-  cx.fillStyle = g2;
-  cx.fillRect(W - 220, CY - 220, 220, 440);
 
-  // KILL : voile rouge
+  // KILL : voile rosé
   if (shock > 0) {
     cx.globalCompositeOperation = 'source-over';
     cx.fillStyle = `rgba(217,120,120,${shock * 0.12})`;
