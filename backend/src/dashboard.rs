@@ -15,6 +15,8 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 const INDEX_HTML: &str = include_str!("../../frontend/index.html");
+const RADAR_HTML: &str = include_str!("../../frontend/radar.html");
+const RADAR_JS: &str = include_str!("../../frontend/radar.js");
 const STYLE_CSS: &str = include_str!("../../frontend/style.css");
 const APP_JS: &str = include_str!("../../frontend/app.js");
 
@@ -22,6 +24,9 @@ const APP_JS: &str = include_str!("../../frontend/app.js");
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardState {
     pub dry_run: bool,
+    pub role: String, // "radar" | "executor" — sélectionne l'interface servie sur /
+    pub seq: u64,     // dernier seq de tick émis (radar)
+    pub radar_log: Vec<(String, String)>, // (heure, événement) — ring 40 entrées
     // Radar
     pub binance_connected: bool,
     pub btc_micro: f64,
@@ -177,11 +182,22 @@ fn tail_json(path: &str, max: usize) -> String {
 
 pub type Shared = Arc<RwLock<DashboardState>>;
 
-pub fn shared(dry_run: bool) -> Shared {
+pub fn shared(dry_run: bool, role: &str) -> Shared {
     Arc::new(RwLock::new(DashboardState {
         dry_run,
+        role: role.into(),
         ..Default::default()
     }))
+}
+
+/// Journal d'événements radar (ring 40) — affiché en bas à droite de l'UI Tokyo.
+pub fn radar_log(d: &mut DashboardState, msg: impl Into<String>) {
+    let t = chrono::Utc::now().format("%H:%M:%S").to_string();
+    d.radar_log.push((t, msg.into()));
+    let n = d.radar_log.len();
+    if n > 40 {
+        d.radar_log.drain(0..n - 40);
+    }
 }
 
 /// Lance le serveur HTTP de monitoring (boucle infinie).
@@ -213,9 +229,14 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 .unwrap_or("/");
 
             let (ctype, body) = match path {
-                "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML.to_string()),
+                "/" | "/index.html" => {
+                    // Le rôle choisit l'interface : Tokyo a la sienne.
+                    let radar = state.read().await.role == "radar";
+                    ("text/html; charset=utf-8", if radar { RADAR_HTML.to_string() } else { INDEX_HTML.to_string() })
+                }
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
                 "/app.js" => ("application/javascript; charset=utf-8", APP_JS.to_string()),
+                "/radar.js" => ("application/javascript; charset=utf-8", RADAR_JS.to_string()),
                 "/state" => {
                     let s = state.read().await;
                     (
@@ -235,6 +256,7 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 || path == "/index.html"
                 || path == "/style.css"
                 || path == "/app.js"
+                || path == "/radar.js"
             {
                 "200 OK"
             } else {

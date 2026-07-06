@@ -39,7 +39,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?cfg.role, dry_run = cfg.dry_run, "Démarrage polymarket_mm_bot");
 
     // État partagé + serveur de monitoring local.
-    let shared = dashboard::shared(cfg.dry_run);
+    let role_str = match (env::var("BOT_ROLE").map(|r| r.eq_ignore_ascii_case("combined")).unwrap_or(false), cfg.role) {
+        (true, _) => "executor", // combined : UI bot
+        (_, config::BotRole::Radar) => "radar",
+        _ => "executor",
+    };
+    let shared = dashboard::shared(cfg.dry_run, role_str);
     {
         let (port, st) = (cfg.dashboard_port, shared.clone());
         tokio::spawn(async move {

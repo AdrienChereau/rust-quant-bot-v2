@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TOKYO — Radar</title>
+<style>
+:root{--bg:#05070c;--txt:#dfe6ee;--mut:#5c6878;--cy:#33e0ff;--vi:#8b7cf7;--gr:#3ddc84;--rd:#ff5252;}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--txt);font-family:ui-monospace,'SF Mono',Menlo,monospace;overflow:hidden}
+#scene{position:fixed;inset:0;display:block}
+.hud{position:fixed;z-index:2;pointer-events:none}
+/* titre */
+#title{top:22px;left:26px}
+#title .t1{font-size:20px;letter-spacing:.35em;color:var(--cy);text-shadow:0 0 18px rgba(51,224,255,.55)}
+#title .t2{font-size:10px;letter-spacing:.22em;color:var(--mut);margin-top:6px}
+#status{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--rd);margin-right:7px;vertical-align:1px}
+#status.on{background:var(--gr);box-shadow:0 0 10px var(--gr)}
+/* prix */
+#price{top:22px;right:26px;text-align:right}
+#price .p{font-size:34px;font-weight:600;color:var(--txt);text-shadow:0 0 24px rgba(51,224,255,.25)}
+#price .l{font-size:10px;letter-spacing:.25em;color:var(--mut);margin-top:4px}
+/* métriques gauche */
+#metrics{left:26px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:18px}
+.m .k{font-size:9px;letter-spacing:.25em;color:var(--mut)}
+.m .v{font-size:19px;margin-top:3px}
+.m .bar{width:120px;height:3px;background:#141a24;border-radius:2px;margin-top:6px;position:relative;overflow:hidden}
+.m .bar i{position:absolute;top:0;bottom:0;left:50%;background:var(--cy);border-radius:2px;transition:all .4s}
+/* lien Dublin */
+#link{right:26px;top:50%;transform:translateY(-50%);text-align:right}
+#link .k{font-size:9px;letter-spacing:.25em;color:var(--mut)}
+#link .v{font-size:15px;color:var(--vi);margin-top:4px;text-shadow:0 0 14px rgba(139,124,247,.5)}
+#link .s{font-size:10px;color:var(--mut);margin-top:3px}
+/* journal bas droite */
+#logbox{right:0;bottom:0;width:min(560px,46vw);max-height:38vh;padding:14px 18px 16px;
+ background:linear-gradient(160deg,rgba(9,13,20,.55),rgba(9,13,20,.92));
+ border-top:1px solid rgba(51,224,255,.18);border-left:1px solid rgba(51,224,255,.18);
+ border-top-left-radius:12px;backdrop-filter:blur(8px);pointer-events:auto}
+#logbox .k{font-size:9px;letter-spacing:.3em;color:var(--cy);margin-bottom:9px}
+#log{font-size:11.5px;line-height:1.75;overflow:auto;max-height:calc(38vh - 44px)}
+#log .t{color:var(--mut);margin-right:9px}
+#log .kill{color:var(--rd)}#log .ok{color:var(--gr)}#log .warn{color:#ffb454}
+/* footer gauche */
+#foot{left:26px;bottom:18px;font-size:10px;letter-spacing:.18em;color:var(--mut)}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div class="hud" id="title">
+  <div class="t1">TOKYO · RADAR</div>
+  <div class="t2"><span id="status"></span><span id="statustxt">CONNEXION…</span></div>
+</div>
+<div class="hud" id="price">
+  <div class="p" id="px">–</div>
+  <div class="l">BTC · MICRO-PRICE BINANCE</div>
+</div>
+<div class="hud" id="metrics">
+  <div class="m"><div class="k">DRIFT /s</div><div class="v" id="mdrift">–</div><div class="bar"><i id="bdrift"></i></div></div>
+  <div class="m"><div class="k">OBI</div><div class="v" id="mobi">–</div><div class="bar"><i id="bobi"></i></div></div>
+  <div class="m"><div class="k">OFI</div><div class="v" id="mofi">–</div><div class="bar"><i id="bofi"></i></div></div>
+  <div class="m"><div class="k">σ ANNUALISÉE</div><div class="v" id="msigma">–</div></div>
+</div>
+<div class="hud" id="link">
+  <div class="k">LIAISON UDP</div>
+  <div class="v">⟶ DUBLIN :8080</div>
+  <div class="s"><span id="rate">0</span> ticks/s · seq <span id="seq">0</span></div>
+  <div class="s" style="margin-top:10px">KILLS ÉMIS · <span id="kills" style="color:var(--rd)">0</span></div>
+</div>
+<div class="hud" id="logbox">
+  <div class="k">◢ JOURNAL TOKYO</div>
+  <div id="log"></div>
+</div>
+<div class="hud" id="foot">SIGNAL MADE IN TOKYO — DRIFT · OFI · OBI · σ — 10 Hz</div>
+<script src="/radar.js"></script>
+</body>
+</html>

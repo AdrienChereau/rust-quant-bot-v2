@@ -54,6 +54,15 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
     let mut last_kill_ms: u64 = 0;
     let mut log_throttle: u8 = 0;
     let mut kills_emitted: u64 = 0;
+    // Journal d'événements pour l'UI Tokyo (connexions, kills, silences).
+    {
+        let mut d = dash.write().await;
+        crate::dashboard::radar_log(&mut d, "◉ nœud radar démarré — feed Binance en cours de connexion");
+    }
+    let mut was_connected = false;
+    let mut last_micro = 0.0f64;
+    let mut micro_still_since: u64 = 0;
+    let mut stale_warned = false;
 
     loop {
         tick.tick().await;
@@ -97,7 +106,35 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
             tracing::warn!(obi = format!("{:+.3}", obi), "⚡ KILL détecté — émission du signal");
             if let Err(e) = transport.send_signal(crate::types::Signal::Kill).await {
                 tracing::error!(error = %e, "échec d'émission du signal KILL");
+            } else {
+                let mut d = dash.write().await;
+                crate::dashboard::radar_log(&mut d, format!("⚡ KILL émis — OBI {obi:+.2}, carnet en emballement"));
             }
+        }
+
+        // Événements de santé du feed (pour le journal de l'UI).
+        let connected_now = micro > 0.0;
+        if connected_now != was_connected {
+            let mut d = dash.write().await;
+            crate::dashboard::radar_log(&mut d, if connected_now {
+                "✓ feed Binance connecté — émission du signal vers Dublin"
+            } else {
+                "✗ feed Binance perdu — reconnexion en cours"
+            });
+            was_connected = connected_now;
+        }
+        if (micro - last_micro).abs() > f64::EPSILON {
+            last_micro = micro;
+            micro_still_since = now_ms;
+            if stale_warned {
+                stale_warned = false;
+                let mut d = dash.write().await;
+                crate::dashboard::radar_log(&mut d, "✓ spot de nouveau vivant");
+            }
+        } else if !stale_warned && micro > 0.0 && now_ms.saturating_sub(micro_still_since) > 8_000 {
+            stale_warned = true;
+            let mut d = dash.write().await;
+            crate::dashboard::radar_log(&mut d, "⚠ spot figé depuis 8 s — surveillance zombie");
         }
 
         // Mise à jour du dashboard (état radar).
@@ -107,6 +144,10 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
             d.btc_micro = micro;
             d.obi = obi;
             d.kills_emitted = kills_emitted;
+            d.seq = seq;
+            d.drift = drift_eng.per_sec();
+            d.sigma = vol_eng.annualized_sigma();
+            d.ofi = ofi_eng.value_norm();
         }
 
         log_throttle = log_throttle.wrapping_add(1);
