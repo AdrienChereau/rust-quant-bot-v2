@@ -5,17 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TOKYO — Signal</title>
 <style>
-:root{--txt:#e2e8f0;--mut:#6b7890;--cy:#38e1ff;--vi:#8b7cf7;--gr:#3ddc84;--rd:#ff5252;--amb:#ffb454;
---panel:rgba(8,12,20,.66);--edge:rgba(56,225,255,.14);}
+:root{--txt:#c9d1dc;--mut:#5f6a7d;--cy:#8fd4e6;--vi:#a49bdb;--gr:#8ec9a8;--rd:#d99a9a;--amb:#d9bd8f;
+--panel:rgba(13,16,22,.55);--edge:rgba(255,255,255,.055);}
 *{box-sizing:border-box;margin:0}
 html,body{height:100%}
-body{background:#030509;color:var(--txt);font-family:ui-monospace,'SF Mono',Menlo,monospace;overflow:hidden}
+body{background:#07090d;color:var(--txt);overflow:hidden;
+ font-family:-apple-system,'Inter','Segoe UI',sans-serif;font-weight:300;
+ -webkit-font-smoothing:antialiased}
+.num{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-weight:300}
 #scene{position:fixed;inset:0;display:block}
 .panel{position:fixed;z-index:3;background:var(--panel);border:1px solid var(--edge);
- border-radius:12px;padding:13px 16px;backdrop-filter:blur(10px)}
-.k{font-size:8.5px;letter-spacing:.3em;color:var(--mut)}
-.big{font-size:26px;font-weight:300;margin-top:4px}
-.sub{font-size:10px;color:var(--mut);margin-top:3px;line-height:1.5}
+ border-radius:16px;padding:15px 19px;backdrop-filter:blur(14px)}
+.k{font-size:9.5px;letter-spacing:.18em;color:var(--mut);font-weight:400;text-transform:uppercase}
+.big{font-size:27px;font-weight:200;margin-top:6px;letter-spacing:.01em}
+.sub{font-size:10.5px;color:var(--mut);margin-top:5px;line-height:1.55;font-weight:300}
 .tag{display:inline-block;font-size:10px;padding:2px 8px;border-radius:5px;margin-top:5px;letter-spacing:.08em}
 .tag.up{background:rgba(61,220,132,.12);color:var(--gr)}
 .tag.dn{background:rgba(255,82,82,.12);color:var(--rd)}
@@ -26,29 +29,30 @@ body{background:#030509;color:var(--txt);font-family:ui-monospace,'SF Mono',Menl
 #stage-in{left:24px;top:24px;max-width:250px}
 #stage-out{right:24px;top:24px;text-align:right;max-width:270px}
 #title{left:50%;top:22px;transform:translateX(-50%);text-align:center;background:none;border:none;backdrop-filter:none}
-#title .t1{font-size:16px;letter-spacing:.45em;color:var(--cy);text-shadow:0 0 16px rgba(56,225,255,.4)}
-#title .t2{font-size:9px;letter-spacing:.2em;color:var(--mut);margin-top:6px}
+#title .t1{font-size:13px;letter-spacing:.5em;color:var(--cy);font-weight:300}
+#title .t2{font-size:9.5px;letter-spacing:.14em;color:var(--mut);margin-top:7px;font-weight:300}
 #status{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--rd);margin-right:7px;vertical-align:1px}
-#status.on{background:var(--gr);box-shadow:0 0 9px var(--gr)}
+#status.on{background:var(--gr);box-shadow:0 0 6px rgba(142,201,168,.6)}
 
 /* ── étage 2 : lecture du signal (sous le cœur, centré) ── */
 #read{left:50%;bottom:26px;transform:translateX(-50%);display:flex;gap:14px;background:none;border:none;
  backdrop-filter:none;padding:0}
-#read .cell{background:var(--panel);border:1px solid var(--edge);border-radius:12px;padding:12px 18px;
- min-width:150px;text-align:center;backdrop-filter:blur(10px)}
-#read .v{font-size:19px;font-weight:300;margin-top:4px}
+#read .cell{background:var(--panel);border:1px solid var(--edge);border-radius:16px;padding:13px 20px;
+ min-width:152px;text-align:center;backdrop-filter:blur(14px)}
+#read .v{font-size:16.5px;font-weight:300;margin-top:6px;letter-spacing:.02em}
 
 /* ── journal bas droite, permanent ── */
 #logbox{right:24px;bottom:26px;width:min(430px,34vw);max-height:30vh;padding:13px 16px}
 #logbox .k{color:var(--cy)}
-#log{font-size:11px;line-height:1.8;overflow:auto;max-height:calc(30vh - 46px);margin-top:8px}
+#log{font-size:11px;line-height:1.9;overflow:auto;max-height:calc(30vh - 46px);margin-top:9px;
+ font-family:ui-monospace,'SF Mono',Menlo,monospace;font-weight:300}
 #log .t{color:var(--mut);margin-right:8px}
 .kill{color:var(--rd)}.ok{color:var(--gr)}.warn{color:var(--amb)}
 
 /* étiquettes de zone dessinées SOUS la scène */
-.zone{position:fixed;z-index:2;font-size:9px;letter-spacing:.35em;color:var(--mut);pointer-events:none}
+.zone{position:fixed;z-index:2;font-size:9px;letter-spacing:.3em;color:var(--mut);opacity:.55;pointer-events:none;font-weight:300}
 #z-in{left:24px;top:50%;transform:translateY(90px)}
-#z-core{left:50%;top:50%;transform:translate(-50%,110px);text-align:center;color:var(--cy);opacity:.8}
+#z-core{left:50%;top:50%;transform:translate(-50%,110px);text-align:center;color:var(--cy);opacity:.5;line-height:1.9}
 #z-out{right:24px;top:50%;transform:translateY(90px);text-align:right}
 @media(max-height:760px){#read .cell{padding:9px 13px;min-width:128px}}
 </style>
@@ -64,14 +68,14 @@ body{background:#030509;color:var(--txt);font-family:ui-monospace,'SF Mono',Menl
 <!-- ENTRÉE : ce que Tokyo écoute -->
 <div class="panel" id="stage-in">
   <div class="k">① ENTRÉE — MARCHÉ BINANCE</div>
-  <div class="big" id="px">–</div>
+  <div class="big num" id="px">–</div>
   <div class="sub">micro-price BTC, carnet L2 à 10 lectures/s — la matière première du signal</div>
 </div>
 
 <!-- SORTIE : ce que Tokyo envoie -->
 <div class="panel" id="stage-out">
   <div class="k">③ SORTIE — SIGNAL VERS DUBLIN</div>
-  <div class="big"><span id="rate">0</span> <span style="font-size:13px;color:var(--mut)">ticks/s</span></div>
+  <div class="big num"><span id="rate">0</span> <span style="font-size:13px;color:var(--mut)">ticks/s</span></div>
   <div class="sub">paquet UDP 65 octets · n° <span id="seq">0</span><br>
   kills émis (retrait d'urgence des quotes) : <b id="kills" style="color:var(--rd)">0</b></div>
 </div>
