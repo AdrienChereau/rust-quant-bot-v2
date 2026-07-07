@@ -565,19 +565,25 @@ async fn quote_loop(
                     });
                     // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
                     // et jamais plus que le cash réel restant.
-                    let min_sz = m.min_order_size.max(1.0);
-                    // Visibilité : un désir non plaçable doit se DIRE (min size PM / cash).
-                    if let (Some(b), Some(px)) = (want, want_px) {
+                    // Minimums Polymarket : ≥ min_order_size PARTS **ET** ≥ 1$ de
+                    // NOTIONNEL (à 1¢/part, 5 parts = 5¢ → rejeté). On GONFLE la
+                    // taille jusqu'au minimum plutôt que de sauter l'ordre : à bas
+                    // prix, le sur-achat coûte ~1$ et sert l'appariement.
+                    let min_shares = m.min_order_size.max(1.0);
+                    let want_sz = want.zip(want_px).map(|(b, px)| {
+                        b.size.max(min_shares).max((1.0_f64 / px).ceil())
+                    });
+                    if let (Some(sz), Some(px)) = (want_sz, want_px) {
                         let now = chrono::Utc::now().timestamp();
-                        if (b.size < min_sz || px * b.size > lv.cash) && now - last_nosig_log >= 10 {
+                        if px * sz > lv.cash && now - last_nosig_log >= 10 {
                             last_nosig_log = now;
-                            tracing::warn!(side = ?side, size = b.size, min_sz, px,
+                            tracing::warn!(side = ?side, sz, px,
                                 cash = format!("{:.2}", lv.cash),
-                                "bid skippé (taille < min PM ou cash insuffisant) — ajuster SC_MAX_CLIP_USDC/SC_BASE_CLIP");
+                                "bid skippé : notionnel minimal > cash réel disponible");
                         }
                     }
-                    match (want, want_px, &*lrest) {
-                        (Some(b), Some(px), cur) if px >= 0.01 && b.size >= min_sz && px * b.size <= lv.cash => {
+                    match (want_sz, want_px, &*lrest) {
+                        (Some(sz), Some(px), cur) if px >= 0.01 && px * sz <= lv.cash => {
                             let reprice = match cur {
                                 Some(r) => (px - r.price).abs() > tick_sz / 2.0 + 1e-9,
                                 None => true,
@@ -586,7 +592,7 @@ async fn quote_loop(
                                 if let Some(r) = lrest.take() {
                                     lv.cancel(&r.order_id).await;
                                 }
-                                *lrest = lv.place_bid(side == Side::Up, px, b.size).await;
+                                *lrest = lv.place_bid(side == Side::Up, px, sz).await;
                             }
                         }
                         (None, _, Some(r)) => {
@@ -642,8 +648,11 @@ async fn quote_loop(
                     (true, ask_up, ask_up_sz)
                 };
                 if ask > 0.0 && ask <= 0.99 {
-                    let sz = sc.imbalance().abs().min(ask_sz.max(1.0)).floor();
-                    if sz >= 1.0 {
+                    // Assurance : mêmes minimums PM (parts + 1$ de notionnel).
+                    let sz = sc.imbalance().abs().min(ask_sz.max(1.0)).floor()
+                        .max(m.min_order_size.max(1.0))
+                        .max((1.0_f64 / ask).ceil());
+                    if ask * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
                         lv.place_insurance_fak(is_up, ask, sz).await;
                     }
