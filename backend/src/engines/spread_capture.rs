@@ -289,7 +289,13 @@ impl SpreadCaptureEngine {
         directional_max: f64,
         directional_min: f64,
         size_factor: f64,
+        symmetric: bool,
     ) -> Vec<BidQuote> {
+        if symmetric {
+            return self.desired_bids_symmetric(
+                best_bid_up, best_bid_dn, remaining_s, now_s, tick, size_factor,
+            );
+        }
         let c = &self.cfg;
         let mut out = Vec::new();
         if remaining_s < c.min_seconds || size_factor <= 0.0 {
@@ -353,6 +359,82 @@ impl SpreadCaptureEngine {
                 continue;
             }
             out.push(BidQuote { side, price, size, completion: is_completion });
+        }
+        out
+    }
+
+
+    /// MODE SYMÉTRIQUE (la mécanique décrite par l'utilisateur, 7 juil.) :
+    ///   · équilibré → un bid par CÔTÉ à best_bid+tick, avec la GARANTIE
+    ///     arithmétique prix_up + prix_dn ≤ completion_max_pair : si les deux
+    ///     remplissent, la paire est gagnante par construction ;
+    ///   · un côté excédentaire → AUCUN ajout de ce côté ; l'autre côté est la
+    ///     complétion classique (≤ pair_target − coût moyen déjà payé), taille
+    ///     = le déficit — le marché oscille, elle finit par croiser ;
+    ///   · AUCUNE jambe directionnelle : zéro pari sur le drift.
+    pub fn desired_bids_symmetric(
+        &self,
+        best_bid_up: f64,
+        best_bid_dn: f64,
+        remaining_s: i64,
+        now_s: i64,
+        tick: f64,
+        size_factor: f64,
+    ) -> Vec<BidQuote> {
+        let c = &self.cfg;
+        let mut out = Vec::new();
+        if remaining_s < c.min_seconds || size_factor <= 0.0 {
+            return out;
+        }
+        let tick = if tick > 0.0 { tick } else { 0.01 };
+        let pair_target = c.completion_max_pair.min(0.999);
+        for side in [Side::Up, Side::Down] {
+            let (my, other, bb, bb_other) = match side {
+                Side::Up => (self.shares_up, self.shares_dn, best_bid_up, best_bid_dn),
+                Side::Down => (self.shares_dn, self.shares_up, best_bid_dn, best_bid_up),
+            };
+            if bb <= 0.0 || my > other + 1e-9 {
+                continue; // côté excédentaire : on attend d'être apparié
+            }
+            let last = match side {
+                Side::Up => self.last_clip_up,
+                Side::Down => self.last_clip_dn,
+            };
+            if last.map_or(false, |t| now_s - t < c.clip_interval_s) {
+                continue;
+            }
+            let deficit = other - my;
+            let (price_cap, size, completion) = if deficit > 1e-9 {
+                // Complétion : la paire résultante reste ≤ pair_target.
+                let other_avg = self.avg(match side {
+                    Side::Up => Side::Down,
+                    Side::Down => Side::Up,
+                });
+                (
+                    c.completion_max_price.min(pair_target - other_avg),
+                    deficit.min(c.max_clip),
+                    true,
+                )
+            } else {
+                // Équilibré : ouverture SYMÉTRIQUE — l'autre côté est supposé
+                // rempli à SON bb+tick → notre prix ≤ pair_target − (bb_autre+tick).
+                if WINDOW_SECS - remaining_s < c.min_window_age_s {
+                    continue;
+                }
+                (pair_target - (bb_other + tick), c.base_clip, false)
+            };
+            let price = ((bb + tick).min(price_cap) / tick).floor() * tick;
+            if price < 0.01 {
+                continue;
+            }
+            let mut size = size.min(c.max_clip_usdc / price.max(0.01));
+            let capital_room = c.max_capital_per_market - self.deployed();
+            size = size.min((capital_room / price).max(0.0));
+            size = (size * size_factor).floor();
+            if size < 1.0 {
+                continue;
+            }
+            out.push(BidQuote { side, price, size, completion });
         }
         out
     }
@@ -594,10 +676,10 @@ mod tests {
     fn no_directional_without_confirmed_trend() {
         let mut e = eng();
         // tendance non confirmee -> zero directionnel, mais la completion vit.
-        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, None, 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, None, 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.is_empty());
         e.on_fill(Side::Up, 0.60, 12.0, 0);
-        let q = e.desired_bids(0.48, 0.30, 0.60, 200, 100, None, 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.30, 0.60, 200, 100, None, 0.01, 0.90, 0.40, 1.0, false);
         assert_eq!(q.len(), 1);
         assert!(q[0].completion && q[0].side == Side::Down);
     }
@@ -607,8 +689,43 @@ mod tests {
         let e = eng();
         // drift dit Down mais le marche price Down a 33c (< 40c) -> pas de pari
         // sur le couteau qui tombe ; et pas de directionnel Up (tendance Down).
-        let q = e.desired_bids(0.65, 0.33, 0.35, 200, 0, Some(false), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.65, 0.33, 0.35, 200, 0, Some(false), 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.iter().all(|b| b.completion), "{q:?}");
+    }
+
+    // ── MODE SYMÉTRIQUE ──
+    #[test]
+    fn symmetric_balanced_quotes_both_sides_pair_guaranteed() {
+        let e = eng();
+        // marché 60/40 : bb_up 0.58, bb_dn 0.38 → bids 0.59 et 0.39, somme < pair_target
+        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0);
+        assert_eq!(q.len(), 2, "{q:?}");
+        let pu = q.iter().find(|b| b.side == Side::Up).unwrap().price;
+        let pd = q.iter().find(|b| b.side == Side::Down).unwrap().price;
+        assert!(pu + pd <= 0.995 + 1e-9, "paire garantie: {pu}+{pd}");
+        assert!(q.iter().all(|b| !b.completion));
+    }
+
+    #[test]
+    fn symmetric_after_fill_only_completion_on_other_side() {
+        let mut e = eng();
+        e.on_fill(Side::Up, 0.60, 10.0, 0); // fill Up 60c
+        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0);
+        // plus d'ajout Up ; complétion Down ≤ 0.995-0.60 = 0.395 → 0.39
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(q[0].side, Side::Down);
+        assert!(q[0].completion);
+        assert!(q[0].price <= 0.395 + 1e-9, "px={}", q[0].price);
+        assert!((q[0].size - 10.0).abs() < 3.0); // vise le déficit (borné clips)
+    }
+
+    #[test]
+    fn symmetric_tight_market_never_pays_pair_above_target() {
+        let e = eng();
+        // marché serré 50/50 : bb 0.49 des deux côtés → bids capés pour somme ≤ 0.995
+        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0);
+        let sum: f64 = q.iter().map(|b| b.price).sum();
+        assert!(q.len() == 2 && sum <= 0.995 + 1e-9, "{q:?} somme={sum}");
     }
 
     // ── v8 MAKER : desired_bids ──
@@ -616,7 +733,7 @@ mod tests {
     fn maker_directional_on_trend_side_only() {
         let e = eng();
         // tendance Up, fenetre agee, fair large -> bid directionnel Up seulement.
-        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].side, Side::Up);
         assert!(!q[0].completion);
@@ -628,10 +745,10 @@ mod tests {
     fn maker_directional_capped_by_fair_and_absolute() {
         let e = eng();
         // fair 0.50 -> cap 0.46 < bb+tick 0.49 -> bid a 0.46.
-        let q = e.desired_bids(0.48, 0.0, 0.50, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.0, 0.50, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         assert!((q[0].price - 0.46).abs() < 1e-9, "px={}", q[0].price);
         // borne absolue 0.90 meme si fair tres haute.
-        let q = e.desired_bids(0.95, 0.0, 0.99, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.95, 0.0, 0.99, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.is_empty() || q[0].price <= 0.90 + 1e-9);
     }
 
@@ -639,7 +756,7 @@ mod tests {
     fn maker_completion_targets_deficit_and_caps() {
         let mut e = eng();
         e.on_fill(Side::Up, 0.60, 12.0, 0); // long Up -> completion Down
-        let q = e.desired_bids(0.40, 0.30, 0.70, 200, 100, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.40, 0.30, 0.70, 200, 100, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         let comp: Vec<_> = q.iter().filter(|b| b.completion).collect();
         assert_eq!(comp.len(), 1);
         assert_eq!(comp[0].side, Side::Down);
@@ -651,9 +768,9 @@ mod tests {
     #[test]
     fn maker_size_factor_circuit_breaker() {
         let e = eng();
-        let full = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0);
-        let quarter = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.25);
-        let zero = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.0);
+        let full = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false);
+        let quarter = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.25, false);
+        let zero = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.0, false);
         assert!(quarter[0].size <= (full[0].size * 0.25).ceil());
         assert!(zero.is_empty());
     }
@@ -663,10 +780,10 @@ mod tests {
         let mut e = eng();
         e.on_fill(Side::Up, 0.49, 10.0, 100);
         // 5 s apres : cooldown directionnel actif -> pas de bid Up.
-        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 105, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 105, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.iter().all(|b| b.side != Side::Up));
         // 20 s apres : de nouveau quote.
-        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 120, Some(true), 0.01, 0.90, 0.40, 1.0);
+        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 120, Some(true), 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.iter().any(|b| b.side == Side::Up));
     }
 

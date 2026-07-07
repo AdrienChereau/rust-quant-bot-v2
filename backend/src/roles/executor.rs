@@ -562,6 +562,7 @@ async fn quote_loop(
             sc.desired_bids(
                 bb_up, bb_dn, fair_up, m.time_remaining_sec(), now_s, trend_up,
                 m.tick_size, cfg.sc_directional_max, cfg.sc_directional_min, size_factor,
+                cfg.sc_symmetric,
             )
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
