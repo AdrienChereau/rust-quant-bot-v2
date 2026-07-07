@@ -4,4 +4,5 @@
 pub mod auth;
 pub mod engine;
 pub mod orders;
+pub mod relayer;
 pub mod user_ws;

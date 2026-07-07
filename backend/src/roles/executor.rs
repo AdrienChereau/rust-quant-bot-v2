@@ -272,6 +272,14 @@ async fn quote_loop(
                     Some(c) => {
                         let up_won = c >= prev_strike;
                         // Stats de fenêtre capturées AVANT resolve/reset.
+                        #[cfg(feature = "live")]
+                        if let Some(lv) = live.as_mut() {
+                            // REDEEM on-chain des résidus (gagnants + poussière) de la
+                            // fenêtre résolue — le pUSD revient au wallet, le sync cash suit.
+                            if paper.state.up_balance + paper.state.down_balance > 0.5 {
+                                lv.redeem(&prev.condition_id).await;
+                            }
+                        }
                         let rec = WindowResult {
                             start: prev.window_ts,
                             res: if up_won { "Up".into() } else { "Down".into() },
@@ -658,6 +666,24 @@ async fn quote_loop(
                     }
                 }
             }
+            // MERGE on-chain (mêmes règles que le paper : ≥90 s de fenêtre, blocs
+            // ≥ MIN_MERGE_THRESHOLD) — un seul en vol ; à la confirmation, le
+            // miroir merge + le moteur recycle son budget + le cash se resynce.
+            if let Some(pairs_done) = lv.poll_merge_done() {
+                let merged = paper.check_and_merge(0.1); // miroir : crédite les paires
+                sc.on_merge(pairs_done);
+                win_merged += pairs_done;
+                tracing::info!(pairs = pairs_done, mirror = merged, "merge on-chain appliqué au miroir");
+            }
+            let elapsed_l = 300 - m.time_remaining_sec();
+            let mirror_pairs = paper.state.up_balance.min(paper.state.down_balance);
+            if elapsed_l >= 90
+                && mirror_pairs >= cfg.min_merge_threshold
+                && lv.merge_available()
+            {
+                lv.start_merge(mirror_pairs.floor()).await;
+            }
+
             // Cash réel : sync CLOB (≤1×/10 s) + valeur courante vers le dashboard.
             lv.sync_cash(false).await;
             {

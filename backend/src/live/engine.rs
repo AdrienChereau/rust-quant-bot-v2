@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::auth::LiveCredentials;
 use super::orders::{self, OrderArgs, PlaceResult};
+use super::relayer::{RelayerCtx, TxOutcome};
 use super::user_ws::{self, FillEvent};
 
 /// Fill prêt pour la boucle stratégie.
@@ -55,6 +56,9 @@ pub struct LiveCtx {
     /// (plusieurs fills/merges par fenêtre → on doit savoir en quasi temps réel).
     pub cash: f64,
     last_cash_sync_ms: i64,
+    /// Merge/redeem on-chain via le relayer officiel (None = clés absentes → désactivé).
+    relayer: Option<RelayerCtx>,
+    merge_inflight: Option<(f64, tokio::sync::oneshot::Receiver<TxOutcome>)>,
 }
 
 impl LiveCtx {
@@ -66,6 +70,7 @@ impl LiveCtx {
         let (cond_tx, fill_rx) = user_ws::spawn(creds.clone());
         tokio::spawn(orders::run_heartbeats(creds.clone()));
         let cash0 = collateral;
+        let creds2 = creds.clone();
         Ok(Self {
             creds,
             armed,
@@ -78,6 +83,8 @@ impl LiveCtx {
             last_poll_ms: 0,
             cash: cash0,
             last_cash_sync_ms: 0,
+            relayer: RelayerCtx::from_env(&creds2),
+            merge_inflight: None,
         })
     }
 
@@ -117,6 +124,58 @@ impl LiveCtx {
     /// Décrément immédiat à chaque fill BUY (le sync CLOB confirmera derrière).
     pub fn note_fill_cash(&mut self, price: f64, size: f64) {
         self.cash = (self.cash - price * size).max(0.0);
+    }
+
+    pub fn merge_available(&self) -> bool {
+        self.relayer.is_some() && self.merge_inflight.is_none() && self.armed
+    }
+
+    /// Lance un MERGE on-chain de `pairs` paires (un seul en vol à la fois).
+    pub async fn start_merge(&mut self, pairs: f64) {
+        let cond = self.condition_id.clone();
+        if let Some(r) = self.relayer.as_mut() {
+            match r.merge(&cond, pairs).await {
+                Ok(rx) => self.merge_inflight = Some((pairs, rx)),
+                Err(e) => tracing::warn!(error = %e, "merge relayer refusé"),
+            }
+        }
+    }
+
+    /// Merge confirmé ? → renvoie le nombre de paires à créditer au miroir.
+    pub fn poll_merge_done(&mut self) -> Option<f64> {
+        let (pairs, rx) = self.merge_inflight.as_mut()?;
+        match rx.try_recv() {
+            Ok(TxOutcome::Confirmed) => {
+                let p = *pairs;
+                self.merge_inflight = None;
+                self.last_cash_sync_ms = 0; // force le resync du collatéral
+                Some(p)
+            }
+            Ok(TxOutcome::Failed(e)) => {
+                tracing::warn!(error = %e, "merge on-chain échoué (retry possible au tick suivant)");
+                self.merge_inflight = None;
+                None
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(_) => {
+                self.merge_inflight = None;
+                None
+            }
+        }
+    }
+
+    /// REDEEM (fin de fenêtre résolue) : brûle tout le solde de la condition,
+    /// le pUSD revient au wallet (fire-and-forget, le sync cash suit).
+    pub async fn redeem(&mut self, condition_id: &str) {
+        if !self.armed {
+            return;
+        }
+        if let Some(r) = self.relayer.as_mut() {
+            match r.redeem(condition_id).await {
+                Ok(_rx) => self.last_cash_sync_ms = 0,
+                Err(e) => tracing::warn!(error = %e, "redeem relayer refusé"),
+            }
+        }
     }
 
     /// Pose un bid GTC. Renvoie l'ordre restant (ou None en dry-run/échec).
