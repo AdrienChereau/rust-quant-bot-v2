@@ -152,6 +152,8 @@ async fn quote_loop(
     let mut lrest_dn: Option<RestingOrder> = None;
     #[cfg(feature = "live")]
     let mut last_insurance_ms: i64 = 0;
+    #[cfg(feature = "live")]
+    let mut last_place_ms: [i64; 2] = [0, 0]; // anti-churn : ≥4 s entre replaces par côté
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
@@ -252,6 +254,8 @@ async fn quote_loop(
         if need_resolve {
             // Résoudre le marché précédent (Up gagne si close ≥ open de la fenêtre).
             // Close = open de la fenêtre suivante (kline) ; à défaut, dernier spot observé.
+            let now_s_roll = chrono::Utc::now().timestamp();
+            let _ = now_s_roll;
             if let (Some(prev), Some(prev_strike)) = (current.as_ref(), strike) {
                 // Le close OFFICIEL = open de la kline suivante. À :59.8 elle n'existe
                 // pas encore → on RETRY jusqu'à 15 s au lieu de retomber en silence
@@ -274,6 +278,19 @@ async fn quote_loop(
                         // Stats de fenêtre capturées AVANT resolve/reset.
                         #[cfg(feature = "live")]
                         if let Some(lv) = live.as_mut() {
+                            // Récolter les fills des ordres encore restants AVANT de
+                            // les annuler — ils appartiennent à la fenêtre qui se clôt.
+                            for (r, is_up) in [(lrest_up.take(), true), (lrest_dn.take(), false)] {
+                                if let Some(r) = r {
+                                    if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
+                                        let side = if f.is_up { Side::Up } else { Side::Down };
+                                        if paper.try_buy(side.as_str(), f.price, f.size, "maker") {
+                                            sc.on_fill(side, f.price, f.size, now_s_roll);
+                                            lv.note_fill_cash(f.price, f.size);
+                                        }
+                                    }
+                                }
+                            }
                             // REDEEM on-chain des résidus (gagnants + poussière) de la
                             // fenêtre résolue — le pUSD revient au wallet, le sync cash suit.
                             if paper.state.up_balance + paper.state.down_balance > 0.5 {
@@ -552,6 +569,7 @@ async fn quote_loop(
         // ═══ CHEMIN LIVE : reconcile GTC réels + fills réels ═══
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
+            let mut harvested: Vec<crate::live::engine::LiveFill> = Vec::new();
             // KILL/pause → tout annuler.
             if paused || sleeping || !enabled {
                 if lrest_up.is_some() || lrest_dn.is_some() {
@@ -590,30 +608,44 @@ async fn quote_loop(
                                 "bid skippé : notionnel minimal > cash réel disponible");
                         }
                     }
+                    let side_ix = if side == Side::Up { 0 } else { 1 };
                     match (want_sz, want_px, &*lrest) {
                         (Some(sz), Some(px), cur) if px >= 0.01 && px * sz <= lv.cash => {
+                            // ANTI-CHURN (leçon du 7 juil. : replace toutes les 1-3 s =
+                            // chasse le prix + fills partiels éparpillés) : reprice
+                            // seulement si l'écart dépasse 2 ticks ET ≥4 s depuis le
+                            // dernier placement de ce côté.
                             let reprice = match cur {
-                                Some(r) => (px - r.price).abs() > tick_sz / 2.0 + 1e-9,
-                                None => true,
+                                Some(r) => {
+                                    (px - r.price).abs() > 2.0 * tick_sz + 1e-9
+                                        && now_ms_books as i64 - last_place_ms[side_ix] >= 4_000
+                                }
+                                None => now_ms_books as i64 - last_place_ms[side_ix] >= 4_000,
                             };
                             if reprice {
                                 if let Some(r) = lrest.take() {
-                                    lv.cancel(&r.order_id).await;
+                                    if let Some(f) = lv.harvest_and_cancel(&r, side == Side::Up).await {
+                                        harvested.push(f);
+                                    }
                                 }
                                 *lrest = lv.place_bid(side == Side::Up, px, sz).await;
+                                last_place_ms[side_ix] = now_ms_books as i64;
                             }
                         }
                         (None, _, Some(r)) => {
-                            let id = r.order_id.clone();
-                            lv.cancel(&id).await;
+                            let r2 = r.clone();
+                            if let Some(f) = lv.harvest_and_cancel(&r2, side == Side::Up).await {
+                                harvested.push(f);
+                            }
                             *lrest = None;
                         }
                         _ => {}
                     }
                 }
             }
-            // Fills réels : WS (rapide) + poll de réconciliation (autorité).
+            // Fills réels : WS (rapide) + récoltes pré-annulation + poll (autorité).
             let mut fills = lv.drain_ws_fills();
+            fills.append(&mut harvested);
             for f in &fills {
                 LiveCtx::note_ws_fill(&mut lrest_up, &mut lrest_dn, f);
             }

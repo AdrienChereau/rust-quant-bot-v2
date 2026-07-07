@@ -226,6 +226,34 @@ impl LiveCtx {
         }
     }
 
+    /// TROU CRITIQUE corrigé (7 juil. : −21$ invisibles) : avant d'annuler un
+    /// ordre (reprice/retrait/rollover), on RÉCOLTE son size_matched — tout
+    /// fill partiel survenu pendant sa vie est comptabilisé, plus jamais perdu.
+    pub async fn harvest_and_cancel(&mut self, r: &RestingOrder, is_up: bool) -> Option<LiveFill> {
+        let mut fill = None;
+        if self.armed {
+            match super::auth::l2_request(
+                &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
+            ).await {
+                Ok(text) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    let v = v.get("data").cloned().unwrap_or(v);
+                    let matched: f64 = v.get("size_matched")
+                        .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    if matched > r.matched + 1e-9 {
+                        let delta = matched - r.matched;
+                        tracing::info!(order_id = %r.order_id, delta, "fill récolté à l'annulation");
+                        fill = Some(LiveFill { is_up, price: r.price, size: delta, maker: true });
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "récolte pré-annulation échouée"),
+            }
+            let _ = orders::cancel_order(&self.creds, &r.order_id).await;
+        }
+        fill
+    }
+
     pub async fn cancel_all(&self) {
         if self.armed && !self.condition_id.is_empty() {
             let _ = orders::cancel_market_orders(&self.creds, &self.condition_id).await;
@@ -237,12 +265,10 @@ impl LiveCtx {
     pub fn drain_ws_fills(&mut self) -> Vec<LiveFill> {
         let mut out = Vec::new();
         while let Ok(f) = self.fill_rx.try_recv() {
-            let side = self.order_side.get(&f.order_id).copied().or_else(|| {
-                // Attribution de secours par asset_id (ordre posé avant un restart).
-                if f.asset_id == self.up_token { Some((true, true)) }
-                else if f.asset_id == self.dn_token { Some((false, true)) }
-                else { None }
-            });
+            // Attribution STRICTE par order_id connu : l'event trade contient aussi
+            // l'ordre du taker ADVERSE sur notre asset — un fallback par asset_id
+            // compterait son fill comme le nôtre (double comptage).
+            let side = self.order_side.get(&f.order_id).copied();
             match side {
                 Some((is_up, maker)) if !f.is_sell => {
                     out.push(LiveFill { is_up, price: f.price, size: f.size, maker })

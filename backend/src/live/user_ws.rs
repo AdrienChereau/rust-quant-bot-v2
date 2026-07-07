@@ -128,6 +128,9 @@ async fn subscribe(
 }
 
 fn process_message(txt: &str, fill_tx: &mpsc::UnboundedSender<FillEvent>) {
+    // Diagnostic (validation live) : trace brute de TOUT ce que le canal envoie
+    // — c'est notre seul moyen de vérifier le schéma réel des events maker.
+    tracing::info!(raw = %txt.chars().take(400).collect::<String>(), "user_ws event");
     let events = parse_events::<UserEvent>(txt);
     for ev in events {
         if ev.event_type.as_deref() != Some("trade") {
