@@ -58,7 +58,8 @@ pub struct RelayerCtx {
     creds: LiveCredentials,
     api_key: String,
     api_key_address: String,
-    approval_done: bool, // setApprovalForAll préfixé au premier batch seulement
+    #[allow(dead_code)]
+    approval_done: bool, // (historique — l'approbation est désormais dans chaque batch)
 }
 
 #[derive(Debug)]
@@ -144,9 +145,11 @@ impl RelayerCtx {
         }
         .ok_or_else(|| anyhow::anyhow!("nonce absent: {nonce_txt}"))?;
 
-        // 2. batch : approbation unique de l'adaptateur + l'opération
+        // 2. batch : l'approbation de l'adaptateur est incluse dans CHAQUE batch
+        // (idempotente, gasless — le 7 juil., l'approbation « une fois » liée à un
+        // premier batch jamais miné a fait reverter tous les merges suivants).
         let mut calls = Vec::new();
-        if !self.approval_done {
+        {
             calls.push(Call {
                 target: addr(CTF)?,
                 value: U256::ZERO,
@@ -215,7 +218,6 @@ impl RelayerCtx {
             .to_string();
         tracing::info!(op, tx_id = %tx_id, condition = %condition_id.chars().take(12).collect::<String>(),
             "transaction relayer soumise");
-        self.approval_done = true;
 
         // 4. suivi de confirmation (task détachée, résultat par oneshot)
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -224,6 +226,7 @@ impl RelayerCtx {
         let op = op.to_string();
         tokio::spawn(async move {
             let mut last_state = String::new();
+            let mut first_poll = true;
             for _ in 0..75 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let url = format!("{RELAYER_BASE}/transaction/{tx_id}");
@@ -236,7 +239,14 @@ impl RelayerCtx {
                 else {
                     continue;
                 };
+                let http_status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
+                if first_poll || !http_status.is_success() {
+                    first_poll = false;
+                    tracing::info!(op = %op, %http_status,
+                        raw = %text.chars().take(300).collect::<String>(),
+                        "suivi relayer — réponse brute");
+                }
                 let state = serde_json::from_str::<serde_json::Value>(&text)
                     .ok()
                     .and_then(|v| {

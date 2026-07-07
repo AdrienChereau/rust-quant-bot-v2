@@ -176,6 +176,21 @@ pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f
     Ok(base / BASE_UNITS)
 }
 
+/// Solde CONDITIONAL RÉEL d'un token (parts on-chain, cache rafraîchi d'abord).
+/// C'est la VÉRITÉ des positions — le miroir doit s'y aligner (incident du
+/// 7 juil. : miroir équilibré, réalité déséquilibrée → aucune complétion).
+pub async fn get_conditional_balance(creds: &LiveCredentials, token_id: &str) -> anyhow::Result<f64> {
+    let q = format!("asset_type=CONDITIONAL&token_id={token_id}&signature_type={}", creds.sig_type);
+    let _ = l2_request(creds, "GET", "/balance-allowance/update", Some(&q), "").await;
+    let text = l2_request(creds, "GET", "/balance-allowance", Some(&q), "").await?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("balance JSON '{text}': {e}"))?;
+    let raw = v.get("balance").and_then(|b| b.as_str())
+        .ok_or_else(|| anyhow::anyhow!("champ 'balance' absent: {text}"))?;
+    let base: f64 = raw.parse().map_err(|e| anyhow::anyhow!("balance '{raw}': {e}"))?;
+    Ok(base / BASE_UNITS)
+}
+
 /// Rafraîchit le cache on-chain CLOB. `asset_type` = COLLATERAL (boot, sig_type 3)
 /// ou CONDITIONAL + token_id (obligatoire avant SELL/merge après un BUY — leçon mémoire).
 pub async fn sync_balance_allowance(

@@ -68,6 +68,8 @@ pub struct LiveCtx {
     relayer: Option<RelayerCtx>,
     merge_inflight: Option<(f64, tokio::sync::oneshot::Receiver<TxOutcome>)>,
     last_merge_attempt_ms: i64, // cooldown anti-spam (429 Cloudflare du 7 juil.)
+    last_pos_sync_ms: i64,
+    pub positions_dirty: bool, // merge/redeem incertain → resync des positions
 }
 
 impl LiveCtx {
@@ -95,6 +97,8 @@ impl LiveCtx {
             relayer: RelayerCtx::from_env(&creds2),
             merge_inflight: None,
             last_merge_attempt_ms: 0,
+            last_pos_sync_ms: 0,
+            positions_dirty: false,
         })
     }
 
@@ -147,6 +151,29 @@ impl LiveCtx {
     /// Force la resynchronisation du collatéral au prochain tick.
     pub fn force_cash_resync(&mut self) {
         self.last_cash_sync_ms = 0;
+        self.positions_dirty = true;
+    }
+
+    /// Positions RÉELLES (up, down) en parts, depuis le CLOB (vérité on-chain).
+    /// None si pas dû (≥60 s depuis le dernier sync, sauf `positions_dirty`).
+    pub async fn real_positions(&mut self, now_ms: i64) -> Option<(f64, f64)> {
+        if !self.positions_dirty && now_ms - self.last_pos_sync_ms < 60_000 {
+            return None;
+        }
+        if self.up_token.is_empty() {
+            return None;
+        }
+        self.last_pos_sync_ms = now_ms;
+        self.positions_dirty = false;
+        let up = super::auth::get_conditional_balance(&self.creds, &self.up_token).await;
+        let dn = super::auth::get_conditional_balance(&self.creds, &self.dn_token).await;
+        match (up, dn) {
+            (Ok(u), Ok(d)) => Some((u, d)),
+            (u, d) => {
+                tracing::warn!(?u, ?d, "sync positions réelles échoué");
+                None
+            }
+        }
     }
 
     /// Lance un MERGE on-chain de `pairs` paires (un seul en vol, cooldown 45 s).
@@ -182,11 +209,13 @@ impl LiveCtx {
                 let p = *pairs;
                 self.merge_inflight = None;
                 self.last_cash_sync_ms = 0; // force le resync du collatéral
+                self.positions_dirty = true;
                 Some(p)
             }
             Ok(TxOutcome::Failed(e)) => {
-                tracing::warn!(error = %e, "merge on-chain échoué (retry possible au tick suivant)");
+                tracing::warn!(error = %e, "merge on-chain échoué — resync des positions réelles");
                 self.merge_inflight = None;
+                self.positions_dirty = true; // la vérité tranchera (mergé ou pas)
                 None
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,

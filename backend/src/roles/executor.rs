@@ -731,6 +731,25 @@ async fn quote_loop(
                 }
             }
 
+            // POSITIONS RÉELLES : le miroir s'aligne sur la vérité on-chain
+            // (≤1×/60 s, ou immédiatement après un merge/redeem incertain).
+            // Incident du 7 juil. : miroir « équilibré » ≠ réalité déséquilibrée
+            // → aucune complétion pendant que la vraie jambe mourait.
+            if let Some((ru, rd)) = lv.real_positions(now_ms_books as i64).await {
+                let (mu, md) = (paper.state.up_balance, paper.state.down_balance);
+                if (ru - mu).abs() > 0.5 || (rd - md).abs() > 0.5 {
+                    tracing::warn!(
+                        reel_up = ru, reel_dn = rd, miroir_up = mu, miroir_dn = md,
+                        "positions désynchronisées — miroir ALIGNÉ sur la réalité"
+                    );
+                    paper.state.up_balance = ru;
+                    paper.state.down_balance = rd;
+                    // le moteur suit aussi (imbalance/complétion sur la vérité)
+                    sc.shares_up = ru;
+                    sc.shares_dn = rd;
+                }
+            }
+
             // Cash réel : sync CLOB (≤1×/10 s) + valeur courante vers le dashboard.
             lv.sync_cash(false).await;
             {
