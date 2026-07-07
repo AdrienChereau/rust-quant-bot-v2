@@ -152,6 +152,7 @@ async fn quote_loop(
     let mut lrest_dn: Option<RestingOrder> = None;
     #[cfg(feature = "live")]
     let mut last_insurance_ms: i64 = 0;
+    let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
     let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
@@ -375,7 +376,24 @@ async fn quote_loop(
         let t_years = pricing::years_from_secs(t_secs);
         let (spot, sigma, drift_ps, obi, ofi) = if cfg.use_udp_transport {
             let snap = *remote_rx.borrow();
-            let Some((t, recv_ms)) = snap else { continue };
+            let Some((t, recv_ms)) = snap else {
+                // JAMAIS rien reçu : dire pourquoi le bot ne fait rien (le cas
+                // « reçu puis coupé » est couvert plus bas par PÉRIMÉ).
+                let now = chrono::Utc::now().timestamp();
+                if now - last_nosig_log >= 10 {
+                    last_nosig_log = now;
+                    tracing::warn!(
+                        ecoute = %cfg.signal_addr,
+                        "AUCUN tick Tokyo reçu — vérifier SIGNAL_TARGET(2) du radar + son restart + le chemin UDP"
+                    );
+                    let mut d = dash.write().await;
+                    d.last_block_reason = "SIGNAL TOKYO ABSENT (UDP muet)".into();
+                    d.market_slug = m.slug.clone();
+                    d.remaining_s = m.time_remaining_sec();
+                    d.cash = paper.state.cash_usdc;
+                }
+                continue;
+            };
             let age_ms = chrono::Utc::now().timestamp_millis() - recv_ms;
             if age_ms > 3_000 {
                 // le radar émet à 10 Hz : 3 s de silence = liaison morte
@@ -721,6 +739,9 @@ async fn quote_loop(
             d.down_bid = buy_cap_dn;
             d.down_ask = ask_dn;
             d.in_band = rest_up.is_some() || rest_dn.is_some();
+            if d.last_block_reason.starts_with("SIGNAL TOKYO") {
+                d.last_block_reason.clear();
+            }
             d.rebate_window = win_rebate;
             d.rebate_total = rebate_total + win_rebate;
             d.size_factor = size_factor;
