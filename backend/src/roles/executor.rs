@@ -153,6 +153,8 @@ async fn quote_loop(
     #[cfg(feature = "live")]
     let mut last_insurance_ms: i64 = 0;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
+    #[cfg(feature = "live")]
+    let mut last_collat_poll: i64 = 0;
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
     let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
@@ -616,6 +618,13 @@ async fn quote_loop(
                         last_insurance_ms = now_ms_books as i64;
                         lv.place_insurance_fak(is_up, ask, sz).await;
                     }
+                }
+            }
+            // Collatéral réel du wallet → tuile cash du dashboard (~60 s).
+            if now_s - last_collat_poll >= 60 {
+                last_collat_poll = now_s;
+                if let Ok(c) = crate::live::auth::get_collateral_balance(&lv.creds).await {
+                    dash.write().await.live_collateral = c;
                 }
             }
             // Miroir des bids pour le dashboard.

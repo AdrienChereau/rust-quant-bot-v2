@@ -195,7 +195,7 @@ async function tick() {
   $('ld').textContent = f(s.deployed, 2) + '$';
   $('lr').textContent = f(s.rebate_window, 2) + '$';
   $('lsf').textContent = '×' + f(s.size_factor, 2) + (s.loss_streak ? ` (${s.loss_streak}p)` : '');
-  $('lc').textContent = f(s.cash, 0) + '$';
+  $('lc').textContent = s.dry_run ? f(s.cash, 0) + '$' : f(s.live_collateral || 0, 2) + '$ wallet';
 
   // bilan par jour
   const days = {};

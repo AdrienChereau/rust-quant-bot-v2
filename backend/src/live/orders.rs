@@ -265,5 +265,7 @@ fn decimal_from_f64(v: f64, decimal_places: u32, field: &str) -> anyhow::Result<
         anyhow::bail!("{field} invalide: {v}");
     }
     let d = Decimal::from_f64_retain(v).ok_or_else(|| anyhow::anyhow!("{field} invalide: {v}"))?;
-    Ok(d.round_dp(decimal_places))
+    // normalize() retire les zéros traînants : 0.7300 (scale 4) → 0.73 (scale 2),
+    // sinon le SDK rejette « price decimal places > tick size decimal places ».
+    Ok(d.round_dp(decimal_places).normalize())
 }
