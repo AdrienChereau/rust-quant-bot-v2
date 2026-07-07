@@ -298,6 +298,7 @@ impl LiveCtx {
                     ).await {
                         Ok(text) => {
                             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                            let v = v.get("data").cloned().unwrap_or(v); // enveloppe éventuelle
                             let matched: f64 = v.get("size_matched")
                                 .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
                                 .unwrap_or(0.0);

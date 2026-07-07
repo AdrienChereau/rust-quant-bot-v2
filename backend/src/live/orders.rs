@@ -225,7 +225,18 @@ impl OpenOrder {
 pub async fn open_orders(creds: &LiveCredentials, condition_id: &str) -> anyhow::Result<Vec<OpenOrder>> {
     let q = format!("market={condition_id}");
     let text = l2_request(creds, "GET", "/data/orders", Some(&q), "").await?;
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("orders JSON: {e} — {text}"))
+    // Deux formats observés : tableau nu, ou enveloppe paginée {"data":[...],"next_cursor":...}.
+    if let Ok(v) = serde_json::from_str::<Vec<OpenOrder>>(&text) {
+        return Ok(v);
+    }
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        data: Vec<OpenOrder>,
+    }
+    serde_json::from_str::<Page>(&text)
+        .map(|p| p.data)
+        .map_err(|e| anyhow::anyhow!("orders JSON: {e} — {text}"))
 }
 
 /// Boucle heartbeat (dead-man switch, doc Polymarket) : POST /v1/heartbeats
