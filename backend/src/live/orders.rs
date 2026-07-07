@@ -141,8 +141,8 @@ pub async fn place_order(
     tracing::info!(
         token = %token_id.chars().take(10).collect::<String>(),
         order_type = order_type_log,
-        price = args.price,
-        size = args.size,
+        price = %price,  // le Decimal réellement envoyé (arrondi tick + normalisé)
+        size = %size,
         is_sell = args.is_sell,
         "ordre LIVE signé"
     );
