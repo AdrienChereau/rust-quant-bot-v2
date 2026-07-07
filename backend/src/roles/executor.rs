@@ -12,6 +12,8 @@ use crate::bankroll::BankrollEngine;
 use crate::config::Config;
 use crate::connectors::binance;
 use crate::connectors::pm_ws;
+#[cfg(feature = "live")]
+use crate::live::engine::{LiveCtx, RestingOrder};
 use crate::connectors::polymarket::{Market, PolyBook, PolymarketClient};
 use crate::dashboard::{Shared, SeriesPoint, WindowResult};
 use crate::engines::spread_capture::{Side, SpreadCaptureConfig, SpreadCaptureEngine};
@@ -129,6 +131,27 @@ async fn quote_loop(
     kill: Arc<KillState>,
 ) -> anyhow::Result<()> {
     let client = PolymarketClient::new();
+    // ═══ MODE LIVE (DRY_RUN=false + feature `live`) : ordres réels sur le CLOB.
+    // Mêmes décisions que le paper ; seule l'exécution change. Le PaperEngine
+    // reste le grand livre (miroir alimenté par les fills réels).
+    #[cfg(feature = "live")]
+    let mut live: Option<LiveCtx> = if !cfg.dry_run {
+        let creds = crate::live::auth::LiveCredentials::from_env()
+            .ok_or_else(|| anyhow::anyhow!("DRY_RUN=false mais credentials POLY_* incomplets"))?;
+        Some(LiveCtx::start(creds, cfg.live_armed).await?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "live"))]
+    if !cfg.dry_run {
+        anyhow::bail!("DRY_RUN=false requiert un build `--features live` (rustc ≥ 1.91)");
+    }
+    #[cfg(feature = "live")]
+    let mut lrest_up: Option<RestingOrder> = None;
+    #[cfg(feature = "live")]
+    let mut lrest_dn: Option<RestingOrder> = None;
+    #[cfg(feature = "live")]
+    let mut last_insurance_ms: i64 = 0;
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
     let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
@@ -317,6 +340,12 @@ async fn quote_loop(
                         strike = ?strike, size_factor, loss_streak, "=== Nouveau marché BTC 5min ==="
                     );
                     let _ = pm_tokens.send(vec![m.up_token_id.clone(), m.down_token_id.clone()]);
+                    #[cfg(feature = "live")]
+                    if let Some(lv) = live.as_mut() {
+                        lv.on_new_market(&m.condition_id, &m.up_token_id, &m.down_token_id).await;
+                        lrest_up = None;
+                        lrest_dn = None;
+                    }
                     current = Some(m);
                 }
                 Ok(None) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
@@ -353,6 +382,12 @@ async fn quote_loop(
                 rest_up = None;
                 rest_dn = None;
                 last_spot = None;
+                #[cfg(feature = "live")]
+                if let Some(lv) = live.as_ref() {
+                    lv.cancel_all().await;
+                    lrest_up = None;
+                    lrest_dn = None;
+                }
                 tracing::warn!(age_ms, "signal Tokyo PÉRIMÉ — quotes retirées");
                 continue;
             }
@@ -467,6 +502,107 @@ async fn quote_loop(
             )
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
+
+        // ═══ CHEMIN LIVE : reconcile GTC réels + fills réels ═══
+        #[cfg(feature = "live")]
+        if let Some(lv) = live.as_mut() {
+            // KILL/pause → tout annuler.
+            if paused || sleeping {
+                if lrest_up.is_some() || lrest_dn.is_some() {
+                    lv.cancel_all().await;
+                    lrest_up = None;
+                    lrest_dn = None;
+                }
+            } else {
+                for (lrest, side, ask) in [
+                    (&mut lrest_up, Side::Up, ask_up),
+                    (&mut lrest_dn, Side::Down, ask_dn),
+                ] {
+                    let want = desired.iter().find(|b| b.side == side);
+                    // ANTI-CROSS : un GTC au prix de l'ask deviendrait taker →
+                    // on clampe strictement sous l'ask (préserve le statut maker).
+                    let want_px = want.map(|b| {
+                        let cap = if ask > 0.0 { ask - tick_sz } else { b.price };
+                        ((b.price.min(cap)) / tick_sz).floor() * tick_sz
+                    });
+                    match (want, want_px, &*lrest) {
+                        (Some(b), Some(px), cur) if px >= 0.01 => {
+                            let reprice = match cur {
+                                Some(r) => (px - r.price).abs() > tick_sz / 2.0 + 1e-9,
+                                None => true,
+                            };
+                            if reprice {
+                                if let Some(r) = lrest.take() {
+                                    lv.cancel(&r.order_id).await;
+                                }
+                                *lrest = lv.place_bid(side == Side::Up, px, b.size).await;
+                            }
+                        }
+                        (None, _, Some(r)) => {
+                            let id = r.order_id.clone();
+                            lv.cancel(&id).await;
+                            *lrest = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Fills réels : WS (rapide) + poll de réconciliation (autorité).
+            let mut fills = lv.drain_ws_fills();
+            for f in &fills {
+                LiveCtx::note_ws_fill(&mut lrest_up, &mut lrest_dn, f);
+            }
+            fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
+            for f in fills {
+                let side = if f.is_up { Side::Up } else { Side::Down };
+                let ltype = if f.maker { "maker" } else { "taker" };
+                if paper.try_buy(side.as_str(), f.price, f.size, ltype) {
+                    sc.on_fill(side, f.price, f.size, now_s);
+                    win_fills += 1;
+                    win_deployed += f.price * f.size;
+                    if f.maker {
+                        win_rebate += cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
+                    }
+                    if sc.imbalance().abs() > win_imb_max.abs() {
+                        win_imb_max = sc.imbalance();
+                    }
+                    tracing::info!(
+                        side = side.as_str(),
+                        px = format!("{:.3}", f.price),
+                        size = format!("{:.1}", f.size),
+                        ltype,
+                        imb = format!("{:.0}", sc.imbalance()),
+                        "[LIVE] fill réel"
+                    );
+                }
+            }
+            // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
+            // au plus 1 tentative / 3 s (le fill revient par le WS).
+            let remaining_l = m.time_remaining_sec();
+            if (10..=45).contains(&remaining_l)
+                && sc.imbalance().abs() >= 5.0
+                && now_ms_books as i64 - last_insurance_ms >= 3_000
+            {
+                let (is_up, ask, ask_sz) = if sc.imbalance() > 0.0 {
+                    (false, ask_dn, ask_dn_sz)
+                } else {
+                    (true, ask_up, ask_up_sz)
+                };
+                if ask > 0.0 && ask <= 0.99 {
+                    let sz = sc.imbalance().abs().min(ask_sz.max(1.0)).floor();
+                    if sz >= 1.0 {
+                        last_insurance_ms = now_ms_books as i64;
+                        lv.place_insurance_fak(is_up, ask, sz).await;
+                    }
+                }
+            }
+            // Miroir des bids pour le dashboard.
+            rest_up = lrest_up.as_ref().map(|r| (r.price, r.size));
+            rest_dn = lrest_dn.as_ref().map(|r| (r.price, r.size));
+        }
+
+        let live_mode = !cfg.dry_run;
+        if !live_mode {
         for (side_rest, side) in [(&mut rest_up, Side::Up), (&mut rest_dn, Side::Down)] {
             let want = desired.iter().find(|b| b.side == side);
             match (want, side_rest.as_ref()) {
@@ -509,13 +645,15 @@ async fn quote_loop(
             }
         }
 
+        } // fin du chemin PAPER (simulation cross-fill)
+
         // 2b) COMPLÉTION TAKER de dernier recours : une fenêtre ne doit JAMAIS finir
         // avec un seul côté. Si le bid de complétion maker n'a pas croisé et qu'on
         // approche de la fin, on paie l'ask (prime d'assurance, comme la cible qui
         // complète à −4,3¢ d'edge médian, jusqu'à >1$ la paire). Frais taker inclus,
         // pas de rebate sur ce fill.
         let remaining = m.time_remaining_sec();
-        if (10..=45).contains(&remaining) && sc.imbalance().abs() >= 5.0 {
+        if !live_mode && (10..=45).contains(&remaining) && sc.imbalance().abs() >= 5.0 {
             let (side, ask, ask_sz) = if sc.imbalance() > 0.0 {
                 (Side::Down, ask_dn, ask_dn_sz)
             } else {
@@ -545,7 +683,7 @@ async fn quote_loop(
         // Avant 90 s on n'y touche pas : le livre directionnel reste intact pendant
         // l'accumulation, et le recyclage de budget ne relance pas de churn 50/50
         // précoce. Le seuil de bloc vient de MIN_MERGE_THRESHOLD (30 paires).
-        if 300 - remaining >= 90 {
+        if !live_mode && 300 - remaining >= 90 {
             let cash_before = paper.state.cash_usdc;
             paper.check_and_merge(0.1);
             let merged_now = (paper.state.cash_usdc - cash_before).max(0.0);

@@ -13,6 +13,8 @@ mod dashboard;
 mod engines;
 mod execution;
 mod inventory;
+#[cfg(feature = "live")]
+mod live;
 mod roles;
 mod signal;
 mod types;
@@ -91,8 +93,14 @@ async fn main() -> anyhow::Result<()> {
                 .signal_target
                 .context("SIGNAL_TARGET requis pour le rôle radar (adresse de l'exécuteur)")?;
             let local: std::net::SocketAddr = ([0, 0, 0, 0], 0).into();
-            let transport: Arc<dyn SignalTransport> =
-                Arc::new(UdpSignalTransport::new_connect(local, target).await?);
+            // Fan-out optionnel : SIGNAL_TARGET2 → le radar nourrit paper ET live.
+            let transport: Arc<dyn SignalTransport> = match cfg.signal_target2 {
+                Some(t2) => Arc::new(signal::FanoutTransport::new(vec![
+                    Arc::new(UdpSignalTransport::new_connect(local, target).await?),
+                    Arc::new(UdpSignalTransport::new_connect(([0, 0, 0, 0], 0).into(), t2).await?),
+                ])),
+                None => Arc::new(UdpSignalTransport::new_connect(local, target).await?),
+            };
             roles::radar::run(cfg, transport, shared).await
         }
         BotRole::Executor => {

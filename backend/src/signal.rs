@@ -49,6 +49,37 @@ impl SignalTransport for LoopbackTransport {
     }
 }
 
+// ───── Fan-out : un radar, plusieurs exécuteurs (paper + live) ─────
+pub struct FanoutTransport {
+    targets: Vec<std::sync::Arc<dyn SignalTransport>>,
+}
+
+impl FanoutTransport {
+    pub fn new(targets: Vec<std::sync::Arc<dyn SignalTransport>>) -> Self {
+        Self { targets }
+    }
+}
+
+#[async_trait]
+impl SignalTransport for FanoutTransport {
+    async fn send_signal(&self, signal: Signal) -> anyhow::Result<()> {
+        let mut last_err = None;
+        for t in &self.targets {
+            if let Err(e) = t.send_signal(signal).await {
+                last_err = Some(e);
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    async fn recv_signal(&self) -> anyhow::Result<Signal> {
+        anyhow::bail!("FanoutTransport est émetteur uniquement")
+    }
+}
+
 // ───── Production AWS : UDP brut 1 octet ─────
 pub struct UdpSignalTransport {
     socket: UdpSocket,

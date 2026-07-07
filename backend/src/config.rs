@@ -32,12 +32,14 @@ impl BotRole {
 pub struct Config {
     pub role: BotRole,
     pub dry_run: bool,
+    pub live_armed: bool, // 2e verrou : sans lui les ordres sont signés mais JAMAIS postés
 
     // Réseau / dashboard
     pub dashboard_port: u16,
     pub binance_ws_url: String,
     pub signal_addr: SocketAddr,        // adresse locale d'écoute (exécuteur)
     pub signal_target: Option<SocketAddr>, // cible (radar → exécuteur)
+    pub signal_target2: Option<SocketAddr>, // 2e cible optionnelle (radar → live)
     pub use_udp_transport: bool,        // false = loopback in-process (dev local)
 
     // Radar (J2)
@@ -157,10 +159,14 @@ impl Config {
         let signal_target: Option<SocketAddr> = env::var("SIGNAL_TARGET")
             .ok()
             .and_then(|s| s.parse().ok());
+        let signal_target2: Option<SocketAddr> = env::var("SIGNAL_TARGET2")
+            .ok()
+            .and_then(|s| s.parse().ok());
 
         Self {
             role: BotRole::from_env(),
             dry_run: env_or("DRY_RUN", true),
+            live_armed: env_or("LIVE_ARMED", false),
 
             dashboard_port,
             binance_ws_url: env::var("BINANCE_WS_URL").unwrap_or_else(|_| {
@@ -170,6 +176,7 @@ impl Config {
             }),
             signal_addr,
             signal_target,
+            signal_target2,
             use_udp_transport: env_or("USE_UDP_TRANSPORT", false),
 
             obi_depth_levels: env_or("OBI_DEPTH_LEVELS", 5),

@@ -4,7 +4,19 @@ version = "0.3.0"
 edition = "2021"
 authors = ["Quantitative Trading Team"]
 
+[features]
+default = []
+# `cargo build --features live` : ordres réels (SDK Polymarket POLY_1271 / sig_type=3).
+# ⚠️ alloy 2.1 requiert rustc ≥ 1.91 → build live sur AWS uniquement (local 1.86 = paper).
+live = ["dep:alloy", "dep:polymarket_client_sdk_v2"]
+
 [dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+alloy = { version = "2.1", default-features = false, features = ["signer-local", "sol-types"], optional = true }
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", default-features = false, features = ["clob"], optional = true }
 # Asynchronisme & Runtime
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = { version = "0.23", features = ["native-tls"] }

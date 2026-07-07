@@ -1,0 +1,17 @@
+[Unit]
+Description=Poly Executor LIVE Dublin (ORDRES RÉELS Polymarket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rust-quant-bot-v2/backend
+EnvironmentFile=/home/ubuntu/rust-quant-bot-v2/backend/.env.live
+ExecStart=/home/ubuntu/rust-quant-bot-v2/backend/target/release/polymarket_mm_bot
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
