@@ -10,6 +10,8 @@ cd backend
 mkdir -p data
 if [ "$ROLE" = "live" ]; then
   cargo build --release --features live   # rustc >= 1.91 requis (AWS OK)
+  # Binaire DÉDIÉ : un deploy paper/radar ne peut plus écraser le live.
+  cp target/release/polymarket_mm_bot target/release/polymarket_mm_bot-live
 else
   cargo build --release
 fi
