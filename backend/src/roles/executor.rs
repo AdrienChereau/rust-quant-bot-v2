@@ -153,8 +153,6 @@ async fn quote_loop(
     #[cfg(feature = "live")]
     let mut last_insurance_ms: i64 = 0;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
-    #[cfg(feature = "live")]
-    let mut last_collat_poll: i64 = 0;
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
     let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
@@ -647,7 +645,6 @@ async fn quote_loop(
                 let mut d = dash.write().await;
                 d.live_collateral = lv.cash;
             }
-            let _ = last_collat_poll;
             // Miroir des bids pour le dashboard.
             rest_up = lrest_up.as_ref().map(|r| (r.price, r.size));
             rest_dn = lrest_dn.as_ref().map(|r| (r.price, r.size));
