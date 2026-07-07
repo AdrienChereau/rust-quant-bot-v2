@@ -47,6 +47,38 @@ static CACHED_AUTH_CLIENT: std::sync::OnceLock<
     tokio::sync::Mutex<Client<Authenticated<Normal>>>,
 > = std::sync::OnceLock::new();
 
+/// Métadonnées RAW Polymarket par token (tick exact, neg_risk) — préchargées au
+/// rollover : les arrondis se font sur LES décimales du marché, pas une constante.
+static TOKEN_META: std::sync::Mutex<Option<std::collections::HashMap<String, u32>>> =
+    std::sync::Mutex::new(None);
+
+/// Précharge le tick size réel de chaque token (appelé à chaque rollover).
+pub async fn preload_token_meta(token_ids: &[&str]) -> anyhow::Result<()> {
+    let lock = CACHED_AUTH_CLIENT
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("client live non initialisé"))?;
+    let client = lock.lock().await;
+    let mut map = std::collections::HashMap::new();
+    for &tid in token_ids {
+        let token = U256::from_str(tid).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
+        let tick = client.tick_size(token).await.map_err(|e| anyhow::anyhow!("tick_size: {e}"))?;
+        let dp = tick.minimum_tick_size.as_decimal().scale();
+        map.insert(tid.to_string(), dp);
+    }
+    tracing::info!(?map, "tick sizes RAW Polymarket préchargés");
+    *TOKEN_META.lock().unwrap() = Some(map);
+    Ok(())
+}
+
+fn price_dp_for(token_id: &str) -> u32 {
+    TOKEN_META
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(token_id).copied())
+        .unwrap_or(2) // btc-updown-5m : tick 0.01
+}
+
 /// Démarrage live : parse le signer, authentifie le client SDK (une fois),
 /// sync le cache balance-allowance (obligatoire en sig_type 3).
 pub async fn startup(creds: &LiveCredentials) -> anyhow::Result<()> {
@@ -78,7 +110,7 @@ pub async fn place_order(
 ) -> anyhow::Result<PlaceResult> {
     let signer = local_signer(creds)?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
-    let price = decimal_from_f64(args.price, 4, "price")?; // le SDK re-valide vs tick size
+    let price = decimal_from_f64(args.price, price_dp_for(token_id), "price")?; // décimales RAW du tick PM
     let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
     let side = if args.is_sell { Side::Sell } else { Side::Buy };
     let order_type = if args.gtc { OrderType::GTC } else { OrderType::FAK };

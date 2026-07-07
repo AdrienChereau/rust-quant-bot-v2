@@ -51,6 +51,10 @@ pub struct LiveCtx {
     // ordre_id → (is_up, maker) pour attribuer les fills WS
     order_side: HashMap<String, (bool, bool)>,
     last_poll_ms: i64,
+    /// Collatéral USDC réel : sync CLOB ~10 s + décrément IMMÉDIAT à chaque fill
+    /// (plusieurs fills/merges par fenêtre → on doit savoir en quasi temps réel).
+    pub cash: f64,
+    last_cash_sync_ms: i64,
 }
 
 impl LiveCtx {
@@ -61,6 +65,7 @@ impl LiveCtx {
         tracing::info!(collateral, armed, "LIVE démarré — collatéral USDC réel");
         let (cond_tx, fill_rx) = user_ws::spawn(creds.clone());
         tokio::spawn(orders::run_heartbeats(creds.clone()));
+        let cash0 = collateral;
         Ok(Self {
             creds,
             armed,
@@ -71,6 +76,8 @@ impl LiveCtx {
             condition_id: String::new(),
             order_side: HashMap::new(),
             last_poll_ms: 0,
+            cash: cash0,
+            last_cash_sync_ms: 0,
         })
     }
 
@@ -86,6 +93,30 @@ impl LiveCtx {
         self.dn_token = dn_token.to_string();
         self.order_side.clear();
         let _ = self.cond_tx.send(Some(condition_id.to_string()));
+        // Métadonnées RAW du nouveau marché (tick exact par token).
+        if let Err(e) = orders::preload_token_meta(&[up_token, dn_token]).await {
+            tracing::warn!(error = %e, "préchargement tick sizes échoué (fallback 2 déc.)");
+        }
+        // Re-sync du collatéral au rollover (règlements/redeems éventuels).
+        self.sync_cash(true).await;
+    }
+
+    /// Sync du collatéral réel (forcé, ou au plus 1×/10 s).
+    pub async fn sync_cash(&mut self, force: bool) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if !force && now - self.last_cash_sync_ms < 10_000 {
+            return;
+        }
+        self.last_cash_sync_ms = now;
+        match super::auth::get_collateral_balance(&self.creds).await {
+            Ok(c) => self.cash = c,
+            Err(e) => tracing::warn!(error = %e, "sync collatéral échoué"),
+        }
+    }
+
+    /// Décrément immédiat à chaque fill BUY (le sync CLOB confirmera derrière).
+    pub fn note_fill_cash(&mut self, price: f64, size: f64) {
+        self.cash = (self.cash - price * size).max(0.0);
     }
 
     /// Pose un bid GTC. Renvoie l'ordre restant (ou None en dry-run/échec).

@@ -349,6 +349,23 @@ async fn quote_loop(
                         lrest_up = None;
                         lrest_dn = None;
                     }
+                    // Budget de fenêtre en % de bankroll (SC_BANKROLL_PCT>0) —
+                    // recalculé à CHAQUE rollover ; le recyclage par merge du
+                    // moteur (on_merge) réutilise ce budget dans la fenêtre.
+                    if cfg.sc_bankroll_pct > 0.0 {
+                        let bankroll = {
+                            #[cfg(feature = "live")]
+                            { live.as_ref().map(|lv| lv.cash).unwrap_or(paper.state.cash_usdc) }
+                            #[cfg(not(feature = "live"))]
+                            { paper.state.cash_usdc }
+                        };
+                        sc.cfg.max_capital_per_market = (bankroll * cfg.sc_bankroll_pct).max(1.0);
+                        tracing::info!(
+                            bankroll = format!("{bankroll:.2}"),
+                            cap = format!("{:.2}", sc.cfg.max_capital_per_market),
+                            "budget fenêtre = pct × bankroll"
+                        );
+                    }
                     current = Some(m);
                 }
                 Ok(None) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
@@ -548,8 +565,11 @@ async fn quote_loop(
                         let cap = if ask > 0.0 { ask - tick_sz } else { b.price };
                         ((b.price.min(cap)) / tick_sz).floor() * tick_sz
                     });
+                    // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
+                    // et jamais plus que le cash réel restant.
+                    let min_sz = m.min_order_size.max(1.0);
                     match (want, want_px, &*lrest) {
-                        (Some(b), Some(px), cur) if px >= 0.01 => {
+                        (Some(b), Some(px), cur) if px >= 0.01 && b.size >= min_sz && px * b.size <= lv.cash => {
                             let reprice = match cur {
                                 Some(r) => (px - r.price).abs() > tick_sz / 2.0 + 1e-9,
                                 None => true,
@@ -577,6 +597,7 @@ async fn quote_loop(
             }
             fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
             for f in fills {
+                lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
                 let side = if f.is_up { Side::Up } else { Side::Down };
                 let ltype = if f.maker { "maker" } else { "taker" };
                 if paper.try_buy(side.as_str(), f.price, f.size, ltype) {
@@ -620,13 +641,13 @@ async fn quote_loop(
                     }
                 }
             }
-            // Collatéral réel du wallet → tuile cash du dashboard (~60 s).
-            if now_s - last_collat_poll >= 60 {
-                last_collat_poll = now_s;
-                if let Ok(c) = crate::live::auth::get_collateral_balance(&lv.creds).await {
-                    dash.write().await.live_collateral = c;
-                }
+            // Cash réel : sync CLOB (≤1×/10 s) + valeur courante vers le dashboard.
+            lv.sync_cash(false).await;
+            {
+                let mut d = dash.write().await;
+                d.live_collateral = lv.cash;
             }
+            let _ = last_collat_poll;
             // Miroir des bids pour le dashboard.
             rest_up = lrest_up.as_ref().map(|r| (r.price, r.size));
             rest_dn = lrest_dn.as_ref().map(|r| (r.price, r.size));

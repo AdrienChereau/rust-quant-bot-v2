@@ -91,6 +91,7 @@ pub struct Config {
     pub sc_rebate_rate: f64,       // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
     pub sc_streak_soft: u32,       // pertes consécutives → taille ×0.25
     pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
+    pub sc_bankroll_pct: f64,      // >0 : budget/fenêtre = pct × bankroll (recalculé au rollover) ; 0 = cap fixe
 
     // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
     pub sc_sleep_hours_utc: Vec<u32>,
@@ -221,6 +222,7 @@ impl Config {
             sc_rebate_rate: env_or("SC_REBATE_RATE", 0.20),
             sc_streak_soft: env_or("SC_STREAK_SOFT", 4),
             sc_streak_hard: env_or("SC_STREAK_HARD", 6),
+            sc_bankroll_pct: env_or("SC_BANKROLL_PCT", 0.0),
 
             sc_sleep_hours_utc: std::env::var("SC_SLEEP_HOURS_UTC")
                 .unwrap_or_else(|_| "22,23,0,1,2,3,8".into())
