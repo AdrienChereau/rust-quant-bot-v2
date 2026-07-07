@@ -566,6 +566,16 @@ async fn quote_loop(
                     // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
                     // et jamais plus que le cash réel restant.
                     let min_sz = m.min_order_size.max(1.0);
+                    // Visibilité : un désir non plaçable doit se DIRE (min size PM / cash).
+                    if let (Some(b), Some(px)) = (want, want_px) {
+                        let now = chrono::Utc::now().timestamp();
+                        if (b.size < min_sz || px * b.size > lv.cash) && now - last_nosig_log >= 10 {
+                            last_nosig_log = now;
+                            tracing::warn!(side = ?side, size = b.size, min_sz, px,
+                                cash = format!("{:.2}", lv.cash),
+                                "bid skippé (taille < min PM ou cash insuffisant) — ajuster SC_MAX_CLIP_USDC/SC_BASE_CLIP");
+                        }
+                    }
                     match (want, want_px, &*lrest) {
                         (Some(b), Some(px), cur) if px >= 0.01 && b.size >= min_sz && px * b.size <= lv.cash => {
                             let reprice = match cur {
