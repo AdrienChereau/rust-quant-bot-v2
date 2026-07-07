@@ -13,6 +13,7 @@ mod dashboard;
 mod engines;
 mod execution;
 mod inventory;
+mod logbuf;
 #[cfg(feature = "live")]
 mod live;
 mod roles;
@@ -30,12 +31,16 @@ use signal::{LoopbackTransport, SignalTransport, UdpSignalTransport};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()))
+            .with(tracing_subscriber::fmt::layer())
+            .with(logbuf::RingLayer) // → dashboard /logs
+            .init();
+    }
 
     let cfg = Config::from_env();
     tracing::info!(?cfg.role, dry_run = cfg.dry_run, "Démarrage polymarket_mm_bot");

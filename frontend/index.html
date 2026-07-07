@@ -57,7 +57,11 @@
   <div class="ph">Dernières fenêtres (40)</div>
   <table id="tbl"></table>
 </div>
-<div class="panel">
+<div class="panel" id="logspanel" style="display:none">
+  <div class="ph">◢ JOURNAL DU BOT — temps réel (équivalent journalctl)</div>
+  <div class="feed" id="botlog" style="max-height:420px;font-size:11.5px"></div>
+</div>
+<div class="panel stratp">
   <details id="strategyPanel" open>
     <summary class="ph" style="cursor:pointer;margin-bottom:0">1. Stratégie actuelle — Copy Maker V9 (copie 0xb27b…, cliquer pour plier)</summary>
     <div class="strat">
@@ -90,7 +94,7 @@
     </div>
   </details>
 </div>
-<div class="panel">
+<div class="panel stratp">
   <details>
     <summary class="ph" style="cursor:pointer;margin-bottom:0">2. À tester absolument avant le live (backlog, cliquer pour déplier)</summary>
     <div class="strat">
@@ -112,7 +116,7 @@
     </div>
   </details>
 </div>
-<div class="panel">
+<div class="panel stratp">
   <details>
     <summary class="ph" style="cursor:pointer;margin-bottom:0">3. Checklist LIVE (à vérifier le jour J, cliquer pour déplier)</summary>
     <div class="strat">

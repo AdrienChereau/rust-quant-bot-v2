@@ -148,6 +148,26 @@ async function tick() {
   series = s.series || [];
   winStart = s.window_start || 0;
   $('mode').textContent = s.dry_run ? 'PAPER' : 'LIVE';
+  // Mode LIVE : le journal du bot remplace les panneaux stratégie.
+  if (!window.__uiMode || window.__uiMode !== s.dry_run) {
+    window.__uiMode = s.dry_run;
+    document.querySelectorAll('.stratp').forEach((el) => el.style.display = s.dry_run ? '' : 'none');
+    $('logspanel').style.display = s.dry_run ? 'none' : '';
+    if (!s.dry_run && !window.__logsTimer) {
+      const pollLogs = async () => {
+        const lines = await j('/logs');
+        if (!lines) return;
+        const lc = { WARN: '#e0a24a', ERROR: '#ff8a8a', INFO: '#8a919c' };
+        const html = lines.slice().reverse().map(([t, lvl, m]) =>
+          `<div><span class="mut">${t}</span> <span style="color:${lc[lvl] || '#8a919c'}">${lvl}</span> ${m.replace(/</g, '&lt;')}</div>`
+        ).join('');
+        const el = $('botlog');
+        if (el.__last !== html) { el.__last = html; el.innerHTML = html; }
+      };
+      pollLogs();
+      window.__logsTimer = setInterval(pollLogs, 2000);
+    }
+  }
   if (typeof s.trading_enabled === 'boolean' && s.trading_enabled !== tradingOn) { tradingOn = s.trading_enabled; renderPower(); }
   $('clock').textContent = new Date().toLocaleTimeString();
   const ws = s.windows || [];

@@ -254,6 +254,10 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                         serde_json::to_string(&*s).unwrap_or_else(|_| "{}".into()),
                     )
                 }
+                "/logs" => {
+                    let lines = crate::logbuf::tail(250);
+                    ("application/json", serde_json::to_string(&lines).unwrap_or_else(|_| "[]".into()))
+                }
                 "/events" => {
                     let tp = { state.read().await.trades_path.clone() };
                     ("application/json", tail_json(&tp, 250))
@@ -263,6 +267,7 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
             let status = if path == "/state"
                 || path == "/start"
                 || path == "/stop"
+                || path == "/logs"
                 || path == "/events"
                 || path == "/"
                 || path == "/index.html"
