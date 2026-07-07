@@ -714,7 +714,21 @@ async fn quote_loop(
                 && mirror_pairs >= cfg.min_merge_threshold
                 && lv.merge_available()
             {
-                lv.start_merge(mirror_pairs.floor()).await;
+                let pairs = mirror_pairs.floor();
+                match lv.start_merge(pairs).await {
+                    crate::live::engine::MergeStart::WouldRevert => {
+                        // La simulation refuse = les tokens n'y sont plus → le
+                        // merge PRÉCÉDENT est passé malgré le timeout de suivi.
+                        // On aligne le miroir et on resynce le cash réel.
+                        let merged = paper.check_and_merge(0.1);
+                        sc.on_merge(pairs);
+                        win_merged += pairs;
+                        lv.force_cash_resync();
+                        tracing::info!(pairs, mirror = merged,
+                            "merge déjà passé on-chain (would revert) — miroir aligné");
+                    }
+                    _ => {}
+                }
             }
 
             // Cash réel : sync CLOB (≤1×/10 s) + valeur courante vers le dashboard.

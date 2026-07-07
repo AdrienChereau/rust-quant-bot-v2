@@ -223,7 +223,8 @@ impl RelayerCtx {
         let api_key_address = self.api_key_address.clone();
         let op = op.to_string();
         tokio::spawn(async move {
-            for _ in 0..30 {
+            let mut last_state = String::new();
+            for _ in 0..75 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let url = format!("{RELAYER_BASE}/transaction/{tx_id}");
                 let Ok(resp) = HTTP
@@ -244,13 +245,14 @@ impl RelayerCtx {
                             .and_then(|s| s.as_str().map(String::from))
                     })
                     .unwrap_or_default();
+                last_state = state.clone();
                 match state.as_str() {
-                    "STATE_CONFIRMED" | "STATE_MINED" => {
+                    s if s.contains("CONFIRMED") || s.contains("MINED") || s.contains("EXECUTED") || s.contains("SUCCESS") => {
                         tracing::info!(op = %op, tx_id = %tx_id, "✅ transaction relayer CONFIRMÉE");
                         let _ = done_tx.send(TxOutcome::Confirmed);
                         return;
                     }
-                    "STATE_FAILED" | "STATE_INVALID" => {
+                    s if s.contains("FAILED") || s.contains("INVALID") || s.contains("REVERTED") => {
                         tracing::warn!(op = %op, tx_id = %tx_id, resp = %text, "transaction relayer ÉCHOUÉE");
                         let _ = done_tx.send(TxOutcome::Failed(text));
                         return;
@@ -258,8 +260,9 @@ impl RelayerCtx {
                     _ => {}
                 }
             }
-            tracing::warn!(op = %op, tx_id = %tx_id, "confirmation relayer : timeout de suivi (60 s)");
-            let _ = done_tx.send(TxOutcome::Failed("timeout".into()));
+            tracing::warn!(op = %op, tx_id = %tx_id, dernier_etat = %last_state,
+                "confirmation relayer : timeout de suivi (150 s)");
+            let _ = done_tx.send(TxOutcome::Failed(format!("timeout (dernier état: {last_state})")));
         });
         Ok(done_rx)
     }

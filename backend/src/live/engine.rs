@@ -20,6 +20,14 @@ use tokio::sync::{mpsc, watch};
 use super::auth::LiveCredentials;
 use super::orders::{self, OrderArgs, PlaceResult};
 use super::relayer::{RelayerCtx, TxOutcome};
+
+/// Résultat du lancement d'un merge.
+#[derive(Debug, PartialEq)]
+pub enum MergeStart {
+    Submitted,
+    WouldRevert, // déjà mergé on-chain (probable) → aligner le miroir
+    Err,
+}
 use super::user_ws::{self, FillEvent};
 
 /// Fill prêt pour la boucle stratégie.
@@ -59,6 +67,7 @@ pub struct LiveCtx {
     /// Merge/redeem on-chain via le relayer officiel (None = clés absentes → désactivé).
     relayer: Option<RelayerCtx>,
     merge_inflight: Option<(f64, tokio::sync::oneshot::Receiver<TxOutcome>)>,
+    last_merge_attempt_ms: i64, // cooldown anti-spam (429 Cloudflare du 7 juil.)
 }
 
 impl LiveCtx {
@@ -85,6 +94,7 @@ impl LiveCtx {
             last_cash_sync_ms: 0,
             relayer: RelayerCtx::from_env(&creds2),
             merge_inflight: None,
+            last_merge_attempt_ms: 0,
         })
     }
 
@@ -127,16 +137,39 @@ impl LiveCtx {
     }
 
     pub fn merge_available(&self) -> bool {
-        self.relayer.is_some() && self.merge_inflight.is_none() && self.armed
+        let now = chrono::Utc::now().timestamp_millis();
+        self.relayer.is_some()
+            && self.merge_inflight.is_none()
+            && self.armed
+            && now - self.last_merge_attempt_ms >= 45_000 // cooldown anti-spam/429
     }
 
-    /// Lance un MERGE on-chain de `pairs` paires (un seul en vol à la fois).
-    pub async fn start_merge(&mut self, pairs: f64) {
+    /// Force la resynchronisation du collatéral au prochain tick.
+    pub fn force_cash_resync(&mut self) {
+        self.last_cash_sync_ms = 0;
+    }
+
+    /// Lance un MERGE on-chain de `pairs` paires (un seul en vol, cooldown 45 s).
+    /// `WouldRevert` = la simulation du relayer refuse — quasi toujours parce que
+    /// les paires sont DÉJÀ mergées on-chain (tx précédente passée malgré un
+    /// timeout de suivi) → l'appelant doit aligner le miroir.
+    pub async fn start_merge(&mut self, pairs: f64) -> MergeStart {
+        self.last_merge_attempt_ms = chrono::Utc::now().timestamp_millis();
         let cond = self.condition_id.clone();
-        if let Some(r) = self.relayer.as_mut() {
-            match r.merge(&cond, pairs).await {
-                Ok(rx) => self.merge_inflight = Some((pairs, rx)),
-                Err(e) => tracing::warn!(error = %e, "merge relayer refusé"),
+        let Some(r) = self.relayer.as_mut() else { return MergeStart::Err };
+        match r.merge(&cond, pairs).await {
+            Ok(rx) => {
+                self.merge_inflight = Some((pairs, rx));
+                MergeStart::Submitted
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(error = %msg, "merge relayer refusé");
+                if msg.contains("would revert") || msg.contains("reverted") {
+                    MergeStart::WouldRevert
+                } else {
+                    MergeStart::Err
+                }
             }
         }
     }
