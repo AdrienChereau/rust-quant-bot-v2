@@ -405,19 +405,16 @@ impl SpreadCaptureEngine {
             }
             let deficit = other - my;
             let (price_cap, size, completion) = if deficit > 1e-9 {
-                // Complétion : la paire résultante reste ≤ pair_target.
-                let other_avg = self.avg(match side {
-                    Side::Up => Side::Down,
-                    Side::Down => Side::Up,
-                });
-                (
-                    c.completion_max_price.min(pair_target - other_avg),
-                    deficit.min(c.max_clip),
-                    true,
-                )
+                // COMPLÉTION = PRIORITÉ ABSOLUE (règle utilisateur : on ne meurt
+                // JAMAIS dans une direction). Le bid suit le touch jusqu'à 99¢,
+                // MÊME si la paire dépasse 1$ — un MM se rééquilibre, il ne
+                // spécule pas sur le retour. Pas de plafond de paire ici.
+                (c.completion_max_price, deficit.min(c.max_clip), true)
             } else {
                 // Équilibré : ouverture SYMÉTRIQUE — l'autre côté est supposé
                 // rempli à SON bb+tick → notre prix ≤ pair_target − (bb_autre+tick).
+                // (Le plafond de paire ne s'applique qu'à L'OUVERTURE : c'est là
+                // que se construit le profit ; la complétion, elle, assure.)
                 if WINDOW_SECS - remaining_s < c.min_window_age_s {
                     continue;
                 }
@@ -428,13 +425,23 @@ impl SpreadCaptureEngine {
                 continue;
             }
             let mut size = size.min(c.max_clip_usdc / price.max(0.01));
-            let capital_room = c.max_capital_per_market - self.deployed();
-            size = size.min((capital_room / price).max(0.0));
+            if !completion {
+                // Le budget de fenêtre ne bride que l'OUVERTURE — jamais la
+                // complétion (sinon budget épuisé = jambe nue garantie).
+                let capital_room = c.max_capital_per_market - self.deployed();
+                size = size.min((capital_room / price).max(0.0));
+            }
             size = (size * size_factor).floor();
             if size < 1.0 {
                 continue;
             }
             out.push(BidQuote { side, price, size, completion });
+        }
+        // Un market maker ouvre les DEUX côtés ou aucun : une ouverture orpheline
+        // (l'autre côté filtré) serait un pari directionnel déguisé.
+        let openings = out.iter().filter(|b| !b.completion).count();
+        if openings == 1 {
+            out.retain(|b| b.completion);
         }
         out
     }
@@ -726,6 +733,38 @@ mod tests {
         let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0);
         let sum: f64 = q.iter().map(|b| b.price).sum();
         assert!(q.len() == 2 && sum <= 0.995 + 1e-9, "{q:?} somme={sum}");
+    }
+
+    #[test]
+    fn symmetric_completion_follows_market_even_above_one_dollar() {
+        let mut e = eng();
+        e.cfg.completion_max_price = 0.99; // config de prod (le eng() de test garde le vieux cap v5)
+        e.on_fill(Side::Up, 0.60, 10.0, 0); // rempli Up 60c…
+        // …puis Up s'effondre : Down monte a 80c. La complétion DOIT suivre le
+        // touch (81c → paire 1.41$) — on se rééquilibre, on ne meurt pas nu.
+        let q = e.desired_bids_symmetric(0.15, 0.80, 200, 100, 0.01, 1.0);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].completion && q[0].side == Side::Down);
+        assert!((q[0].price - 0.81).abs() < 1e-9, "suit le touch: {}", q[0].price);
+    }
+
+    #[test]
+    fn symmetric_completion_ignores_window_budget() {
+        let mut e = eng();
+        // budget de fenêtre déjà consommé par l'ouverture
+        e.on_fill(Side::Up, 0.80, 24.0, 0); // 19.2$ déployés sur cap 20$
+        let q = e.desired_bids_symmetric(0.75, 0.20, 200, 100, 0.01, 1.0);
+        let comp: Vec<_> = q.iter().filter(|b| b.completion).collect();
+        assert_eq!(comp.len(), 1, "la complétion passe malgré le budget: {q:?}");
+    }
+
+    #[test]
+    fn symmetric_opening_never_orphan() {
+        let e = eng();
+        // Down inquotable (carnet vide de ce côté) → AUCUNE ouverture (pas de pari déguisé)
+        let q = e.desired_bids_symmetric(0.97, 0.0, 200, 100, 0.01, 1.0);
+        assert!(q.iter().all(|b| b.completion), "{q:?}");
+        assert!(q.is_empty());
     }
 
     // ── v8 MAKER : desired_bids ──
