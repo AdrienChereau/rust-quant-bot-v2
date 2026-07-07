@@ -24,6 +24,9 @@ const APP_JS: &str = include_str!("../../frontend/app.js");
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardState {
     pub dry_run: bool,
+    /// Interrupteur manuel (bouton ON/OFF du dashboard) : false = aucune nouvelle
+    /// quote ni assurance, ordres réels annulés — les positions vont à la résolution.
+    pub trading_enabled: bool,
     pub role: String, // "radar" | "executor" — sélectionne l'interface servie sur /
     pub seq: u64,     // dernier seq de tick émis (radar)
     pub radar_log: Vec<(String, String)>, // (heure, événement) — ring 40 entrées
@@ -185,6 +188,7 @@ pub type Shared = Arc<RwLock<DashboardState>>;
 pub fn shared(dry_run: bool, role: &str) -> Shared {
     Arc::new(RwLock::new(DashboardState {
         dry_run,
+        trading_enabled: true,
         role: role.into(),
         ..Default::default()
     }))
@@ -237,6 +241,12 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
                 "/app.js" => ("application/javascript; charset=utf-8", APP_JS.to_string()),
                 "/radar.js" => ("application/javascript; charset=utf-8", RADAR_JS.to_string()),
+                "/start" | "/stop" => {
+                    let on = path == "/start";
+                    state.write().await.trading_enabled = on;
+                    tracing::warn!(trading_enabled = on, "interrupteur manuel dashboard");
+                    ("application/json", format!("{{\"trading_enabled\":{on}}}"))
+                }
                 "/state" => {
                     let s = state.read().await;
                     (
@@ -251,6 +261,8 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 _ => ("text/plain", "not found".to_string()),
             };
             let status = if path == "/state"
+                || path == "/start"
+                || path == "/stop"
                 || path == "/events"
                 || path == "/"
                 || path == "/index.html"

@@ -36,3 +36,8 @@ details summary::-webkit-details-marker{display:none}
 details summary:after{content:' ▸';color:var(--mut)}
 details[open] summary:after{content:' ▾'}
 .empty{color:var(--mut);padding:12px;text-align:center}
+
+.pw{margin-left:12px;font:600 11px ui-monospace,monospace;padding:4px 12px;border-radius:6px;
+ cursor:pointer;border:1px solid transparent;letter-spacing:.05em}
+.pw.on{background:#173324;color:#6fe0a0;border-color:#245c3a}
+.pw.off{background:#3a1a1a;color:#ff8a8a;border-color:#6b2b2b}

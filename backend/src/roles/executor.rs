@@ -464,6 +464,9 @@ async fn quote_loop(
         // Bids RESTANTS des deux rôles (directionnel côté tendance + complétion côté
         // déficitaire), remplis par règle de CROSS. Rebate estimé par fill maker.
         let paused = kill.is_paused(); // observabilité
+        // Interrupteur manuel (bouton dashboard) : OFF = aucune nouvelle quote,
+        // aucune assurance ; en live les ordres restants sont annulés ci-dessous.
+        let enabled = { dash.read().await.trading_enabled };
         let now_s = chrono::Utc::now().timestamp();
         use chrono::Timelike;
         let sleeping = cfg.sc_sleep_hours_utc.contains(&chrono::Utc::now().hour());
@@ -493,7 +496,7 @@ async fn quote_loop(
         };
 
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
-        let desired = if sleeping || paused {
+        let desired = if sleeping || paused || !enabled {
             Vec::new()
         } else {
             sc.desired_bids(
@@ -507,7 +510,7 @@ async fn quote_loop(
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
             // KILL/pause → tout annuler.
-            if paused || sleeping {
+            if paused || sleeping || !enabled {
                 if lrest_up.is_some() || lrest_dn.is_some() {
                     lv.cancel_all().await;
                     lrest_up = None;
@@ -579,7 +582,8 @@ async fn quote_loop(
             // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
             // au plus 1 tentative / 3 s (le fill revient par le WS).
             let remaining_l = m.time_remaining_sec();
-            if (10..=45).contains(&remaining_l)
+            if enabled
+                && (10..=45).contains(&remaining_l)
                 && sc.imbalance().abs() >= 5.0
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
@@ -653,7 +657,7 @@ async fn quote_loop(
         // complète à −4,3¢ d'edge médian, jusqu'à >1$ la paire). Frais taker inclus,
         // pas de rebate sur ce fill.
         let remaining = m.time_remaining_sec();
-        if !live_mode && (10..=45).contains(&remaining) && sc.imbalance().abs() >= 5.0 {
+        if !live_mode && enabled && (10..=45).contains(&remaining) && sc.imbalance().abs() >= 5.0 {
             let (side, ask, ask_sz) = if sc.imbalance() > 0.0 {
                 (Side::Down, ask_dn, ask_dn_sz)
             } else {
@@ -813,7 +817,7 @@ async fn quote_loop(
             net = format!("{:.0}", net),
             wpnl = format!("{:.2}", window_pnl),
             fills = paper.state.fills,
-            state = if sleeping { "sleep" } else if paused { "kill(obs)" } else { "scan" },
+            state = if !enabled { "OFF(manuel)" } else if sleeping { "sleep" } else if paused { "kill(obs)" } else { "scan" },
             "sc"
         );
         }

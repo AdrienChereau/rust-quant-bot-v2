@@ -148,6 +148,7 @@ async function tick() {
   series = s.series || [];
   winStart = s.window_start || 0;
   $('mode').textContent = s.dry_run ? 'PAPER' : 'LIVE';
+  if (typeof s.trading_enabled === 'boolean' && s.trading_enabled !== tradingOn) { tradingOn = s.trading_enabled; renderPower(); }
   $('clock').textContent = new Date().toLocaleTimeString();
   const ws = s.windows || [];
   $('hw').textContent = ws.length;
@@ -219,6 +220,21 @@ async function tickEvents() {
     return `<div><span class="mut">${time}</span> <span style="color:${kc[t.kind] || '#fff'}">${t.kind}</span> ${det}</div>`;
   }).join(''));
 }
+
+// ── bouton ON/OFF (interrupteur manuel : /start | /stop) ──
+let tradingOn = true;
+function renderPower() {
+  const b = $('power');
+  b.className = 'pw ' + (tradingOn ? 'on' : 'off');
+  b.textContent = tradingOn ? '● ON' : '■ OFF';
+}
+$('power').onclick = async () => {
+  const target = tradingOn ? '/stop' : '/start';
+  if (!tradingOn || confirm('Couper les prises d\'ordres ? (les ordres restants seront annulés, les positions vont à la résolution)')) {
+    try { const r = await fetch(target, { method: 'POST' }); const d = await r.json(); tradingOn = d.trading_enabled; } catch (e) {}
+    renderPower();
+  }
+};
 
 tick(); tickEvents();
 setInterval(tick, 1000);
