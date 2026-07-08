@@ -73,6 +73,10 @@ pub struct LiveCtx {
     last_merge_attempt_ms: i64, // cooldown anti-spam (429 Cloudflare du 7 juil.)
     last_pos_sync_ms: i64,
     pub positions_dirty: bool, // merge/redeem incertain → resync des positions
+    /// Fills constatés à la RÉPONSE du POST (GTC marketable) : émis au prix
+    /// moyen réellement exécuté, dès le tick courant (le journal doit montrer
+    /// le prix PAYÉ, pas notre limite — écarts 45,0 vs 45,7 du 8 juil.).
+    post_fills: Vec<LiveFill>,
     /// Ordres retirés SANS lecture réussie de leur size_matched (GET /data/order
     /// en échec au moment du cancel). Un fill ne doit JAMAIS être perdu : le poll
     /// réinterroge ces ordres jusqu'à obtenir la vérité (incident du 8 juil. :
@@ -127,6 +131,7 @@ impl LiveCtx {
             last_merge_attempt_ms: 0,
             last_pos_sync_ms: 0,
             positions_dirty: false,
+            post_fills: Vec::new(),
             audit: Vec::new(),
         })
     }
@@ -282,13 +287,16 @@ impl LiveCtx {
         match orders::place_order(self.armed, &self.creds, token, args).await {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
                 self.order_side.insert(order_id.clone(), (is_up, true));
-                // Fill immédiat possible (GTC marketable malgré le clamp) : compté tout de suite.
+                // Fill immédiat (GTC marketable malgré le clamp) : émis TOUT DE
+                // SUITE au prix moyen réel, et inscrit dans la baseline matched
+                // (les canaux WS/poll ne le recompteront pas).
                 let matched = filled_size.unwrap_or(0.0);
                 if matched > 0.0 {
-                    tracing::info!(matched, "GTC partiellement fillé au POST");
+                    let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
+                    tracing::info!(matched, px, "GTC fillé au POST (marketable) — compté immédiatement");
+                    self.post_fills.push(LiveFill { is_up, price: px, size: matched, maker: false });
                 }
-                let _ = avg_price;
-                Some(RestingOrder { order_id, price, size, matched: 0.0 })
+                Some(RestingOrder { order_id, price, size, matched })
             }
             Ok(PlaceResult::DryRun) => None,
             Err(e) => {
@@ -364,7 +372,7 @@ impl LiveCtx {
         rest_up: &mut Option<RestingOrder>,
         rest_dn: &mut Option<RestingOrder>,
     ) -> Vec<LiveFill> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.post_fills);
         while let Ok(msg) = self.fill_rx.try_recv() {
             match msg {
                 UserMsg::Fill(f) => {

@@ -433,11 +433,20 @@ impl SpreadCaptureEngine {
             }
             let deficit = other - my;
             let (price_cap, size, completion) = if deficit > 1e-9 {
-                // COMPLÉTION = PRIORITÉ ABSOLUE (règle utilisateur : on ne meurt
-                // JAMAIS dans une direction). Le bid suit le touch jusqu'à 99¢,
-                // MÊME si la paire dépasse 1$ — un MM se rééquilibre, il ne
-                // spécule pas sur le retour. Pas de plafond de paire ici.
-                (c.completion_max_price, deficit.min(c.max_clip), true)
+                // COMPLÉTION : on se pose au prix COMPLÉMENTAIRE de ce qu'a
+                // coûté la jambe excédentaire (paire ≤ pair_target) et on
+                // laisse l'oscillation venir se faire fill. Chasser le touch
+                // (comportement du 8 juil.) verrouillait des paires à
+                // 1,11-1,29$ : CHAQUE merge perdait. « Il FAUT merge » reste
+                // garanti par les deux voies d'escalade dédiées : complétion
+                // URGENTE (drift Tokyo, executor) et assurance FAK de fin de
+                // fenêtre — elles seules ont le droit de payer le marché.
+                let avg_excess = match side {
+                    Side::Up => self.avg(Side::Down),
+                    Side::Down => self.avg(Side::Up),
+                };
+                let complement = (pair_target - avg_excess).min(c.completion_max_price);
+                (complement, deficit.min(c.max_clip), true)
             } else {
                 // Équilibré : ouverture SYMÉTRIQUE — l'autre côté est supposé
                 // rempli à SON bb+tick → notre prix ≤ pair_target − (bb_autre+tick).
@@ -784,16 +793,33 @@ mod tests {
     }
 
     #[test]
-    fn symmetric_completion_follows_market_even_above_one_dollar() {
+    fn symmetric_completion_rests_at_complement_not_touch() {
         let mut e = eng();
-        e.cfg.completion_max_price = 0.99; // config de prod (le eng() de test garde le vieux cap v5)
+        e.cfg.completion_max_price = 0.99;
         e.on_fill(Side::Up, 0.60, 10.0, 0); // rempli Up 60c…
-        // …puis Up s'effondre : Down monte a 80c. La complétion DOIT suivre le
-        // touch (81c → paire 1.41$) — on se rééquilibre, on ne meurt pas nu.
+        // …puis Up s'effondre : Down monte à 80c. La complétion ne CHASSE PAS
+        // le touch (8 juil. : paires à 1,11-1,29$, merges tous perdants) —
+        // elle se pose au COMPLÉMENT (pair_target − avg_up) et attend le
+        // retour. L'escalade appartient à l'urgence Tokyo / assurance FAK.
         let q = e.desired_bids_symmetric(0.15, 0.80, 200, 100, 0.01, 1.0);
         assert_eq!(q.len(), 1, "{q:?}");
         assert!(q[0].completion && q[0].side == Side::Down);
-        assert!((q[0].price - 0.81).abs() < 1e-9, "suit le touch: {}", q[0].price);
+        let pair_target = e.cfg.completion_max_pair.min(0.999);
+        let complement = pair_target - 0.60;
+        assert!(q[0].price <= complement + 1e-9, "paie ≤ complément: {} vs {}", q[0].price, complement);
+    }
+
+    #[test]
+    fn symmetric_completion_takes_touch_when_cheaper_than_complement() {
+        let mut e = eng();
+        e.cfg.completion_max_price = 0.99;
+        e.on_fill(Side::Up, 0.30, 10.0, 0); // jambe excédentaire payée 30c
+        // complément ≈ 0.999−0.30 = 0.699 mais le touch Down est à 40c :
+        // on quote bb+tick (41c) — moins cher que le complément = paire 71c.
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].completion && q[0].side == Side::Down);
+        assert!((q[0].price - 0.41).abs() < 1e-9, "au touch: {}", q[0].price);
     }
 
     #[test]

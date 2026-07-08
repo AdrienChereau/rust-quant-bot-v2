@@ -1054,7 +1054,7 @@ async fn quote_loop(
         }
 
         if slow_tick {
-        tracing::info!(
+        tracing::debug!(
             rem_s = m.time_remaining_sec(),
             fair = format!("{:.3}", fair_up),
             drift = format!("{:+.4}", drift_log),
