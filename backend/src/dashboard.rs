@@ -56,6 +56,8 @@ pub struct DashboardState {
     pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
     #[serde(default)]
     pub merge_pair_avg: f64, // coût de paire moyen AU MOMENT des merges de la fenêtre (qualité d'exécution, cible ≈ 1,00)
+    #[serde(default)]
+    pub taker_fees_window: f64, // taxe taker payée cette fenêtre (7% × p(1−p) × taille par fill taker) — cible : 0
     pub deployed: f64,  // $ déployés sur la fenêtre courante
     pub window_start: i64, // unix s du début de la fenêtre courante (graphique)
     pub rebate_window: f64, // rebate estimé de la fenêtre courante

@@ -167,6 +167,9 @@ async fn quote_loop(
     // Qualité d'exécution : coût de paire blended AU MOMENT de chaque merge.
     let mut win_merge_cost_sum = 0.0f64;
     let mut win_merge_n: u32 = 0;
+    // Taxe taker payée (7 % × p(1−p) × taille — formule VÉRIFIÉE sur les fills
+    // du 8 juil. : 51,7¢ affiché = 50¢ exécuté + 0,105$ de frais sur 6 parts).
+    let mut win_taker_fees = 0.0f64;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
@@ -374,6 +377,7 @@ async fn quote_loop(
                     win_deployed = 0.0;
                     win_merge_cost_sum = 0.0;
                     win_merge_n = 0;
+                    win_taker_fees = 0.0;
                     win_fills = 0;
                     win_imb_max = 0.0;
                     tracing::info!(
@@ -612,10 +616,15 @@ async fn quote_loop(
         let urgency_blocked = now_s < urgency_block_until;
         #[cfg(not(feature = "live"))]
         let urgency_blocked = false;
+        // FIN DE FENÊTRE (t-45 → t-20) : la complétion passe en maker AGRESSIF
+        // (ask−tick) AVANT que le FAK taker ne tire à t-20 — 25 s de chance de
+        // compléter sans payer la taxe (profil 0xb27b : complétions maker).
+        let endgame = (20..=45).contains(&m.time_remaining_sec());
         for b in desired.iter_mut() {
             if b.completion
-                && !urgency_blocked
-                && crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
+                && ((!urgency_blocked
+                    && crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift))
+                    || endgame)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
                 if ask > tick_sz {
@@ -675,6 +684,29 @@ async fn quote_loop(
                         _ => None,
                     }
                 };
+                // ANTI-CROSS dernier moment (8 juil., fill taker 51,7¢) :
+                // l'ask du snapshot de début de tick peut être périmé au POST.
+                // VETO ATOMIQUE : si l'ask d'UN côté à ouvrir vient de BAISSER
+                // (le marché vient vers nous = scénario du cross), AUCUNE
+                // ouverture ce tick — « les deux ou aucun » vaut aussi au
+                // placement. Les complétions, elles, ne sont JAMAIS différées
+                // (organe anti-directionnel) : re-clamp seul.
+                let fresh_ask = |token: &str, fallback: f64| -> f64 {
+                    let now2 = chrono::Utc::now().timestamp_millis() as u64;
+                    pm_ws::fresh_book(&pm_state, token, now2, 5_000)
+                        .as_ref()
+                        .and_then(best_ask_level)
+                        .map(|(p, _)| p)
+                        .unwrap_or(fallback)
+                };
+                let veto_openings = open_common.is_some() && {
+                    let fu = fresh_ask(&m.up_token_id, ask_up);
+                    let fd = fresh_ask(&m.down_token_id, ask_dn);
+                    fu + 1e-9 < ask_up || fd + 1e-9 < ask_dn
+                };
+                if veto_openings {
+                    tracing::info!("veto ouverture : carnet en mouvement (ask en baisse) — on repasse au tick suivant");
+                }
                 for (lrest, side, ask) in [
                     (&mut lrest_up, Side::Up, ask_up),
                     (&mut lrest_dn, Side::Down, ask_dn),
@@ -709,6 +741,8 @@ async fn quote_loop(
                                 } else {
                                     Some(sz)
                                 }
+                            } else if veto_openings {
+                                None
                             } else {
                                 open_common
                             }
@@ -735,8 +769,21 @@ async fn quote_loop(
                                         harvested.push(f);
                                     }
                                 }
-                                *lrest = lv.place_bid(side == Side::Up, px, sz).await;
-                                last_place_ms[side_ix] = now_ms_books as i64;
+                                // RE-CLAMP au dernier moment : l'ask le plus
+                                // frais juste avant le POST (les awaits ci-dessus
+                                // ont pu durer des centaines de ms). Un GTC qui
+                                // croise = taxe taker + rebate perdu.
+                                let tok = if side == Side::Up { &m.up_token_id } else { &m.down_token_id };
+                                let fa = fresh_ask(tok, ask);
+                                let px = if fa > tick_sz {
+                                    px.min(((fa - tick_sz) / tick_sz).floor() * tick_sz)
+                                } else {
+                                    px
+                                };
+                                if px >= 0.01 {
+                                    *lrest = lv.place_bid(side == Side::Up, px, sz).await;
+                                    last_place_ms[side_ix] = now_ms_books as i64;
+                                }
                             }
                         }
                         (None, _, Some(r)) => {
@@ -758,6 +805,20 @@ async fn quote_loop(
             for f in fills {
                 last_fill_wall_ms = now_ms_books as i64;
                 lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
+                if !f.maker {
+                    // Taxe taker : décomptée du cash réel tout de suite (le sync
+                    // CLOB la confirmera) + visible au dashboard. Chaque taker
+                    // est une anomalie à expliquer (cross ou FAK d'assurance).
+                    let fee = 0.07 * f.price * (1.0 - f.price) * f.size;
+                    lv.cash -= fee;
+                    win_taker_fees += fee;
+                    tracing::warn!(
+                        px = format!("{:.3}", f.price),
+                        size = format!("{:.1}", f.size),
+                        fee = format!("{:.3}", fee),
+                        "fill TAKER — taxe payée (cross d'ouverture ou FAK)"
+                    );
+                }
                 let side = if f.is_up { Side::Up } else { Side::Down };
                 let ltype = if f.maker { "maker" } else { "taker" };
                 // INCONDITIONNEL : un fill réel est un FAIT — la comptabilité
@@ -784,8 +845,10 @@ async fn quote_loop(
             // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
             // au plus 1 tentative / 3 s (le fill revient par le WS).
             let remaining_l = m.time_remaining_sec();
+            // FAK = DERNIER recours : le maker agressif a eu t-45→t-20 pour
+            // compléter sans taxe ; sous t-20 on paie pour ne pas mourir nu.
             if enabled
-                && (10..=45).contains(&remaining_l)
+                && (10..=20).contains(&remaining_l)
                 && sc.imbalance().abs() >= 5.0
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
@@ -1024,6 +1087,7 @@ async fn quote_loop(
             d.loss_streak = loss_streak;
             d.pair_cost = sc.pair_cost().unwrap_or(0.0);
             d.merge_pair_avg = if win_merge_n > 0 { win_merge_cost_sum / win_merge_n as f64 } else { 0.0 };
+            d.taker_fees_window = win_taker_fees;
             d.deployed = win_deployed;
             d.window_start = m.window_ts;
             d.params = crate::dashboard::StrategyParams {

@@ -203,6 +203,12 @@ async function tick() {
   const li = $('li'); li.textContent = (imbNow > 0 ? '+' : '') + f(imbNow, 0);
   li.className = 'cv ' + (Math.abs(imbNow) > 100 ? 'neg' : '');
   $('lpc').textContent = cents(s.pair_cost);
+  const ltf = $('ltf');
+  if (ltf) {
+    ltf.textContent = f(s.taker_fees_window || 0, 2) + '$';
+    // cible : 0 — chaque centime ici est un cross d'ouverture ou un FAK
+    ltf.className = 'cv ' + ((s.taker_fees_window || 0) > 0.005 ? 'neg' : '');
+  }
   const mpa = $('lmpa');
   if (mpa) {
     mpa.textContent = s.merge_pair_avg ? cents(s.merge_pair_avg) : '–';
