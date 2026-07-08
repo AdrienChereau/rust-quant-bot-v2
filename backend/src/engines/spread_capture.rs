@@ -455,7 +455,11 @@ impl SpreadCaptureEngine {
                     Side::Down => self.avg(Side::Up),
                 };
                 let complement = (pair_target - avg_excess).min(c.completion_max_price);
-                (complement, deficit.min(c.max_clip), true)
+                // Taille = TOUT le déficit : les clips (max_clip / max_clip_usdc)
+                // sont une discipline d'OUVERTURE. Tronquer la complétion laisse
+                // un reste sous les minimums PM = résidu orphelin garanti
+                // (19:25 le 8 juil. : déficit 12 → clip 10 → 2 Up morts).
+                (complement, deficit, true)
             } else {
                 // Équilibré : ouverture SYMÉTRIQUE — l'autre côté est supposé
                 // rempli à SON bb+tick → notre prix ≤ pair_target − (bb_autre+tick).
@@ -473,8 +477,9 @@ impl SpreadCaptureEngine {
             if price < 0.01 {
                 continue;
             }
-            let mut size = size.min(c.max_clip_usdc / price.max(0.01));
+            let mut size = size;
             if !completion {
+                size = size.min(c.max_clip_usdc / price.max(0.01));
                 // Le budget de fenêtre ne bride que l'OUVERTURE — jamais la
                 // complétion (sinon budget épuisé = jambe nue garantie).
                 let capital_room = c.max_capital_per_market - self.deployed();
@@ -834,6 +839,18 @@ mod tests {
         let q = e.desired_bids_symmetric(0.50, 0.48, 50, 200, 0.01, 1.0);
         assert_eq!(q.len(), 1, "{q:?}");
         assert!(q[0].completion && q[0].side == Side::Down);
+    }
+
+    #[test]
+    fn symmetric_completion_covers_full_deficit_no_clip_cap() {
+        let mut e = eng();
+        e.cfg.completion_max_price = 0.99;
+        e.cfg.max_clip = 10.0; // clip d'ouverture — ne doit PAS tronquer la complétion
+        e.on_fill(Side::Up, 0.60, 12.0, 0); // déficit Down = 12 > max_clip
+        let q = e.desired_bids_symmetric(0.55, 0.30, 200, 100, 0.01, 1.0);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].completion);
+        assert!((q[0].size - 12.0).abs() < 1e-9, "tout le déficit: {}", q[0].size);
     }
 
     #[test]

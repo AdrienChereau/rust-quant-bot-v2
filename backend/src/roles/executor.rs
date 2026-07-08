@@ -764,10 +764,21 @@ async fn quote_loop(
                                 None => now_ms_books as i64 - last_place_ms[side_ix] >= 4_000,
                             };
                             if reprice {
+                                let mut old_was_filled = false;
                                 if let Some(r) = lrest.take() {
                                     if let Some(f) = lv.harvest_and_cancel(&r, side == Side::Up).await {
                                         harvested.push(f);
+                                        old_was_filled = true;
                                     }
+                                }
+                                if old_was_filled {
+                                    // L'ordre qu'on voulait repricer était DÉJÀ
+                                    // fillé : l'inventaire vient de changer — on
+                                    // ne pose RIEN ce tick (19:25 le 8 juil. :
+                                    // remplacer un ordre déjà rempli = achat en
+                                    // DOUBLE, 12 Up au lieu de 6 + taxe taker).
+                                    // Le tick suivant re-décide sur l'état à jour.
+                                    continue;
                                 }
                                 // RE-CLAMP au dernier moment : l'ask le plus
                                 // frais juste avant le POST (les awaits ci-dessus
