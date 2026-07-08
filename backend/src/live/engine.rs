@@ -28,7 +28,7 @@ pub enum MergeStart {
     WouldRevert, // déjà mergé on-chain (probable) → aligner le miroir
     Err,
 }
-use super::user_ws::{self, UserMsg};
+use super::user_ws::{self, OrderUpdate};
 
 /// Fill prêt pour la boucle stratégie.
 #[derive(Debug, Clone)]
@@ -45,21 +45,40 @@ pub struct RestingOrder {
     pub order_id: String,
     pub price: f64,
     pub size: f64,
-    pub matched: f64,   // cumul fillé déjà comptabilisé
+    pub matched: f64,   // cumul fillé déjà comptabilisé (recopié du grand livre)
     pub placed_ms: i64, // epoch ms du POST — un ordre trop frais peut être absent du poll (lag d'indexation)
+}
+
+/// UNE ligne du GRAND LIVRE par ordre (clé = order_id). C'est la SEULE source de
+/// vérité de comptabilité des fills. Incident du 8 juil. 23:33 : le WS ré-émet
+/// chaque trade 3-4 fois (statuts MATCHED/MINED/CONFIRMED) et par plusieurs
+/// canaux → un ordre Down de 6 parts compté 4× → inventaire fantôme −24 →
+/// 18 Up nus. La parade structurelle : on ne compte JAMAIS un montant de trade ;
+/// on ne suit que le `size_matched` ABSOLU par ordre, et on n'émet que le DELTA
+/// au-delà de ce qui est déjà compté. Rejouer le même event = delta 0.
+#[derive(Debug, Clone)]
+struct LedgerEntry {
+    is_up: bool,
+    size: f64,    // taille d'origine de l'ordre (plafond dur du cumul)
+    counted: f64, // cumul déjà ÉMIS en LiveFill (le size_matched absolu déjà pris en compte)
+    price: f64,   // prix limite (valorise les fills maker)
 }
 
 pub struct LiveCtx {
     pub creds: LiveCredentials,
     pub armed: bool,
     cond_tx: watch::Sender<Option<String>>,
-    fill_rx: mpsc::UnboundedReceiver<UserMsg>,
+    fill_rx: mpsc::UnboundedReceiver<OrderUpdate>,
     // token_ids du marché courant (associe asset_id/ordre → côté Up/Down)
     up_token: String,
     dn_token: String,
     condition_id: String,
-    // ordre_id → (is_up, maker) pour attribuer les fills WS
+    // ordre_id → (is_up, maker) — secours d'attribution quand l'asset_id manque
     order_side: HashMap<String, (bool, bool)>,
+    /// GRAND LIVRE par ordre : la seule comptabilité de fills. Tous les canaux
+    /// (POST, event `order`, poll, récolte) créditent via `credit()` avec un
+    /// size_matched ABSOLU → aucun double comptage possible. Purgé au rollover.
+    ledger: HashMap<String, LedgerEntry>,
     last_poll_ms: i64,
     /// Collatéral USDC réel : sync CLOB ~10 s + décrément IMMÉDIAT à chaque fill
     /// (plusieurs fills/merges par fenêtre → on doit savoir en quasi temps réel).
@@ -123,6 +142,7 @@ impl LiveCtx {
             dn_token: String::new(),
             condition_id: String::new(),
             order_side: HashMap::new(),
+            ledger: HashMap::new(),
             last_poll_ms: 0,
             cash: cash0,
             baseline,
@@ -148,6 +168,7 @@ impl LiveCtx {
         self.up_token = up_token.to_string();
         self.dn_token = dn_token.to_string();
         self.order_side.clear();
+        self.ledger.clear(); // nouveau marché = nouveaux order_ids
         let _ = self.cond_tx.send(Some(condition_id.to_string()));
         // Métadonnées RAW du nouveau marché (tick exact par token).
         if let Err(e) = orders::preload_token_meta(&[up_token, dn_token]).await {
@@ -293,16 +314,20 @@ impl LiveCtx {
         match orders::place_order(self.armed, &self.creds, token, args).await {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
                 self.order_side.insert(order_id.clone(), (is_up, true));
-                // Fill immédiat (GTC marketable malgré le clamp) : émis TOUT DE
-                // SUITE au prix moyen réel, et inscrit dans la baseline matched
-                // (les canaux WS/poll ne le recompteront pas).
+                // Enregistre l'ordre au grand livre (counted=0), puis crédite le
+                // fill immédiat éventuel (GTC marketable) au prix RÉEL — taker.
+                // Comme tout passe par `credit`, les events WS/poll ne
+                // recompteront jamais cette portion (idempotence par order_id).
                 let matched = filled_size.unwrap_or(0.0);
-                if matched > 0.0 {
-                    let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
-                    tracing::info!(matched, px, "GTC fillé au POST (marketable) — compté immédiatement");
-                    self.post_fills.push(LiveFill { is_up, price: px, size: matched, maker: false });
+                let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
+                if let Some(f) =
+                    Self::credit(&mut self.ledger, &order_id, is_up, size, matched, px, false)
+                {
+                    tracing::info!(matched = f.size, px, "GTC fillé au POST (marketable) — compté (taker)");
+                    self.post_fills.push(f);
                 }
-                Some(RestingOrder { order_id, price, size, matched, placed_ms: chrono::Utc::now().timestamp_millis() })
+                let counted = self.ledger.get(&order_id).map(|e| e.counted).unwrap_or(matched);
+                Some(RestingOrder { order_id, price, size, matched: counted, placed_ms: chrono::Utc::now().timestamp_millis() })
             }
             Ok(PlaceResult::DryRun) => None,
             Err(e) => {
@@ -320,11 +345,13 @@ impl LiveCtx {
         let args = OrderArgs { price, size, is_sell: false, gtc: false };
         match orders::place_order(self.armed, &self.creds, token, args).await {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
-                self.order_side.insert(order_id, (is_up, false));
+                self.order_side.insert(order_id.clone(), (is_up, false));
                 let matched = filled_size.unwrap_or(0.0);
-                if matched > 0.0 {
-                    let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
-                    self.post_fills.push(LiveFill { is_up, price: px, size: matched, maker: false });
+                let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
+                if let Some(f) =
+                    Self::credit(&mut self.ledger, &order_id, is_up, size, matched, px, false)
+                {
+                    self.post_fills.push(f);
                 }
             }
             Ok(PlaceResult::DryRun) => {}
@@ -353,10 +380,11 @@ impl LiveCtx {
                     let matched: f64 = v.get("size_matched")
                         .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
-                    if matched > r.matched + 1e-9 {
-                        let delta = matched - r.matched;
-                        tracing::info!(order_id = %r.order_id, delta, "fill récolté à l'annulation");
-                        fill = Some(LiveFill { is_up, price: r.price, size: delta, maker: true });
+                    if let Some(f) = Self::credit(
+                        &mut self.ledger, &r.order_id, is_up, r.size, matched, r.price, true,
+                    ) {
+                        tracing::info!(order_id = %r.order_id, delta = f.size, "fill récolté à l'annulation");
+                        fill = Some(f);
                     }
                 }
                 Err(e) => {
@@ -376,100 +404,87 @@ impl LiveCtx {
         }
     }
 
-    /// Draine le WS user : fills (`trade`) ET états d'ordres (`order`,
-    /// size_matched ABSOLU temps réel). Toute émission de fill d'un ordre
-    /// SUIVI passe par sa baseline `matched` — un même fill signalé par
-    /// plusieurs canaux (trade, order, poll, récolte) ne compte qu'UNE fois.
+    /// LE CHOKE-POINT de comptabilité. Crédite l'ordre `id` d'un `size_matched`
+    /// ABSOLU et n'émet QUE le delta au-delà de ce qui est déjà compté. Rejouer
+    /// le même montant (event ré-émis, autre canal) → delta 0. Plafonné à la
+    /// taille d'origine de l'ordre. C'est ce qui rend le double comptage
+    /// STRUCTURELLEMENT impossible (bug des −24 Down du 8 juil.).
+    fn credit(
+        ledger: &mut HashMap<String, LedgerEntry>,
+        id: &str,
+        is_up: bool,
+        size_hint: f64,
+        abs_matched: f64,
+        price: f64,
+        maker: bool,
+    ) -> Option<LiveFill> {
+        let e = ledger.entry(id.to_string()).or_insert(LedgerEntry {
+            is_up,
+            // Taille connue de l'ordre = plafond dur. Un size_matched aberrant
+            // (> taille) ne doit JAMAIS gonfler le plafond ; ce n'est qu'en
+            // l'absence de taille connue (hint 0) qu'on se rabat sur l'absolu.
+            size: if size_hint > 0.0 { size_hint } else { abs_matched },
+            counted: 0.0,
+            price,
+        });
+        // Une taille connue plus grande (hint fiable arrivé après) fait grandir
+        // le plafond ; jamais un simple size_matched.
+        if size_hint > e.size {
+            e.size = size_hint;
+        }
+        // plafond dur : ne jamais compter au-delà de la taille de l'ordre.
+        let target = abs_matched.min(e.size);
+        if target > e.counted + 1e-9 {
+            let delta = target - e.counted;
+            e.counted = target;
+            Some(LiveFill {
+                is_up: e.is_up,
+                price: if e.price > 0.0 { e.price } else { price },
+                size: delta,
+                maker,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Draine le WS user. Les events `order` portent le `size_matched` ABSOLU de
+    /// NOS ordres → seule voie de comptabilité temps réel (via `credit`). Les
+    /// events `trade` sont IGNORÉS pour la compta : le serveur les ré-émet par
+    /// statut (MATCHED/MINED/CONFIRMED) et ils portent des montants PAR TRADE —
+    /// les compter quadruplait l'inventaire (23:33 le 8 juil.). Le poll et le
+    /// POST couvrent tout fill qu'un event `order` raterait, avec le même absolu.
     pub fn drain_ws(
         &mut self,
         rest_up: &mut Option<RestingOrder>,
         rest_dn: &mut Option<RestingOrder>,
     ) -> Vec<LiveFill> {
         let mut out = std::mem::take(&mut self.post_fills);
-        while let Ok(msg) = self.fill_rx.try_recv() {
-            match msg {
-                UserMsg::Fill(f) => {
-                    // Attribution STRICTE par order_id connu : l'event trade contient
-                    // aussi l'ordre du taker ADVERSE — un fallback par asset_id
-                    // compterait son fill comme le nôtre (double comptage).
-                    match self.order_side.get(&f.order_id).copied() {
-                        Some((is_up, maker)) if !f.is_sell => {
-                            match Self::find_tracked(rest_up, rest_dn, &mut self.audit, &f.order_id) {
-                                Some(r) => {
-                                    // Borné au restant de l'ordre : idempotent.
-                                    let allowed = (r.size - r.matched).max(0.0).min(f.size);
-                                    if allowed > 1e-9 {
-                                        r.matched += allowed;
-                                        out.push(LiveFill { is_up, price: f.price, size: allowed, maker });
-                                    }
-                                }
-                                None if !maker => {
-                                    // FAK taker : jamais resting, le trade est l'unique canal.
-                                    out.push(LiveFill { is_up, price: f.price, size: f.size, maker });
-                                }
-                                None => {
-                                    // Maker connu mais suivi NULLE PART = fuite. On compte
-                                    // ce fill et on ouvre une baseline d'audit pour la suite.
-                                    tracing::error!(order_id = %f.order_id,
-                                        "fill d'un maker NON SUIVI — compté + mis en AUDIT");
-                                    self.audit.push((RestingOrder {
-                                        order_id: f.order_id.clone(),
-                                        price: f.price,
-                                        size: 1e9, // taille réelle inconnue : pas de cap
-                                        matched: f.size,
-                                        placed_ms: 0,
-                                    }, is_up, 0));
-                                    out.push(LiveFill { is_up, price: f.price, size: f.size, maker });
-                                }
-                            }
-                        }
-                        Some(_) => tracing::warn!(order_id = %f.order_id, "fill SELL inattendu (ignoré)"),
-                        None => tracing::debug!(order_id = %f.order_id, "fill d'un ordre inconnu (ignoré)"),
-                    }
-                }
-                UserMsg::Order(u) => {
-                    // Surveillance temps réel (8 juil.) : le size_matched ABSOLU de
-                    // l'event tranche IMMÉDIATEMENT — plus d'attente du poll 3 s.
-                    let Some((is_up, maker)) = self.order_side.get(&u.order_id).copied() else {
-                        if u.kind != "CANCELLATION" && u.size_matched > 0.0 {
-                            tracing::warn!(order_id = %u.order_id, kind = %u.kind,
-                                "event order d'un ordre INCONNU (autre process ?)");
-                        }
-                        continue;
-                    };
-                    if !maker {
-                        continue; // FAK : compté par son event trade uniquement
-                    }
-                    match Self::find_tracked(rest_up, rest_dn, &mut self.audit, &u.order_id) {
-                        Some(r) => {
-                            if u.size_matched > r.matched + 1e-9 {
-                                let delta = u.size_matched - r.matched;
-                                r.matched = u.size_matched;
-                                tracing::info!(order_id = %u.order_id, delta,
-                                    "fill vu par event ORDER (temps réel)");
-                                let px = if r.price > 0.0 { r.price } else { u.price };
-                                out.push(LiveFill { is_up, price: px, size: delta, maker });
-                            }
-                        }
-                        None if u.size_matched > 1e-9 => {
-                            tracing::error!(order_id = %u.order_id,
-                                "ordre CONNU mais non suivi (event order) — fill compté + AUDIT");
-                            out.push(LiveFill { is_up, price: u.price, size: u.size_matched, maker });
-                            self.audit.push((RestingOrder {
-                                order_id: u.order_id.clone(),
-                                price: u.price,
-                                size: u.size.max(u.size_matched),
-                                matched: u.size_matched,
-                                placed_ms: 0,
-                            }, is_up, 0));
-                        }
-                        None => {}
-                    }
-                }
+        while let Ok(u) = self.fill_rx.try_recv() {
+            if u.size_matched <= 0.0 {
+                continue;
+            }
+            // Côté déduit de l'asset_id (robuste), secours order_side.
+            let is_up = if !u.asset_id.is_empty() {
+                u.asset_id == self.up_token
+            } else {
+                self.order_side.get(&u.order_id).map(|(up, _)| *up).unwrap_or(false)
+            };
+            if let Some(f) = Self::credit(
+                &mut self.ledger, &u.order_id, is_up, u.size, u.size_matched, u.price, true,
+            ) {
+                tracing::info!(order_id = %u.order_id, delta = f.size,
+                    "fill (event order — size_matched absolu, temps réel)");
+                out.push(f);
             }
         }
-        // Slots entièrement fillés → libérés (re-quote possible).
+        // Slots : matched recopié du grand livre + libération si complet.
         for rest in [rest_up, rest_dn] {
+            if let Some(r) = rest.as_mut() {
+                if let Some(e) = self.ledger.get(&r.order_id) {
+                    r.matched = e.counted;
+                }
+            }
             if rest.as_ref().is_some_and(|r| r.matched >= r.size - 1e-6) {
                 *rest = None;
             }
@@ -477,26 +492,10 @@ impl LiveCtx {
         out
     }
 
-    /// Localise un ordre suivi (slot Up, slot Down, ou entrée d'audit).
-    fn find_tracked<'a>(
-        rest_up: &'a mut Option<RestingOrder>,
-        rest_dn: &'a mut Option<RestingOrder>,
-        audit: &'a mut Vec<(RestingOrder, bool, u32)>,
-        id: &str,
-    ) -> Option<&'a mut RestingOrder> {
-        if rest_up.as_ref().is_some_and(|r| r.order_id == id) {
-            return rest_up.as_mut();
-        }
-        if rest_dn.as_ref().is_some_and(|r| r.order_id == id) {
-            return rest_dn.as_mut();
-        }
-        audit.iter_mut().find(|(o, _, _)| o.order_id == id).map(|(o, _, _)| o)
-    }
-
-    /// Réconciliation par poll (autorité) — à appeler ~1×/3 s. Compare
-    /// `size_matched` du CLOB au cumul déjà comptabilisé sur nos ordres
-    /// restants et synthétise les fills manqués par le WS. Met aussi à jour
-    /// `matched`/présence des ordres (absent = fillé en entier ou annulé).
+    /// Réconciliation par poll (autorité, ~1×/3 s). Le CLOB donne le
+    /// `size_matched` ABSOLU de chaque ordre → on le passe à `credit` : il émet
+    /// le delta manqué par le WS, ou rien s'il est déjà compté. Même absolu, même
+    /// choke-point que le temps réel → jamais de double comptage entre les voies.
     pub async fn reconcile(
         &mut self,
         rest_up: &mut Option<RestingOrder>,
@@ -508,8 +507,8 @@ impl LiveCtx {
             return out;
         }
         self.last_poll_ms = now_ms;
-        // AUDIT d'abord : les ordres retirés sans lecture réussie sont réinterrogés
-        // jusqu'à vérité connue (un ordre clos reste consultable sur /data/order).
+        // AUDIT d'abord : les ordres à lecture ratée sont réinterrogés jusqu'à
+        // vérité connue (un ordre clos reste consultable sur /data/order).
         let mut audit = std::mem::take(&mut self.audit);
         for (r, is_up, tries) in &mut audit {
             match super::auth::l2_request(
@@ -521,20 +520,19 @@ impl LiveCtx {
                     let matched: f64 = v.get("size_matched")
                         .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
-                    if matched > r.matched + 1e-9 {
-                        let delta = matched - r.matched;
-                        tracing::info!(order_id = %r.order_id, delta, "fill récupéré par AUDIT");
-                        out.push(LiveFill { is_up: *is_up, price: r.price, size: delta, maker: true });
+                    if let Some(f) = Self::credit(
+                        &mut self.ledger, &r.order_id, *is_up, r.size, matched, r.price, true,
+                    ) {
+                        tracing::info!(order_id = %r.order_id, delta = f.size, "fill récupéré par AUDIT");
+                        out.push(f);
                     }
                     *tries = u32::MAX; // tranché → sortie de l'audit
                 }
                 Err(e) => {
                     *tries += 1;
                     if *tries >= 40 {
-                        // ~2 min d'échecs : on abandonne BRUYAMMENT — le sync des
-                        // positions on-chain (60 s) reste le filet de sécurité.
                         tracing::error!(order_id = %r.order_id, error = %e,
-                            "AUDIT abandonné après 40 échecs — fill éventuel invisible au journal (positions resyncées on-chain)");
+                            "AUDIT abandonné après 40 échecs — filet = resync positions on-chain (60 s)");
                         *tries = u32::MAX;
                     }
                 }
@@ -557,12 +555,14 @@ impl LiveCtx {
             let Some(r) = rest.as_mut() else { continue };
             match open.iter().find(|o| o.id == r.order_id) {
                 Some(o) => {
-                    let matched = o.matched();
-                    if matched > r.matched + 1e-9 {
-                        let delta = matched - r.matched;
-                        tracing::info!(order_id = %r.order_id, delta, "fill rattrapé par le poll");
-                        out.push(LiveFill { is_up, price: r.price, size: delta, maker: true });
-                        r.matched = matched;
+                    if let Some(f) = Self::credit(
+                        &mut self.ledger, &r.order_id, is_up, r.size, o.matched(), r.price, true,
+                    ) {
+                        tracing::info!(order_id = %r.order_id, delta = f.size, "fill rattrapé par le poll");
+                        out.push(f);
+                    }
+                    if let Some(e) = self.ledger.get(&r.order_id) {
+                        r.matched = e.counted;
                     }
                 }
                 None => {
@@ -572,23 +572,22 @@ impl LiveCtx {
                     if now_ms - r.placed_ms < 10_000 {
                         continue;
                     }
-                    // Plus au carnet : fillé en entier, ou annulé. On compte le
-                    // reliquat comme fillé UNIQUEMENT si le WS ne l'a pas déjà
-                    // fait — impossible à distinguer ici sans /data/order/{id} ;
-                    // on interroge l'ordre individuellement pour trancher.
+                    // Absent du carnet = fillé en entier ou annulé : on lit son
+                    // size_matched final et on crédite le reliquat éventuel.
                     match super::auth::l2_request(
                         &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
                     ).await {
                         Ok(text) => {
                             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                            let v = v.get("data").cloned().unwrap_or(v); // enveloppe éventuelle
+                            let v = v.get("data").cloned().unwrap_or(v);
                             let matched: f64 = v.get("size_matched")
                                 .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
                                 .unwrap_or(0.0);
-                            if matched > r.matched + 1e-9 {
-                                let delta = matched - r.matched;
-                                tracing::info!(order_id = %r.order_id, delta, "fill final rattrapé (ordre clos)");
-                                out.push(LiveFill { is_up, price: r.price, size: delta, maker: true });
+                            if let Some(f) = Self::credit(
+                                &mut self.ledger, &r.order_id, is_up, r.size, matched, r.price, true,
+                            ) {
+                                tracing::info!(order_id = %r.order_id, delta = f.size, "fill final rattrapé (ordre clos)");
+                                out.push(f);
                             }
                         }
                         Err(e) => {
@@ -602,10 +601,9 @@ impl LiveCtx {
             }
         }
         self.audit.extend(new_audit);
-        // BALAYAGE ANTI DOUBLE-ORDRE (8 juil.) : tout ordre OUVERT au carnet
-        // doit coïncider avec ce que le bot suit (slots + audit). Un survivant
-        // inconnu = ordre fantôme → ANNULÉ immédiatement, et audité pour que
-        // ses fills éventuels entrent quand même dans la comptabilité.
+        // BALAYAGE ANTI DOUBLE-ORDRE : tout ordre OUVERT au carnet inconnu des
+        // slots/audit → annulé, et crédité via le grand livre (donc jamais
+        // recompté s'il y était déjà via son POST).
         for o in &open {
             if tracked_ids.iter().any(|t| t == &o.id) {
                 continue;
@@ -616,24 +614,68 @@ impl LiveCtx {
                 .map(|(u, _)| *u)
                 .unwrap_or(o.asset_id == self.up_token);
             tracing::error!(order_id = %o.id, is_up,
-                "ordre OUVERT au carnet INCONNU du suivi — annulé + audité");
-            self.audit.push((RestingOrder {
-                order_id: o.id.clone(),
-                price: o.price.parse().unwrap_or(0.0),
-                size: o.original_size.parse().unwrap_or(0.0),
-                matched: o.matched(),
-                placed_ms: 0,
-            }, is_up, 0));
-            out.push(LiveFill {
-                is_up,
-                price: o.price.parse().unwrap_or(0.0),
-                size: o.matched(),
-                maker: true,
-            });
+                "ordre OUVERT au carnet INCONNU du suivi — annulé + crédité");
+            let px = o.price.parse().unwrap_or(0.0);
+            let sz = o.original_size.parse().unwrap_or(0.0);
+            if let Some(f) = Self::credit(&mut self.ledger, &o.id, is_up, sz, o.matched(), px, true) {
+                out.push(f);
+            }
             let _ = orders::cancel_order(&self.creds, &o.id).await;
         }
         out.retain(|f| f.size > 1e-9);
         out
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Le bug du 8 juil. 23:33 : un ordre Down de 6 parts, re-signalé par le WS à
+    // chaque statut (MATCHED/MINED/CONFIRMED) et par plusieurs canaux, compté 4×
+    // → inventaire fantôme. `credit` doit rendre ce scénario IMPOSSIBLE.
+    #[test]
+    fn credit_is_idempotent_across_repeats_and_channels() {
+        let mut l: HashMap<String, LedgerEntry> = HashMap::new();
+        let mut total = 0.0;
+        // même size_matched absolu (6) émis 4 fois (statuts + canaux) :
+        for _ in 0..4 {
+            if let Some(f) = LiveCtx::credit(&mut l, "ord-A", false, 6.0, 6.0, 0.80, true) {
+                total += f.size;
+            }
+        }
+        assert!((total - 6.0).abs() < 1e-9, "6 parts comptées 1×, pas 24 : {total}");
+    }
+
+    #[test]
+    fn credit_emits_only_incremental_deltas() {
+        let mut l: HashMap<String, LedgerEntry> = HashMap::new();
+        // fills partiels cumulatifs 3 → 5 → 5 (répété) → 6
+        let mut total = 0.0;
+        for m in [3.0, 5.0, 5.0, 6.0] {
+            if let Some(f) = LiveCtx::credit(&mut l, "ord-B", true, 6.0, m, 0.50, true) {
+                total += f.size;
+            }
+        }
+        assert!((total - 6.0).abs() < 1e-9, "somme des deltas = 6 : {total}");
+    }
+
+    #[test]
+    fn credit_post_fill_then_order_event_no_double() {
+        let mut l: HashMap<String, LedgerEntry> = HashMap::new();
+        // POST : 6 fillés au marché (taker)
+        let post = LiveCtx::credit(&mut l, "ord-C", true, 6.0, 6.0, 0.56, false).unwrap();
+        assert!((post.size - 6.0).abs() < 1e-9);
+        assert!(!post.maker);
+        // l'event `order` rapporte le même size_matched absolu (6) → rien de plus
+        assert!(LiveCtx::credit(&mut l, "ord-C", true, 6.0, 6.0, 0.56, true).is_none());
+    }
+
+    #[test]
+    fn credit_never_exceeds_order_size() {
+        let mut l: HashMap<String, LedgerEntry> = HashMap::new();
+        // un size_matched aberrant (> taille) est plafonné à la taille de l'ordre
+        let f = LiveCtx::credit(&mut l, "ord-D", true, 6.0, 99.0, 0.10, true).unwrap();
+        assert!((f.size - 6.0).abs() < 1e-9, "plafonné à 6 : {}", f.size);
+    }
 }
