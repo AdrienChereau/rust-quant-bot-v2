@@ -179,7 +179,9 @@ impl LiveCtx {
         self.relayer.is_some()
             && self.merge_inflight.is_none()
             && self.armed
-            && now - self.last_merge_attempt_ms >= 45_000 // cooldown anti-spam/429
+            && now - self.last_merge_attempt_ms >= 10_000 // garde technique anti-spam
+        // (le VRAI cooldown stratégique — paire > 1$ — vit dans l'executor ;
+        //  ici : 10 s entre tentatives, pénalité +35 s sur échec relayer)
     }
 
     /// Force la resynchronisation du collatéral au prochain tick.
@@ -226,6 +228,8 @@ impl LiveCtx {
             Err(e) => {
                 let msg = e.to_string();
                 tracing::warn!(error = %msg, "merge relayer refusé");
+                // Pénalité : échec relayer (429/refus) → prochaine tentative à +45 s.
+                self.last_merge_attempt_ms = chrono::Utc::now().timestamp_millis() + 35_000;
                 if msg.contains("would revert") || msg.contains("reverted") {
                     MergeStart::WouldRevert
                 } else {
@@ -242,6 +246,7 @@ impl LiveCtx {
             Ok(TxOutcome::Confirmed) => {
                 let p = *pairs;
                 self.merge_inflight = None;
+                self.last_merge_attempt_ms = 0; // volume : merge suivant sans attendre
                 self.last_cash_sync_ms = 0; // force le resync du collatéral
                 self.positions_dirty = true;
                 Some(p)

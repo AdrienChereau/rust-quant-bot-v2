@@ -203,6 +203,13 @@ async function tick() {
   const li = $('li'); li.textContent = (imbNow > 0 ? '+' : '') + f(imbNow, 0);
   li.className = 'cv ' + (Math.abs(imbNow) > 100 ? 'neg' : '');
   $('lpc').textContent = cents(s.pair_cost);
+  const mpa = $('lmpa');
+  if (mpa) {
+    mpa.textContent = s.merge_pair_avg ? cents(s.merge_pair_avg) : '–';
+    // qualité d'exécution : vert ≤ 1,00$, rouge au-delà (le salaire = rebates,
+    // la paire au merge doit coller à 1$)
+    mpa.className = 'cv ' + (s.merge_pair_avg > 1.0 ? 'neg' : s.merge_pair_avg > 0 ? 'pos' : '');
+  }
   $('ld').textContent = f(s.deployed, 2) + '$';
   $('lr').textContent = f(s.rebate_window, 2) + '$';
   $('lsf').textContent = '×' + f(s.size_factor, 2) + (s.loss_streak ? ` (${s.loss_streak}p)` : '');

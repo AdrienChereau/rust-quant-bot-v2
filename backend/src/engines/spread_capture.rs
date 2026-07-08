@@ -43,7 +43,13 @@ pub struct SpreadCaptureConfig {
     /// H6 : la complétion (réduire l'imbalance) BYPASSE le gate fair (chez la cible :
     /// edge médian −4,3¢ = prime d'assurance), mais reste bornée :
     pub completion_max_price: f64, // prix max d'une jambe de complétion (0.35)
-    pub completion_max_pair: f64,  // la paire complétée doit rester ≤ ce plafond (0.99)
+    /// Plafond DUR de paire — réservé aux voies d'ESCALADE (urgence Tokyo,
+    /// assurance FAK). La cible DOUCE du quoting normal est ≈ 1,00 : le merge
+    /// n'est pas un centre de profit, c'est la pompe à volume (rebates).
+    pub completion_max_pair: f64,
+    /// Plus d'ouvertures sous N s restantes (0xb27b coupe ~t=240 s) ;
+    /// complétions et assurance continuent jusqu'au bout.
+    pub opening_stop_s: i64,
 }
 
 /// Durée d'une fenêtre (marchés 5 min uniquement).
@@ -415,7 +421,10 @@ impl SpreadCaptureEngine {
             return out;
         }
         let tick = if tick > 0.0 { tick } else { 0.01 };
-        let pair_target = c.completion_max_pair.min(0.999);
+        // Cible DOUCE ≈ 1,00 : on vise le volume (paire au plus près de 1$),
+        // pas la marge par merge. Le hard cap (completion_max_pair) n'est
+        // appliqué qu'aux escalades, côté executor.
+        let pair_target = c.completion_max_pair.min(1.0);
         for side in [Side::Up, Side::Down] {
             let (my, other, bb, bb_other) = match side {
                 Side::Up => (self.shares_up, self.shares_dn, best_bid_up, best_bid_dn),
@@ -454,6 +463,9 @@ impl SpreadCaptureEngine {
                 // que se construit le profit ; la complétion, elle, assure.)
                 if WINDOW_SECS - remaining_s < c.min_window_age_s {
                     continue;
+                }
+                if remaining_s < c.opening_stop_s {
+                    continue; // fin de fenêtre : plus d'ouvertures (complétions seules)
                 }
                 (pair_target - (bb_other + tick), c.base_clip, false)
             };
@@ -555,6 +567,7 @@ mod tests {
             pullback_filter: true,
             completion_max_price: 0.35,
             completion_max_pair: 0.99,
+            opening_stop_s: 0, // tests : pas de coupure d'ouverture par défaut
         }
     }
 
@@ -807,6 +820,20 @@ mod tests {
         let pair_target = e.cfg.completion_max_pair.min(0.999);
         let complement = pair_target - 0.60;
         assert!(q[0].price <= complement + 1e-9, "paie ≤ complément: {} vs {}", q[0].price, complement);
+    }
+
+    #[test]
+    fn symmetric_opening_stops_late_window_completion_survives() {
+        let mut e = eng();
+        e.cfg.opening_stop_s = 60; // spec : plus d'ouvertures sous 60 s restantes
+        // Équilibré → l'ouverture serait désirée… mais il reste 50 s : rien.
+        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 100, 0.01, 1.0);
+        assert!(q.is_empty(), "pas d'ouverture en fin de fenêtre: {q:?}");
+        // Déficit Down → la complétion, elle, continue jusqu'au bout.
+        e.on_fill(Side::Up, 0.50, 10.0, 0);
+        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 200, 0.01, 1.0);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].completion && q[0].side == Side::Down);
     }
 
     #[test]

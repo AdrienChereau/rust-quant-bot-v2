@@ -81,7 +81,8 @@ pub struct Config {
     pub sc_pullback_filter: bool,     // directionnel seulement sur micro-repli 5 s
     pub sc_pullback_s: i64,           // horizon du micro-repli (s)
     pub sc_completion_max_price: f64, // prix max d'une jambe de complétion
-    pub sc_completion_max_pair: f64,  // plafond de paire pour la complétion
+    pub sc_completion_max_pair: f64,  // plafond DUR de paire (voies d'escalade : urgence/assurance)
+    pub sc_opening_stop_s: i64,       // plus d'OUVERTURES sous N s restantes (0xb27b coupe ~t=240 s)
     // v8 maker (copie complète, recalibrée sur 234 fenêtres)
     pub sc_directional_max: f64,   // borne absolue du prix directionnel (0.90 — il charge jusqu'à 87c)
     pub sc_directional_min: f64,   // bid directionnel INTERDIT si best_bid < ce seuil (la cible accumule le favori 66-72c, jamais le couteau)
@@ -215,7 +216,8 @@ impl Config {
             sc_pullback_filter: std::env::var("SC_PULLBACK_FILTER").map(|v| v != "false").unwrap_or(true),
             sc_pullback_s: env_or("SC_PULLBACK_S", 5),
             sc_completion_max_price: env_or("SC_COMPLETION_MAX_PRICE", 0.65),
-            sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.05),
+            sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.02),
+            sc_opening_stop_s: env_or("SC_OPENING_STOP_S", 60.0) as i64,
             sc_directional_max: env_or("SC_DIRECTIONAL_MAX", 0.90),
             sc_directional_min: env_or("SC_DIRECTIONAL_MIN", 0.40),
             sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),

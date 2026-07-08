@@ -154,6 +154,14 @@ async fn quote_loop(
     let mut last_insurance_ms: i64 = 0;
     #[cfg(feature = "live")]
     let mut last_place_ms: [i64; 2] = [0, 0]; // anti-churn : ≥4 s entre replaces par côté
+    // Cooldown STRATÉGIQUE (spec volume/rebates) : après un merge à paire > 1$,
+    // pas d'ESCALADE (urgence) pendant 45 s — mais ouvertures et complétions au
+    // complément continuent : elles ABAISSENT le blended (moyenne à la baisse).
+    #[cfg(feature = "live")]
+    let mut urgency_block_until: i64 = 0;
+    // Qualité d'exécution : coût de paire blended AU MOMENT de chaque merge.
+    let mut win_merge_cost_sum = 0.0f64;
+    let mut win_merge_n: u32 = 0;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
@@ -187,6 +195,7 @@ async fn quote_loop(
         pullback_filter: cfg.sc_pullback_filter,
         completion_max_price: cfg.sc_completion_max_price,
         completion_max_pair: cfg.sc_completion_max_pair,
+        opening_stop_s: cfg.sc_opening_stop_s,
     });
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash, cfg.max_position, cfg.min_merge_threshold, cfg.safety_mult,
@@ -358,6 +367,8 @@ async fn quote_loop(
                     win_rebate = 0.0;
                     win_merged = 0.0;
                     win_deployed = 0.0;
+                    win_merge_cost_sum = 0.0;
+                    win_merge_n = 0;
                     win_fills = 0;
                     win_imb_max = 0.0;
                     tracing::info!(
@@ -592,14 +603,23 @@ async fn quote_loop(
         }
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
+        #[cfg(feature = "live")]
+        let urgency_blocked = now_s < urgency_block_until;
+        #[cfg(not(feature = "live"))]
+        let urgency_blocked = false;
         for b in desired.iter_mut() {
             if b.completion
+                && !urgency_blocked
                 && crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
                 if ask > tick_sz {
+                    // Plafond DUR de paire (escalade) : avg jambe excédentaire + prix ≤ cap.
+                    let avg_excess = sc.avg(match b.side { Side::Up => Side::Down, Side::Down => Side::Up });
+                    let pair_room = (cfg.sc_completion_max_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
-                    let capped = aggressive.min(cfg.sc_completion_max_price);
+                    let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room)) / tick_sz)
+                        .floor() * tick_sz;
                     if capped > b.price + 1e-9 {
                         tracing::info!(side = ?b.side, from = b.price, to = capped,
                             drift = format!("{drift_ps:+.4}"), "complétion URGENTE (Tokyo)");
@@ -768,7 +788,9 @@ async fn quote_loop(
                 } else {
                     (true, ask_up, ask_up_sz)
                 };
-                if ask > 0.0 && ask <= 0.99 {
+                let avg_excess_ins = sc.avg(if is_up { Side::Down } else { Side::Up });
+                let pair_room_ins = cfg.sc_completion_max_pair - avg_excess_ins;
+                if ask > 0.0 && ask <= 0.99 && ask <= pair_room_ins + 1e-9 {
                     // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
                     // par les minimums relançait la spirale). Sous les minimums →
                     // résidu accepté, perte bornée.
@@ -784,6 +806,16 @@ async fn quote_loop(
             // ≥ MIN_MERGE_THRESHOLD) — un seul en vol ; à la confirmation, le
             // miroir merge + le moteur recycle son budget + le cash se resynce.
             if let Some(pairs_done) = lv.poll_merge_done() {
+                // Qualité d'exécution + cooldown stratégique : blended AU merge.
+                if let Some(blended) = sc.pair_cost() {
+                    win_merge_cost_sum += blended;
+                    win_merge_n += 1;
+                    if blended > 1.0 + 1e-9 {
+                        urgency_block_until = now_s + 45;
+                        tracing::info!(blended = format!("{blended:.3}"),
+                            "merge à paire > 1$ — escalade gelée 45 s (le quoting ≤1$ continue)");
+                    }
+                }
                 // Crédit EXACT : uniquement les paires de LA transaction (le
                 // check_and_merge global sur-créditait → PnL fantôme au dashboard).
                 let p = pairs_done
@@ -800,18 +832,25 @@ async fn quote_loop(
                 win_merged += p;
                 tracing::info!(pairs_tx = pairs_done, credited = p, "merge on-chain appliqué (crédit exact)");
             }
-            let elapsed_l = 300 - m.time_remaining_sec();
+            // MERGE = pompe à volume : dès le seuil technique atteint, sans
+            // attendre (spec 8 juil. — le capital qui dort ne génère pas de
+            // rebates). Le blended >1$ ne bloque PAS le merge : il gèle
+            // seulement l'escalade (ci-dessus).
             let mirror_pairs = paper.state.up_balance.min(paper.state.down_balance);
-            if elapsed_l >= 90
-                && mirror_pairs >= cfg.min_merge_threshold
-                && lv.merge_available()
-            {
+            if mirror_pairs >= cfg.min_merge_threshold && lv.merge_available() {
                 let pairs = mirror_pairs.floor();
                 match lv.start_merge(pairs).await {
                     crate::live::engine::MergeStart::WouldRevert => {
                         // La simulation refuse = les tokens n'y sont plus → le
                         // merge PRÉCÉDENT est passé malgré le timeout de suivi.
                         // Crédit EXACT + resync (la vérité on-chain tranchera).
+                        if let Some(blended) = sc.pair_cost() {
+                            win_merge_cost_sum += blended;
+                            win_merge_n += 1;
+                            if blended > 1.0 + 1e-9 {
+                                urgency_block_until = now_s + 45;
+                            }
+                        }
                         let p = pairs
                             .min(paper.state.up_balance)
                             .min(paper.state.down_balance)
@@ -989,6 +1028,7 @@ async fn quote_loop(
             d.size_factor = size_factor;
             d.loss_streak = loss_streak;
             d.pair_cost = sc.pair_cost().unwrap_or(0.0);
+            d.merge_pair_avg = if win_merge_n > 0 { win_merge_cost_sum / win_merge_n as f64 } else { 0.0 };
             d.deployed = win_deployed;
             d.window_start = m.window_ts;
             d.params = crate::dashboard::StrategyParams {
