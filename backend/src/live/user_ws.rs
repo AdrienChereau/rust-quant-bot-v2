@@ -68,11 +68,18 @@ pub fn spawn(
                 if cond_rx.changed().await.is_err() { return; }
             };
             match run_session(&creds, &condition_id, &mut cond_rx, &fill_tx).await {
-                Ok(()) => tracing::info!("user_ws: session terminée, reconnexion dans {backoff}s"),
-                Err(e) => tracing::warn!(error = %e, backoff, "user_ws: erreur, reconnexion"),
+                Ok(()) => {
+                    // Fin PROPRE (rollover/fermeture serveur) : reconnexion
+                    // immédiate — le backoff est réservé aux vraies erreurs.
+                    backoff = 1;
+                    tracing::info!("user_ws: session terminée, reconnexion immédiate");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, backoff, "user_ws: erreur, reconnexion");
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF_S);
+                }
             }
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF_S);
         }
     });
     (cond_tx, fill_rx)
@@ -116,11 +123,12 @@ async fn run_session(
                 sink.send(Message::Ping(vec![].into())).await?;
             }
             Ok(()) = cond_rx.changed() => {
-                let new_id = cond_rx.borrow().clone();
-                if let Some(id) = new_id {
-                    tracing::info!("user_ws: resouscription rollover");
-                    subscribe(&mut sink, creds, &id).await?;
-                }
+                // Le serveur REJETTE une 2e souscription sur la même connexion
+                // (« INVALID OPERATION » à chaque rollover — le canal était
+                // sourd dès la 2e fenêtre). Une souscription par connexion :
+                // on ferme, la boucle parente reconnecte avec le nouveau marché.
+                tracing::info!("user_ws: rollover → reconnexion (une souscription par connexion)");
+                return Ok(());
             }
         }
     }
