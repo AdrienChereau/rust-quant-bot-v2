@@ -192,9 +192,16 @@ fn tail_json(path: &str, max: usize) -> String {
 pub type Shared = Arc<RwLock<DashboardState>>;
 
 pub fn shared(dry_run: bool, role: &str) -> Shared {
+    // SÉCURITÉ DE DÉPLOIEMENT (demande du 8 juil.) : en LIVE, le bot démarre
+    // TOUJOURS sur OFF — c'est un humain qui clique ON après avoir vérifié le
+    // déploiement. Le paper, lui, démarre ON (aucun risque, données continues).
+    let trading_enabled = dry_run;
+    if !dry_run {
+        tracing::warn!("LIVE démarré interrupteur OFF — activer le trading via le bouton ON du dashboard");
+    }
     Arc::new(RwLock::new(DashboardState {
         dry_run,
-        trading_enabled: true,
+        trading_enabled,
         role: role.into(),
         ..Default::default()
     }))
