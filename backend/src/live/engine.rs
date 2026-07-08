@@ -45,7 +45,8 @@ pub struct RestingOrder {
     pub order_id: String,
     pub price: f64,
     pub size: f64,
-    pub matched: f64, // cumul fillé déjà comptabilisé
+    pub matched: f64,   // cumul fillé déjà comptabilisé
+    pub placed_ms: i64, // epoch ms du POST — un ordre trop frais peut être absent du poll (lag d'indexation)
 }
 
 pub struct LiveCtx {
@@ -301,7 +302,7 @@ impl LiveCtx {
                     tracing::info!(matched, px, "GTC fillé au POST (marketable) — compté immédiatement");
                     self.post_fills.push(LiveFill { is_up, price: px, size: matched, maker: false });
                 }
-                Some(RestingOrder { order_id, price, size, matched })
+                Some(RestingOrder { order_id, price, size, matched, placed_ms: chrono::Utc::now().timestamp_millis() })
             }
             Ok(PlaceResult::DryRun) => None,
             Err(e) => {
@@ -416,6 +417,7 @@ impl LiveCtx {
                                         price: f.price,
                                         size: 1e9, // taille réelle inconnue : pas de cap
                                         matched: f.size,
+                                        placed_ms: 0,
                                     }, is_up, 0));
                                     out.push(LiveFill { is_up, price: f.price, size: f.size, maker });
                                 }
@@ -458,6 +460,7 @@ impl LiveCtx {
                                 price: u.price,
                                 size: u.size.max(u.size_matched),
                                 matched: u.size_matched,
+                                placed_ms: 0,
                             }, is_up, 0));
                         }
                         None => {}
@@ -563,6 +566,12 @@ impl LiveCtx {
                     }
                 }
                 None => {
+                    // LAG D'INDEXATION (8 juil. 18:16) : un ordre posté il y a
+                    // <10 s peut ne pas encore apparaître dans /data/orders —
+                    // le slot libéré à tort = ordre DOUBLE posé par-dessus.
+                    if now_ms - r.placed_ms < 10_000 {
+                        continue;
+                    }
                     // Plus au carnet : fillé en entier, ou annulé. On compte le
                     // reliquat comme fillé UNIQUEMENT si le WS ne l'a pas déjà
                     // fait — impossible à distinguer ici sans /data/order/{id} ;
@@ -613,6 +622,7 @@ impl LiveCtx {
                 price: o.price.parse().unwrap_or(0.0),
                 size: o.original_size.parse().unwrap_or(0.0),
                 matched: o.matched(),
+                placed_ms: 0,
             }, is_up, 0));
             out.push(LiveFill {
                 is_up,

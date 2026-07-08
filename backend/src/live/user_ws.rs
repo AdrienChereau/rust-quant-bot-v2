@@ -149,6 +149,12 @@ async fn subscribe(
 fn process_message(txt: &str, fill_tx: &mpsc::UnboundedSender<UserMsg>) {
     // Diagnostic (validation live) : trace brute de TOUT ce que le canal envoie
     // — c'est notre seul moyen de vérifier le schéma réel des events maker.
+    if txt.contains("INVALID OPERATION") {
+        // La souscription a été REJETÉE : aucun event trade/order n'arrivera —
+        // le poll 3 s reste la seule source (il tient, mais on perd le temps réel).
+        tracing::error!("user_ws: souscription REJETÉE (INVALID OPERATION) — vérifier apiKey/secret/passphrase et le format markets[]");
+        return;
+    }
     tracing::info!(raw = %txt.chars().take(400).collect::<String>(), "user_ws event");
     let events = parse_events::<UserEvent>(txt);
     for ev in events {

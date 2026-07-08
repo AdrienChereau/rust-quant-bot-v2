@@ -159,6 +159,11 @@ async fn quote_loop(
     // complément continuent : elles ABAISSENT le blended (moyenne à la baisse).
     #[cfg(feature = "live")]
     let mut urgency_block_until: i64 = 0;
+    // Epoch ms du dernier fill appliqué : un fill CLOB met quelques secondes à
+    // se régler on-chain — aligner le miroir sur une lecture chaîne faite dans
+    // cette fenêtre EFFACE des fills corrects (incident 18:15:34).
+    #[cfg(feature = "live")]
+    let mut last_fill_wall_ms: i64 = 0;
     // Qualité d'exécution : coût de paire blended AU MOMENT de chaque merge.
     let mut win_merge_cost_sum = 0.0f64;
     let mut win_merge_n: u32 = 0;
@@ -751,6 +756,7 @@ async fn quote_loop(
             fills.append(&mut harvested);
             fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
             for f in fills {
+                last_fill_wall_ms = now_ms_books as i64;
                 lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
                 let side = if f.is_up { Side::Up } else { Side::Down };
                 let ltype = if f.maker { "maker" } else { "taker" };
@@ -841,30 +847,15 @@ async fn quote_loop(
                 let pairs = mirror_pairs.floor();
                 match lv.start_merge(pairs).await {
                     crate::live::engine::MergeStart::WouldRevert => {
-                        // La simulation refuse = les tokens n'y sont plus → le
-                        // merge PRÉCÉDENT est passé malgré le timeout de suivi.
-                        // Crédit EXACT + resync (la vérité on-chain tranchera).
-                        if let Some(blended) = sc.pair_cost() {
-                            win_merge_cost_sum += blended;
-                            win_merge_n += 1;
-                            if blended > 1.0 + 1e-9 {
-                                urgency_block_until = now_s + 45;
-                            }
-                        }
-                        let p = pairs
-                            .min(paper.state.up_balance)
-                            .min(paper.state.down_balance)
-                            .max(0.0);
-                        paper.state.up_balance -= p;
-                        paper.state.down_balance -= p;
-                        paper.state.merges += 1;
-                        paper.persist();
-                        lv.cash += p;
-                        sc.on_merge(p);
-                        win_merged += p;
+                        // AMBIGU (leçon du 8 juil. 18:15) : « would revert » peut
+                        // vouloir dire (a) merge précédent déjà passé, ou (b) les
+                        // tokens fraîchement fillés ne sont PAS ENCORE réglés
+                        // on-chain. Créditer ici a fabriqué un déficit fantôme →
+                        // sur-achat. On ne crédite RIEN : resync forcé, la vérité
+                        // on-chain tranche, et la tentative revient dans 45 s.
                         lv.force_cash_resync();
-                        tracing::info!(pairs_tx = pairs, credited = p,
-                            "merge déjà passé on-chain (would revert) — crédit exact");
+                        tracing::warn!(pairs_tx = pairs,
+                            "merge simulé refusé (would revert) — AUCUN crédit, resync on-chain forcé");
                     }
                     _ => {}
                 }
@@ -874,7 +865,11 @@ async fn quote_loop(
             // (≤1×/60 s, ou immédiatement après un merge/redeem incertain).
             // Incident du 7 juil. : miroir « équilibré » ≠ réalité déséquilibrée
             // → aucune complétion pendant que la vraie jambe mourait.
-            if let Some((ru, rd)) = lv.real_positions(now_ms_books as i64).await {
+            let settle_quiet = now_ms_books as i64 - last_fill_wall_ms >= 15_000;
+            if !settle_quiet {
+                // fills récents : la chaîne est en retard sur le CLOB — tout
+                // alignement maintenant écraserait la vérité fraîche du miroir.
+            } else if let Some((ru, rd)) = lv.real_positions(now_ms_books as i64).await {
                 let (mu, md) = (paper.state.up_balance, paper.state.down_balance);
                 if (ru - mu).abs() > 0.5 || (rd - md).abs() > 0.5 {
                     tracing::warn!(
