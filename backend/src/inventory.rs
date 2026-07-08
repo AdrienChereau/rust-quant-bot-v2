@@ -118,6 +118,32 @@ impl PaperEngine {
         true
     }
 
+    /// Comptabilise un fill RÉEL déjà exécuté on-chain — SANS AUCUN REJET.
+    /// (Bug du 8 juil. : `try_buy` refusait silencieusement les fills réels
+    /// quand le cash MIROIR était épuisé → dashboard à 18 Up quand la réalité
+    /// en avait 36, moteur aveugle qui ré-ouvrait en boucle. Le miroir
+    /// enregistre la réalité, il ne la valide pas.)
+    pub fn apply_live_fill(&mut self, side: &str, price: f64, size: f64, liquidity_type: &str) {
+        if size <= 0.0 {
+            return;
+        }
+        let cost = size * price;
+        self.state.cash_usdc -= cost;
+        if self.state.cash_usdc < -0.01 {
+            tracing::warn!(
+                cash_miroir = format!("{:.2}", self.state.cash_usdc),
+                "cash miroir négatif — désynchronisé de la réalité (le sync le réalignera)"
+            );
+        }
+        match side {
+            "up" => self.state.up_balance += size,
+            _ => self.state.down_balance += size,
+        }
+        self.state.fills += 1;
+        if liquidity_type == "maker" { self.state.maker_fills += 1 } else { self.state.taker_fills += 1 }
+        self.append_trade("buy", side, liquidity_type, price, size);
+    }
+
     /// Applique une VENTE de `size` tokens à `price`. Pas de vente à découvert :
     /// on ne vend que ce qu'on détient.
     #[allow(dead_code)] // réservé au chemin live

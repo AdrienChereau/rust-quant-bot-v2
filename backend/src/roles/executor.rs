@@ -284,10 +284,9 @@ async fn quote_loop(
                                 if let Some(r) = r {
                                     if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
                                         let side = if f.is_up { Side::Up } else { Side::Down };
-                                        if paper.try_buy(side.as_str(), f.price, f.size, "maker") {
-                                            sc.on_fill(side, f.price, f.size, now_s_roll);
-                                            lv.note_fill_cash(f.price, f.size);
-                                        }
+                                        paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
+                                        sc.on_fill(side, f.price, f.size, now_s_roll);
+                                        lv.note_fill_cash(f.price, f.size);
                                     }
                                 }
                             }
@@ -720,25 +719,26 @@ async fn quote_loop(
                 lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
                 let side = if f.is_up { Side::Up } else { Side::Down };
                 let ltype = if f.maker { "maker" } else { "taker" };
-                if paper.try_buy(side.as_str(), f.price, f.size, ltype) {
-                    sc.on_fill(side, f.price, f.size, now_s);
-                    win_fills += 1;
-                    win_deployed += f.price * f.size;
-                    if f.maker {
-                        win_rebate += cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
-                    }
-                    if sc.imbalance().abs() > win_imb_max.abs() {
-                        win_imb_max = sc.imbalance();
-                    }
-                    tracing::info!(
-                        side = side.as_str(),
-                        px = format!("{:.3}", f.price),
-                        size = format!("{:.1}", f.size),
-                        ltype,
-                        imb = format!("{:.0}", sc.imbalance()),
-                        "[LIVE] fill réel"
-                    );
+                // INCONDITIONNEL : un fill réel est un FAIT — la comptabilité
+                // l'enregistre toujours (bug des 36 vs 18 Up du 8 juil.).
+                paper.apply_live_fill(side.as_str(), f.price, f.size, ltype);
+                sc.on_fill(side, f.price, f.size, now_s);
+                win_fills += 1;
+                win_deployed += f.price * f.size;
+                if f.maker {
+                    win_rebate += cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
                 }
+                if sc.imbalance().abs() > win_imb_max.abs() {
+                    win_imb_max = sc.imbalance();
+                }
+                tracing::info!(
+                    side = side.as_str(),
+                    px = format!("{:.3}", f.price),
+                    size = format!("{:.1}", f.size),
+                    ltype,
+                    imb = format!("{:.0}", sc.imbalance()),
+                    "[LIVE] fill réel"
+                );
             }
             // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
             // au plus 1 tentative / 3 s (le fill revient par le WS).
@@ -831,6 +831,16 @@ async fn quote_loop(
                     // le moteur suit aussi (imbalance/complétion sur la vérité)
                     sc.shares_up = ru;
                     sc.shares_dn = rd;
+                }
+                // Le cash miroir se réancre aussi sur la réalité : il ne doit
+                // JAMAIS pouvoir diverger au point de censurer la comptabilité.
+                if (paper.state.cash_usdc - lv.cash).abs() > 1.0 {
+                    tracing::warn!(
+                        miroir = format!("{:.2}", paper.state.cash_usdc),
+                        reel = format!("{:.2}", lv.cash),
+                        "cash miroir réancré sur le wallet réel"
+                    );
+                    paper.state.cash_usdc = lv.cash;
                 }
             }
 
