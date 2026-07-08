@@ -174,7 +174,18 @@ async function tick() {
   $('hw').textContent = ws.length;
   const pnl = ws.reduce((a, w) => a + (w.pnl || 0), 0);
   const reb = ws.reduce((a, w) => a + (w.rebate || 0), 0) + (s.rebate_window || 0);
-  const hp = $('hp'); hp.textContent = money(pnl); hp.className = 'v ' + (pnl >= 0 ? 'pos' : 'neg');
+  const hp = $('hp');
+  if (!s.dry_run && typeof s.live_wallet_pnl === 'number') {
+    // LIVE : le PnL affiché = wallet RÉEL (collatéral − baseline), pas le miroir.
+    // Note : les positions ouvertes/non-redeem comptent à 0 ici — c'est voulu
+    // (pire cas), la valeur revient au wallet à chaque merge/redeem.
+    $('hpl').textContent = 'PnL wallet (réel)';
+    hp.textContent = money(s.live_wallet_pnl);
+    hp.className = 'v ' + (s.live_wallet_pnl >= 0 ? 'pos' : 'neg');
+  } else {
+    hp.textContent = money(pnl);
+    hp.className = 'v ' + (pnl >= 0 ? 'pos' : 'neg');
+  }
   $('hr').textContent = money(reb); $('hr').className = 'v pos';
   const tot = pnl + reb;
   $('ht').textContent = money(tot); $('ht').className = 'v ' + (tot >= 0 ? 'pos' : 'neg');

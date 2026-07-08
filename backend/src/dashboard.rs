@@ -58,7 +58,8 @@ pub struct DashboardState {
     pub window_start: i64, // unix s du début de la fenêtre courante (graphique)
     pub rebate_window: f64, // rebate estimé de la fenêtre courante
     pub rebate_total: f64,  // rebate estimé cumulé depuis le lancement
-    pub live_collateral: f64, // USDC réel du wallet (mode live, rafraîchi ~60 s)
+    pub live_collateral: f64, // USDC réel du wallet (mode live, sync ≤10 s + fills)
+    pub live_wallet_pnl: f64, // collatéral − baseline : le SEUL PnL qui fait foi en live
     pub size_factor: f64,   // disjoncteur de séries perdantes (1.0 / 0.25 / 0)
     pub loss_streak: u32,   // pertes consécutives en cours
     // Paramètres de stratégie réellement chargés (affichés dans le panneau « Stratégie »).

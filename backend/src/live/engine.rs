@@ -63,6 +63,9 @@ pub struct LiveCtx {
     /// Collatéral USDC réel : sync CLOB ~10 s + décrément IMMÉDIAT à chaque fill
     /// (plusieurs fills/merges par fenêtre → on doit savoir en quasi temps réel).
     pub cash: f64,
+    /// Collatéral au tout premier démarrage (persisté data/live_baseline.json) —
+    /// référence du PnL wallet RÉEL affiché au dashboard.
+    pub baseline: f64,
     last_cash_sync_ms: i64,
     /// Merge/redeem on-chain via le relayer officiel (None = clés absentes → désactivé).
     relayer: Option<RelayerCtx>,
@@ -81,6 +84,25 @@ impl LiveCtx {
         let (cond_tx, fill_rx) = user_ws::spawn(creds.clone());
         tokio::spawn(orders::run_heartbeats(creds.clone()));
         let cash0 = collateral;
+        // Baseline du PnL wallet : lue si déjà posée, sinon posée MAINTENANT.
+        // (Pour repartir de zéro après un refinancement : supprimer/renommer le
+        // fichier data/live_baseline.json avant de redémarrer.)
+        let baseline = {
+            let path = std::path::Path::new("data/live_baseline.json");
+            let existing = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v.get("baseline").and_then(|b| b.as_f64()));
+            match existing {
+                Some(b) => b,
+                None => {
+                    let _ = std::fs::create_dir_all("data");
+                    let _ = std::fs::write(path, format!("{{\"baseline\":{collateral}}}"));
+                    tracing::info!(collateral, "baseline PnL wallet posée");
+                    collateral
+                }
+            }
+        };
         let creds2 = creds.clone();
         Ok(Self {
             creds,
@@ -93,6 +115,7 @@ impl LiveCtx {
             order_side: HashMap::new(),
             last_poll_ms: 0,
             cash: cash0,
+            baseline,
             last_cash_sync_ms: 0,
             relayer: RelayerCtx::from_env(&creds2),
             merge_inflight: None,

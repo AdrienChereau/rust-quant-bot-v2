@@ -82,6 +82,34 @@ pub struct BidQuote {
     pub completion: bool, // true = jambe d'assurance (réduit l'imbalance)
 }
 
+/// URGENCE DE COMPLÉTION (usage défensif du signal Tokyo — 8 juil.) :
+/// on tient un déficit côté `side` ; si le sous-jacent part dans le sens qui
+/// RENCHÉRIT ce côté (drift ≥ seuil vers lui), attendre coûtera plus cher →
+/// le bid de complétion monte à ask−tick (le plus agressif possible en restant
+/// maker). Ce n'est PAS un pari : on chronomètre le rééquilibrage d'une
+/// position existante.
+pub fn completion_urgent(side: Side, drift_per_sec: f64, threshold: f64) -> bool {
+    match side {
+        Side::Up => drift_per_sec >= threshold,
+        Side::Down => drift_per_sec <= -threshold,
+    }
+}
+
+/// KILL ASYMÉTRIQUE : sur alerte radar, seul le bid d'ouverture EN DANGER est
+/// retiré — celui que le mouvement va traverser (pump → le prix du Down
+/// s'effondre à travers notre bid Down ; dump → symétrique). L'autre côté
+/// garde sa file et ses rebates. Direction illisible (|drift| < seuil) →
+/// None = prudence, on retire les deux (comportement historique).
+pub fn endangered_side(drift_per_sec: f64, threshold: f64) -> Option<Side> {
+    if drift_per_sec >= threshold {
+        Some(Side::Down)
+    } else if drift_per_sec <= -threshold {
+        Some(Side::Up)
+    } else {
+        None
+    }
+}
+
 /// État blended d'une fenêtre + logique d'entrée.
 pub struct SpreadCaptureEngine {
     pub cfg: SpreadCaptureConfig,
@@ -698,6 +726,26 @@ mod tests {
         // sur le couteau qui tombe ; et pas de directionnel Up (tendance Down).
         let q = e.desired_bids(0.65, 0.33, 0.35, 200, 0, Some(false), 0.01, 0.90, 0.40, 1.0, false);
         assert!(q.iter().all(|b| b.completion), "{q:?}");
+    }
+
+    // ── URGENCE & KILL ASYMÉTRIQUE (helpers purs) ──
+    #[test]
+    fn urgency_matches_inventory_threat() {
+        // déficit Up + sous-jacent qui monte = Up renchérit → URGENT
+        assert!(completion_urgent(Side::Up, 0.0005, 0.0004));
+        // déficit Up + sous-jacent qui descend = Up se paie moins cher → patience
+        assert!(!completion_urgent(Side::Up, -0.0005, 0.0004));
+        assert!(completion_urgent(Side::Down, -0.0005, 0.0004));
+        assert!(!completion_urgent(Side::Down, 0.0005, 0.0004));
+        // bruit sous le seuil → jamais urgent
+        assert!(!completion_urgent(Side::Up, 0.0002, 0.0004));
+    }
+
+    #[test]
+    fn endangered_side_follows_move_direction() {
+        assert_eq!(endangered_side(0.0006, 0.0004), Some(Side::Down)); // pump → Down crashe
+        assert_eq!(endangered_side(-0.0006, 0.0004), Some(Side::Up)); // dump → Up crashe
+        assert_eq!(endangered_side(0.0001, 0.0004), None); // illisible → retirer les 2
     }
 
     // ── MODE SYMÉTRIQUE ──

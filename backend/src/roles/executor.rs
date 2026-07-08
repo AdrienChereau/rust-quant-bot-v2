@@ -556,7 +556,7 @@ async fn quote_loop(
         };
 
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
-        let desired = if sleeping || paused || !enabled {
+        let desired = if sleeping || !enabled {
             Vec::new()
         } else {
             sc.desired_bids(
@@ -567,18 +567,73 @@ async fn quote_loop(
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
 
+        // ═══ Signal Tokyo au service de l'INVENTAIRE (8 juil.) ═══
+        let mut desired = desired;
+        // KILL ASYMÉTRIQUE : sur alerte radar, seule l'ouverture EN DANGER est
+        // retirée (celle que le mouvement va traverser) ; l'autre garde sa file.
+        // Les complétions survivent toujours : le côté qui crashe, c'est
+        // précisément celui qu'un déficit veut acheter moins cher.
+        if paused {
+            use crate::engines::spread_capture::endangered_side;
+            match endangered_side(drift_ps, cfg.sc_urgency_drift) {
+                Some(danger) => desired.retain(|b| b.completion || b.side != danger),
+                None => desired.retain(|b| b.completion), // direction illisible → les 2 ouvertures sautent
+            }
+        }
+        // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
+        // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
+        for b in desired.iter_mut() {
+            if b.completion
+                && crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
+            {
+                let ask = if b.side == Side::Up { ask_up } else { ask_dn };
+                if ask > tick_sz {
+                    let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
+                    let capped = aggressive.min(cfg.sc_completion_max_price);
+                    if capped > b.price + 1e-9 {
+                        tracing::info!(side = ?b.side, from = b.price, to = capped,
+                            drift = format!("{drift_ps:+.4}"), "complétion URGENTE (Tokyo)");
+                        b.price = capped;
+                    }
+                }
+            }
+        }
+
         // ═══ CHEMIN LIVE : reconcile GTC réels + fills réels ═══
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
             let mut harvested: Vec<crate::live::engine::LiveFill> = Vec::new();
             // KILL/pause → tout annuler.
-            if paused || sleeping || !enabled {
+            if sleeping || !enabled {
                 if lrest_up.is_some() || lrest_dn.is_some() {
                     lv.cancel_all().await;
                     lrest_up = None;
                     lrest_dn = None;
                 }
             } else {
+                // Ouvertures : tailles STRICTEMENT égales des deux côtés (le bump
+                // 1$ asymétrique a créé 95 orphelines le 7 juil.). Fenêtre de
+                // faisabilité : commune ≥ minimums des 2 côtés ET ≤ tailles engine ;
+                // vide (marché décidé) → AUCUNE ouverture.
+                let min_shares = m.min_order_size.max(1.0);
+                let open_common: Option<f64> = {
+                    let ou = desired.iter().find(|b| b.side == Side::Up && !b.completion);
+                    let od = desired.iter().find(|b| b.side == Side::Down && !b.completion);
+                    match (ou, od) {
+                        (Some(u), Some(d)) => {
+                            let req_u = min_shares.max((1.0_f64 / u.price.max(0.01)).ceil());
+                            let req_d = min_shares.max((1.0_f64 / d.price.max(0.01)).ceil());
+                            let lo = req_u.max(req_d);
+                            let hi = u.size.min(d.size);
+                            if hi + 1e-9 >= lo && (u.price + d.price) * hi <= lv.cash {
+                                Some(hi)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
                 for (lrest, side, ask) in [
                     (&mut lrest_up, Side::Up, ask_up),
                     (&mut lrest_dn, Side::Down, ask_dn),
@@ -592,23 +647,33 @@ async fn quote_loop(
                     });
                     // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
                     // et jamais plus que le cash réel restant.
-                    // Minimums Polymarket : ≥ min_order_size PARTS **ET** ≥ 1$ de
-                    // NOTIONNEL (à 1¢/part, 5 parts = 5¢ → rejeté). On GONFLE la
-                    // taille jusqu'au minimum plutôt que de sauter l'ordre : à bas
-                    // prix, le sur-achat coûte ~1$ et sert l'appariement.
-                    let min_shares = m.min_order_size.max(1.0);
-                    let want_sz = want.zip(want_px).map(|(b, px)| {
-                        b.size.max(min_shares).max((1.0_f64 / px).ceil())
-                    });
-                    if let (Some(sz), Some(px)) = (want_sz, want_px) {
-                        let now = chrono::Utc::now().timestamp();
-                        if px * sz > lv.cash && now - last_nosig_log >= 10 {
-                            last_nosig_log = now;
-                            tracing::warn!(side = ?side, sz, px,
-                                cash = format!("{:.2}", lv.cash),
-                                "bid skippé : notionnel minimal > cash réel disponible");
+                    // Tailles (8 juil. — fin des 95 orphelines) :
+                    //  · COMPLÉTION : jamais plus que le déficit. Si les minimums
+                    //    PM (5 parts / 1$) exigeraient de SUR-acheter → résidu
+                    //    accepté (perte bornée, spirale évitée).
+                    //  · OUVERTURE : taille commune pré-calculée (ou rien).
+                    let want_sz: Option<f64> = match (want, want_px) {
+                        (Some(b), Some(px)) => {
+                            let min_req = min_shares.max((1.0_f64 / px).ceil());
+                            if b.completion {
+                                let sz = (b.size * 100.0).floor() / 100.0;
+                                if sz + 1e-9 < min_req {
+                                    let now = chrono::Utc::now().timestamp();
+                                    if now - last_nosig_log >= 30 {
+                                        last_nosig_log = now;
+                                        tracing::info!(side = ?side, deficit = sz, min_req,
+                                            "résidu accepté — compléter exigerait de sur-acheter (minimums PM)");
+                                    }
+                                    None
+                                } else {
+                                    Some(sz)
+                                }
+                            } else {
+                                open_common
+                            }
                         }
-                    }
+                        _ => None,
+                    };
                     let side_ix = if side == Side::Up { 0 } else { 1 };
                     match (want_sz, want_px, &*lrest) {
                         (Some(sz), Some(px), cur) if px >= 0.01 && px * sz <= lv.cash => {
@@ -689,11 +754,12 @@ async fn quote_loop(
                     (true, ask_up, ask_up_sz)
                 };
                 if ask > 0.0 && ask <= 0.99 {
-                    // Assurance : mêmes minimums PM (parts + 1$ de notionnel).
-                    let sz = sc.imbalance().abs().min(ask_sz.max(1.0)).floor()
-                        .max(m.min_order_size.max(1.0))
-                        .max((1.0_f64 / ask).ceil());
-                    if ask * sz <= lv.cash {
+                    // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
+                    // par les minimums relançait la spirale). Sous les minimums →
+                    // résidu accepté, perte bornée.
+                    let sz = ((sc.imbalance().abs().min(ask_sz.max(1.0))) * 100.0).floor() / 100.0;
+                    let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask).ceil());
+                    if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
                         lv.place_insurance_fak(is_up, ask, sz).await;
                     }
@@ -703,10 +769,20 @@ async fn quote_loop(
             // ≥ MIN_MERGE_THRESHOLD) — un seul en vol ; à la confirmation, le
             // miroir merge + le moteur recycle son budget + le cash se resynce.
             if let Some(pairs_done) = lv.poll_merge_done() {
-                let merged = paper.check_and_merge(0.1); // miroir : crédite les paires
-                sc.on_merge(pairs_done);
-                win_merged += pairs_done;
-                tracing::info!(pairs = pairs_done, mirror = merged, "merge on-chain appliqué au miroir");
+                // Crédit EXACT : uniquement les paires de LA transaction (le
+                // check_and_merge global sur-créditait → PnL fantôme au dashboard).
+                let p = pairs_done
+                    .min(paper.state.up_balance)
+                    .min(paper.state.down_balance)
+                    .max(0.0);
+                paper.state.up_balance -= p;
+                paper.state.down_balance -= p;
+                paper.state.cash_usdc += p;
+                paper.state.merges += 1;
+                paper.persist();
+                sc.on_merge(p);
+                win_merged += p;
+                tracing::info!(pairs_tx = pairs_done, credited = p, "merge on-chain appliqué (crédit exact)");
             }
             let elapsed_l = 300 - m.time_remaining_sec();
             let mirror_pairs = paper.state.up_balance.min(paper.state.down_balance);
@@ -719,13 +795,21 @@ async fn quote_loop(
                     crate::live::engine::MergeStart::WouldRevert => {
                         // La simulation refuse = les tokens n'y sont plus → le
                         // merge PRÉCÉDENT est passé malgré le timeout de suivi.
-                        // On aligne le miroir et on resynce le cash réel.
-                        let merged = paper.check_and_merge(0.1);
-                        sc.on_merge(pairs);
-                        win_merged += pairs;
+                        // Crédit EXACT + resync (la vérité on-chain tranchera).
+                        let p = pairs
+                            .min(paper.state.up_balance)
+                            .min(paper.state.down_balance)
+                            .max(0.0);
+                        paper.state.up_balance -= p;
+                        paper.state.down_balance -= p;
+                        paper.state.cash_usdc += p;
+                        paper.state.merges += 1;
+                        paper.persist();
+                        sc.on_merge(p);
+                        win_merged += p;
                         lv.force_cash_resync();
-                        tracing::info!(pairs, mirror = merged,
-                            "merge déjà passé on-chain (would revert) — miroir aligné");
+                        tracing::info!(pairs_tx = pairs, credited = p,
+                            "merge déjà passé on-chain (would revert) — crédit exact");
                     }
                     _ => {}
                 }
@@ -755,6 +839,7 @@ async fn quote_loop(
             {
                 let mut d = dash.write().await;
                 d.live_collateral = lv.cash;
+                d.live_wallet_pnl = lv.cash - lv.baseline;
             }
             // Miroir des bids pour le dashboard.
             rest_up = lrest_up.as_ref().map(|r| (r.price, r.size));
