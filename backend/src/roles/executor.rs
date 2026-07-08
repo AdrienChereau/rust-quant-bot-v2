@@ -602,12 +602,18 @@ async fn quote_loop(
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
             let mut harvested: Vec<crate::live::engine::LiveFill> = Vec::new();
-            // KILL/pause → tout annuler.
+            // KILL/pause → tout annuler — mais JAMAIS sans récolter d'abord
+            // (un cancel aveugle perd le fill arrivé entre-temps).
             if sleeping || !enabled {
                 if lrest_up.is_some() || lrest_dn.is_some() {
+                    for (lrest, is_up) in [(&mut lrest_up, true), (&mut lrest_dn, false)] {
+                        if let Some(r) = lrest.take() {
+                            if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
+                                harvested.push(f);
+                            }
+                        }
+                    }
                     lv.cancel_all().await;
-                    lrest_up = None;
-                    lrest_dn = None;
                 }
             } else {
                 // Ouvertures : tailles STRICTEMENT égales des deux côtés (le bump

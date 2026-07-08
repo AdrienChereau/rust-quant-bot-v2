@@ -73,6 +73,11 @@ pub struct LiveCtx {
     last_merge_attempt_ms: i64, // cooldown anti-spam (429 Cloudflare du 7 juil.)
     last_pos_sync_ms: i64,
     pub positions_dirty: bool, // merge/redeem incertain → resync des positions
+    /// Ordres retirés SANS lecture réussie de leur size_matched (GET /data/order
+    /// en échec au moment du cancel). Un fill ne doit JAMAIS être perdu : le poll
+    /// réinterroge ces ordres jusqu'à obtenir la vérité (incident du 8 juil. :
+    /// Up 5@56¢ fillé, lecture ratée, ordre oublié → fausse complétion à 62¢).
+    audit: Vec<(RestingOrder, bool, u32)>, // (ordre, is_up, tentatives)
 }
 
 impl LiveCtx {
@@ -122,6 +127,7 @@ impl LiveCtx {
             last_merge_attempt_ms: 0,
             last_pos_sync_ms: 0,
             positions_dirty: false,
+            audit: Vec::new(),
         })
     }
 
@@ -332,7 +338,11 @@ impl LiveCtx {
                         fill = Some(LiveFill { is_up, price: r.price, size: delta, maker: true });
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "récolte pré-annulation échouée"),
+                Err(e) => {
+                    tracing::warn!(error = %e, order_id = %r.order_id,
+                        "récolte pré-annulation échouée → ordre mis en AUDIT (le poll retentera)");
+                    self.audit.push((r.clone(), is_up, 0));
+                }
             }
             let _ = orders::cancel_order(&self.creds, &r.order_id).await;
         }
@@ -356,6 +366,11 @@ impl LiveCtx {
             let side = self.order_side.get(&f.order_id).copied();
             match side {
                 Some((is_up, maker)) if !f.is_sell => {
+                    // Si l'ordre est en audit, ce fill est maintenant comptabilisé :
+                    // l'audit ne devra émettre que l'éventuel reliquat.
+                    if let Some(a) = self.audit.iter_mut().find(|(o, _, _)| o.order_id == f.order_id) {
+                        a.0.matched += f.size;
+                    }
                     out.push(LiveFill { is_up, price: f.price, size: f.size, maker })
                 }
                 Some(_) => tracing::warn!(order_id = %f.order_id, "fill SELL inattendu (ignoré)"),
@@ -380,6 +395,40 @@ impl LiveCtx {
             return out;
         }
         self.last_poll_ms = now_ms;
+        // AUDIT d'abord : les ordres retirés sans lecture réussie sont réinterrogés
+        // jusqu'à vérité connue (un ordre clos reste consultable sur /data/order).
+        let mut audit = std::mem::take(&mut self.audit);
+        for (r, is_up, tries) in &mut audit {
+            match super::auth::l2_request(
+                &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
+            ).await {
+                Ok(text) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    let v = v.get("data").cloned().unwrap_or(v);
+                    let matched: f64 = v.get("size_matched")
+                        .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    if matched > r.matched + 1e-9 {
+                        let delta = matched - r.matched;
+                        tracing::info!(order_id = %r.order_id, delta, "fill récupéré par AUDIT");
+                        out.push(LiveFill { is_up: *is_up, price: r.price, size: delta, maker: true });
+                    }
+                    *tries = u32::MAX; // tranché → sortie de l'audit
+                }
+                Err(e) => {
+                    *tries += 1;
+                    if *tries >= 40 {
+                        // ~2 min d'échecs : on abandonne BRUYAMMENT — le sync des
+                        // positions on-chain (60 s) reste le filet de sécurité.
+                        tracing::error!(order_id = %r.order_id, error = %e,
+                            "AUDIT abandonné après 40 échecs — fill éventuel invisible au journal (positions resyncées on-chain)");
+                        *tries = u32::MAX;
+                    }
+                }
+            }
+        }
+        audit.retain(|(_, _, t)| *t != u32::MAX);
+        self.audit = audit;
         let open = match orders::open_orders(&self.creds, &self.condition_id).await {
             Ok(o) => o,
             Err(e) => {
