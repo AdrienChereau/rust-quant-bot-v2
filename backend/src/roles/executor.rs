@@ -442,10 +442,21 @@ async fn quote_loop(
                 rest_dn = None;
                 last_spot = None;
                 #[cfg(feature = "live")]
-                if let Some(lv) = live.as_ref() {
+                if let Some(lv) = live.as_mut() {
+                    // JAMAIS de cancel aveugle : un fill arrivé entre-temps serait
+                    // perdu (famille des incidents des 7-8 juil.). La récolte lit
+                    // size_matched d'abord ; en échec, l'ordre part en AUDIT.
+                    for (lrest, is_up) in [(&mut lrest_up, true), (&mut lrest_dn, false)] {
+                        if let Some(r) = lrest.take() {
+                            if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
+                                let side = if f.is_up { Side::Up } else { Side::Down };
+                                paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
+                                sc.on_fill(side, f.price, f.size, chrono::Utc::now().timestamp());
+                                lv.note_fill_cash(f.price, f.size);
+                            }
+                        }
+                    }
                     lv.cancel_all().await;
-                    lrest_up = None;
-                    lrest_dn = None;
                 }
                 tracing::warn!(age_ms, "signal Tokyo PÉRIMÉ — quotes retirées");
                 continue;

@@ -306,13 +306,20 @@ impl LiveCtx {
         }
     }
 
-    /// FAK d'assurance (complétion taker fin de fenêtre).
+    /// FAK d'assurance (complétion taker fin de fenêtre). Un FAK n'est jamais
+    /// resting : son fill est dans la RÉPONSE du POST — comptabilisé ici même,
+    /// sans dépendre du WS (un FAK invisible relançait l'assurance en boucle).
     pub async fn place_insurance_fak(&mut self, is_up: bool, price: f64, size: f64) {
         let token = if is_up { &self.up_token } else { &self.dn_token };
         let args = OrderArgs { price, size, is_sell: false, gtc: false };
         match orders::place_order(self.armed, &self.creds, token, args).await {
-            Ok(PlaceResult::Placed { order_id, .. }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
                 self.order_side.insert(order_id, (is_up, false));
+                let matched = filled_size.unwrap_or(0.0);
+                if matched > 0.0 {
+                    let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
+                    self.post_fills.push(LiveFill { is_up, price: px, size: matched, maker: false });
+                }
             }
             Ok(PlaceResult::DryRun) => {}
             Err(e) => tracing::warn!(error = %e, "assurance FAK refusée"),

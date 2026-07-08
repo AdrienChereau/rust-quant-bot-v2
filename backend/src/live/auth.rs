@@ -107,14 +107,15 @@ pub fn build_l2_headers(
 }
 
 fn l2_signature(secret_b64: &str, ts: &str, method: &str, path: &str, body: &str) -> anyhow::Result<String> {
-    let decoded;
+    // get_or_init : le decode n'a lieu qu'UNE fois (l'ancien code testait `get()`
+    // sans jamais `set()` → cache mort, decode à chaque requête).
     let key: &[u8] = if let Some(cached) = CACHED_HMAC_KEY.get() {
         cached
     } else {
-        decoded = base64::engine::general_purpose::URL_SAFE
+        let decoded = base64::engine::general_purpose::URL_SAFE
             .decode(secret_b64)
             .map_err(|e| anyhow::anyhow!("secret base64 invalide: {e}"))?;
-        &decoded
+        CACHED_HMAC_KEY.get_or_init(|| decoded)
     };
     let mut mac = HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("clé HMAC: {e}"))?;
     mac.update(format!("{ts}{method}{path}{body}").as_bytes());
