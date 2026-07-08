@@ -777,9 +777,10 @@ async fn quote_loop(
                     .max(0.0);
                 paper.state.up_balance -= p;
                 paper.state.down_balance -= p;
-                paper.state.cash_usdc += p;
                 paper.state.merges += 1;
                 paper.persist();
+                lv.cash += p; // le merge est on-chain : crédit RÉEL immédiat…
+                lv.force_cash_resync(); // …et le CLOB tranche au prochain sync
                 sc.on_merge(p);
                 win_merged += p;
                 tracing::info!(pairs_tx = pairs_done, credited = p, "merge on-chain appliqué (crédit exact)");
@@ -802,9 +803,9 @@ async fn quote_loop(
                             .max(0.0);
                         paper.state.up_balance -= p;
                         paper.state.down_balance -= p;
-                        paper.state.cash_usdc += p;
                         paper.state.merges += 1;
                         paper.persist();
+                        lv.cash += p;
                         sc.on_merge(p);
                         win_merged += p;
                         lv.force_cash_resync();
@@ -832,20 +833,13 @@ async fn quote_loop(
                     sc.shares_up = ru;
                     sc.shares_dn = rd;
                 }
-                // Le cash miroir se réancre aussi sur la réalité : il ne doit
-                // JAMAIS pouvoir diverger au point de censurer la comptabilité.
-                if (paper.state.cash_usdc - lv.cash).abs() > 1.0 {
-                    tracing::warn!(
-                        miroir = format!("{:.2}", paper.state.cash_usdc),
-                        reel = format!("{:.2}", lv.cash),
-                        "cash miroir réancré sur le wallet réel"
-                    );
-                    paper.state.cash_usdc = lv.cash;
-                }
             }
 
-            // Cash réel : sync CLOB (≤1×/10 s) + valeur courante vers le dashboard.
+            // Cash réel : sync CLOB (≤1×/10 s). Il n'y a PAS de cash miroir en
+            // live — le state ne fait que REFLÉTER le wallet (bug du 8 juil. :
+            // un cash fictif censurait les fills réels).
             lv.sync_cash(false).await;
+            paper.state.cash_usdc = lv.cash;
             {
                 let mut d = dash.write().await;
                 d.live_collateral = lv.cash;

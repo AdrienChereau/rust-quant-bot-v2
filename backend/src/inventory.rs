@@ -127,14 +127,9 @@ impl PaperEngine {
         if size <= 0.0 {
             return;
         }
-        let cost = size * price;
-        self.state.cash_usdc -= cost;
-        if self.state.cash_usdc < -0.01 {
-            tracing::warn!(
-                cash_miroir = format!("{:.2}", self.state.cash_usdc),
-                "cash miroir négatif — désynchronisé de la réalité (le sync le réalignera)"
-            );
-        }
+        // PAS de mutation de cash ici : en live, le cash = wallet réel
+        // (LiveCtx.cash, décrémenté via note_fill_cash + sync CLOB), recopié
+        // dans le state à chaque tick. Ici : parts + compteurs + journal.
         match side {
             "up" => self.state.up_balance += size,
             _ => self.state.down_balance += size,
