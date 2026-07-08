@@ -714,12 +714,10 @@ async fn quote_loop(
                     }
                 }
             }
-            // Fills réels : WS (rapide) + récoltes pré-annulation + poll (autorité).
-            let mut fills = lv.drain_ws_fills();
+            // Fills réels : WS temps réel (trade + états d'ordres) + récoltes
+            // pré-annulation + poll (autorité + balayage anti double-ordre).
+            let mut fills = lv.drain_ws(&mut lrest_up, &mut lrest_dn);
             fills.append(&mut harvested);
-            for f in &fills {
-                LiveCtx::note_ws_fill(&mut lrest_up, &mut lrest_dn, f);
-            }
             fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
             for f in fills {
                 lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB

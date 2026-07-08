@@ -28,7 +28,7 @@ pub enum MergeStart {
     WouldRevert, // déjà mergé on-chain (probable) → aligner le miroir
     Err,
 }
-use super::user_ws::{self, FillEvent};
+use super::user_ws::{self, UserMsg};
 
 /// Fill prêt pour la boucle stratégie.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ pub struct LiveCtx {
     pub creds: LiveCredentials,
     pub armed: bool,
     cond_tx: watch::Sender<Option<String>>,
-    fill_rx: mpsc::UnboundedReceiver<FillEvent>,
+    fill_rx: mpsc::UnboundedReceiver<UserMsg>,
     // token_ids du marché courant (associe asset_id/ordre → côté Up/Down)
     up_token: String,
     dn_token: String,
@@ -355,29 +355,119 @@ impl LiveCtx {
         }
     }
 
-    /// Draine les fills du WS user (voie rapide). Les ordres inconnus (autre
-    /// process, vieux marché) sont ignorés avec un log.
-    pub fn drain_ws_fills(&mut self) -> Vec<LiveFill> {
+    /// Draine le WS user : fills (`trade`) ET états d'ordres (`order`,
+    /// size_matched ABSOLU temps réel). Toute émission de fill d'un ordre
+    /// SUIVI passe par sa baseline `matched` — un même fill signalé par
+    /// plusieurs canaux (trade, order, poll, récolte) ne compte qu'UNE fois.
+    pub fn drain_ws(
+        &mut self,
+        rest_up: &mut Option<RestingOrder>,
+        rest_dn: &mut Option<RestingOrder>,
+    ) -> Vec<LiveFill> {
         let mut out = Vec::new();
-        while let Ok(f) = self.fill_rx.try_recv() {
-            // Attribution STRICTE par order_id connu : l'event trade contient aussi
-            // l'ordre du taker ADVERSE sur notre asset — un fallback par asset_id
-            // compterait son fill comme le nôtre (double comptage).
-            let side = self.order_side.get(&f.order_id).copied();
-            match side {
-                Some((is_up, maker)) if !f.is_sell => {
-                    // Si l'ordre est en audit, ce fill est maintenant comptabilisé :
-                    // l'audit ne devra émettre que l'éventuel reliquat.
-                    if let Some(a) = self.audit.iter_mut().find(|(o, _, _)| o.order_id == f.order_id) {
-                        a.0.matched += f.size;
+        while let Ok(msg) = self.fill_rx.try_recv() {
+            match msg {
+                UserMsg::Fill(f) => {
+                    // Attribution STRICTE par order_id connu : l'event trade contient
+                    // aussi l'ordre du taker ADVERSE — un fallback par asset_id
+                    // compterait son fill comme le nôtre (double comptage).
+                    match self.order_side.get(&f.order_id).copied() {
+                        Some((is_up, maker)) if !f.is_sell => {
+                            match Self::find_tracked(rest_up, rest_dn, &mut self.audit, &f.order_id) {
+                                Some(r) => {
+                                    // Borné au restant de l'ordre : idempotent.
+                                    let allowed = (r.size - r.matched).max(0.0).min(f.size);
+                                    if allowed > 1e-9 {
+                                        r.matched += allowed;
+                                        out.push(LiveFill { is_up, price: f.price, size: allowed, maker });
+                                    }
+                                }
+                                None if !maker => {
+                                    // FAK taker : jamais resting, le trade est l'unique canal.
+                                    out.push(LiveFill { is_up, price: f.price, size: f.size, maker });
+                                }
+                                None => {
+                                    // Maker connu mais suivi NULLE PART = fuite. On compte
+                                    // ce fill et on ouvre une baseline d'audit pour la suite.
+                                    tracing::error!(order_id = %f.order_id,
+                                        "fill d'un maker NON SUIVI — compté + mis en AUDIT");
+                                    self.audit.push((RestingOrder {
+                                        order_id: f.order_id.clone(),
+                                        price: f.price,
+                                        size: 1e9, // taille réelle inconnue : pas de cap
+                                        matched: f.size,
+                                    }, is_up, 0));
+                                    out.push(LiveFill { is_up, price: f.price, size: f.size, maker });
+                                }
+                            }
+                        }
+                        Some(_) => tracing::warn!(order_id = %f.order_id, "fill SELL inattendu (ignoré)"),
+                        None => tracing::debug!(order_id = %f.order_id, "fill d'un ordre inconnu (ignoré)"),
                     }
-                    out.push(LiveFill { is_up, price: f.price, size: f.size, maker })
                 }
-                Some(_) => tracing::warn!(order_id = %f.order_id, "fill SELL inattendu (ignoré)"),
-                None => tracing::debug!(order_id = %f.order_id, "fill d'un ordre inconnu (ignoré)"),
+                UserMsg::Order(u) => {
+                    // Surveillance temps réel (8 juil.) : le size_matched ABSOLU de
+                    // l'event tranche IMMÉDIATEMENT — plus d'attente du poll 3 s.
+                    let Some((is_up, maker)) = self.order_side.get(&u.order_id).copied() else {
+                        if u.kind != "CANCELLATION" && u.size_matched > 0.0 {
+                            tracing::warn!(order_id = %u.order_id, kind = %u.kind,
+                                "event order d'un ordre INCONNU (autre process ?)");
+                        }
+                        continue;
+                    };
+                    if !maker {
+                        continue; // FAK : compté par son event trade uniquement
+                    }
+                    match Self::find_tracked(rest_up, rest_dn, &mut self.audit, &u.order_id) {
+                        Some(r) => {
+                            if u.size_matched > r.matched + 1e-9 {
+                                let delta = u.size_matched - r.matched;
+                                r.matched = u.size_matched;
+                                tracing::info!(order_id = %u.order_id, delta,
+                                    "fill vu par event ORDER (temps réel)");
+                                let px = if r.price > 0.0 { r.price } else { u.price };
+                                out.push(LiveFill { is_up, price: px, size: delta, maker });
+                            }
+                        }
+                        None if u.size_matched > 1e-9 => {
+                            tracing::error!(order_id = %u.order_id,
+                                "ordre CONNU mais non suivi (event order) — fill compté + AUDIT");
+                            out.push(LiveFill { is_up, price: u.price, size: u.size_matched, maker });
+                            self.audit.push((RestingOrder {
+                                order_id: u.order_id.clone(),
+                                price: u.price,
+                                size: u.size.max(u.size_matched),
+                                matched: u.size_matched,
+                            }, is_up, 0));
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        // Slots entièrement fillés → libérés (re-quote possible).
+        for rest in [rest_up, rest_dn] {
+            if rest.as_ref().is_some_and(|r| r.matched >= r.size - 1e-6) {
+                *rest = None;
             }
         }
         out
+    }
+
+    /// Localise un ordre suivi (slot Up, slot Down, ou entrée d'audit).
+    fn find_tracked<'a>(
+        rest_up: &'a mut Option<RestingOrder>,
+        rest_dn: &'a mut Option<RestingOrder>,
+        audit: &'a mut Vec<(RestingOrder, bool, u32)>,
+        id: &str,
+    ) -> Option<&'a mut RestingOrder> {
+        if rest_up.as_ref().is_some_and(|r| r.order_id == id) {
+            return rest_up.as_mut();
+        }
+        if rest_dn.as_ref().is_some_and(|r| r.order_id == id) {
+            return rest_dn.as_mut();
+        }
+        audit.iter_mut().find(|(o, _, _)| o.order_id == id).map(|(o, _, _)| o)
     }
 
     /// Réconciliation par poll (autorité) — à appeler ~1×/3 s. Compare
@@ -436,6 +526,10 @@ impl LiveCtx {
                 return out;
             }
         };
+        let mut tracked_ids: Vec<String> = self.audit.iter().map(|(o, _, _)| o.order_id.clone()).collect();
+        tracked_ids.extend(rest_up.iter().map(|r| r.order_id.clone()));
+        tracked_ids.extend(rest_dn.iter().map(|r| r.order_id.clone()));
+        let mut new_audit: Vec<(RestingOrder, bool, u32)> = Vec::new();
         for (rest, is_up) in [(rest_up, true), (rest_dn, false)] {
             let Some(r) = rest.as_mut() else { continue };
             match open.iter().find(|o| o.id == r.order_id) {
@@ -468,32 +562,48 @@ impl LiveCtx {
                                 out.push(LiveFill { is_up, price: r.price, size: delta, maker: true });
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, "GET /data/order échoué"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, order_id = %r.order_id,
+                                "GET /data/order échoué (ordre clos) → AUDIT");
+                            new_audit.push((r.clone(), is_up, 0));
+                        }
                     }
                     *rest = None; // l'ordre n'existe plus → re-quote au tick suivant
                 }
             }
         }
+        self.audit.extend(new_audit);
+        // BALAYAGE ANTI DOUBLE-ORDRE (8 juil.) : tout ordre OUVERT au carnet
+        // doit coïncider avec ce que le bot suit (slots + audit). Un survivant
+        // inconnu = ordre fantôme → ANNULÉ immédiatement, et audité pour que
+        // ses fills éventuels entrent quand même dans la comptabilité.
+        for o in &open {
+            if tracked_ids.iter().any(|t| t == &o.id) {
+                continue;
+            }
+            let is_up = self
+                .order_side
+                .get(&o.id)
+                .map(|(u, _)| *u)
+                .unwrap_or(o.asset_id == self.up_token);
+            tracing::error!(order_id = %o.id, is_up,
+                "ordre OUVERT au carnet INCONNU du suivi — annulé + audité");
+            self.audit.push((RestingOrder {
+                order_id: o.id.clone(),
+                price: o.price.parse().unwrap_or(0.0),
+                size: o.original_size.parse().unwrap_or(0.0),
+                matched: o.matched(),
+            }, is_up, 0));
+            out.push(LiveFill {
+                is_up,
+                price: o.price.parse().unwrap_or(0.0),
+                size: o.matched(),
+                maker: true,
+            });
+            let _ = orders::cancel_order(&self.creds, &o.id).await;
+        }
+        out.retain(|f| f.size > 1e-9);
         out
     }
 
-    /// Marque un fill WS comme comptabilisé sur l'ordre restant correspondant
-    /// (évite le double comptage WS + poll).
-    pub fn note_ws_fill(
-        rest_up: &mut Option<RestingOrder>,
-        rest_dn: &mut Option<RestingOrder>,
-        f: &LiveFill,
-    ) {
-        let rest = if f.is_up { rest_up } else { rest_dn };
-        let done = match rest.as_mut() {
-            Some(r) => {
-                r.matched += f.size;
-                r.matched >= r.size - 1e-6
-            }
-            None => false,
-        };
-        if done {
-            *rest = None; // entièrement fillé → re-quote possible
-        }
-    }
 }
