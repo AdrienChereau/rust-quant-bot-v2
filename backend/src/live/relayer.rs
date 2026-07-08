@@ -9,7 +9,7 @@
 //!      { name:"DepositWallet", version:"1", chainId:137, verifyingContract:<wallet> }
 //!   3. POST /submit { type:"WALLET", from, to:<factory>, nonce, signature,
 //!      depositWalletParams:{ depositWallet, deadline, calls:[{target,value,data}] } }
-//!   4. GET  /transaction/{id} jusqu'à STATE_CONFIRMED (ou échec)
+//!   4. GET  /transaction?id={id} jusqu'à STATE_CONFIRMED (ou échec)
 //!
 //! Calls encodés (marchés binaires simples, partition [1,2]) :
 //!   merge  → CtfCollateralAdapter.mergePositions(pUSD, 0x0, conditionId, [1,2], amount)
@@ -229,7 +229,7 @@ impl RelayerCtx {
             let mut first_poll = true;
             for _ in 0..75 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let url = format!("{RELAYER_BASE}/transaction/{tx_id}");
+                let url = format!("{RELAYER_BASE}/transaction?id={tx_id}"); // param en QUERY (doc) — /transaction/{{id}} = 404
                 let Ok(resp) = HTTP
                     .get(&url)
                     .header("RELAYER_API_KEY", &api_key)
