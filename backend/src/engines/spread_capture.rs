@@ -72,6 +72,12 @@ impl Side {
             Side::Down => "down",
         }
     }
+    pub fn opposite(&self) -> Side {
+        match self {
+            Side::Up => Side::Down,
+            Side::Down => Side::Up,
+        }
+    }
 }
 
 /// Décision d'achat taker (marketable limit à `price`, fee incluse).
@@ -804,6 +810,25 @@ mod tests {
         assert!(!completion_urgent(Side::Down, -0.000005, thr));
         // l'ancien seuil 4e-4 (bug) ne se déclenchait QUE sur un krach ~1500 $/min
         assert_eq!(endangered_side(-0.000024, 0.0004), None, "l'ancien seuil ratait le trend");
+    }
+
+    #[test]
+    fn directional_winner_is_opposite_of_endangered_loser() {
+        // Base du biais directionnel : drift+OFI d'accord sur le PERDANT → le
+        // GAGNANT présumé est l'opposé. Pump (drift+/OFI+) → Down perd → Up gagne.
+        let (dt, ot) = (0.000025_f64, 0.4_f64);
+        let loser = match (endangered_side(0.00006, dt), endangered_side(0.6, ot)) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        };
+        assert_eq!(loser, Some(Side::Down));
+        assert_eq!(loser.unwrap().opposite(), Side::Up, "pump → on parie Up");
+        // signaux en désaccord → aucune conviction (pas de pari)
+        let none = match (endangered_side(0.00006, dt), endangered_side(-0.6, ot)) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        };
+        assert_eq!(none, None);
     }
 
     #[test]

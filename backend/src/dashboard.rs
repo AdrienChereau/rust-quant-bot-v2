@@ -58,6 +58,10 @@ pub struct DashboardState {
     pub merge_pair_avg: f64, // coût de paire moyen AU MOMENT des merges de la fenêtre (qualité d'exécution, cible ≈ 1,00)
     #[serde(default)]
     pub taker_fees_window: f64, // taxe taker payée cette fenêtre (7% × p(1−p) × taille par fill taker) — cible : 0
+    #[serde(default)]
+    pub dir_wins: u32, // fenêtres où la conviction directionnelle FORTE de Tokyo a visé juste
+    #[serde(default)]
+    pub dir_total: u32, // fenêtres avec conviction forte (précision = wins/total ; l'edge Tokyo se juge ici)
     pub deployed: f64,  // $ déployés sur la fenêtre courante
     pub window_start: i64, // unix s du début de la fenêtre courante (graphique)
     pub rebate_window: f64, // rebate estimé de la fenêtre courante

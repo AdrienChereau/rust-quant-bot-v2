@@ -203,6 +203,13 @@ async function tick() {
   const li = $('li'); li.textContent = (imbNow > 0 ? '+' : '') + f(imbNow, 0);
   li.className = 'cv ' + (Math.abs(imbNow) > 100 ? 'neg' : '');
   $('lpc').textContent = cents(s.pair_cost);
+  const ldir = $('ldir');
+  if (ldir) {
+    const dt = s.dir_total || 0, dw = s.dir_wins || 0;
+    // précision directionnelle de Tokyo : > 55-60% = vrai edge, ~50% = illusion
+    ldir.textContent = dt ? `${Math.round(100*dw/dt)}% (${dw}/${dt})` : '– (0)';
+    ldir.className = 'cv ' + (dt < 10 ? '' : dw/dt >= 0.57 ? 'pos' : dw/dt <= 0.5 ? 'neg' : '');
+  }
   const ltf = $('ltf');
   if (ltf) {
     ltf.textContent = f(s.taker_fees_window || 0, 2) + '$';

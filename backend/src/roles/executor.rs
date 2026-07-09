@@ -249,6 +249,14 @@ async fn quote_loop(
     let radar_obi = RadarEngine::new(cfg.obi_depth_levels, cfg.obi_threshold, cfg.velocity_threshold);
     let mut last_realized = paper.state.realized_pnl; // pour le delta par fenêtre
 
+    // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
+    // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
+    // au gagnant réel. dir_wins/dir_total = notre précision directionnelle live —
+    // c'est CE chiffre qui dira si Tokyo a un vrai edge (avant de miser gros).
+    let mut dir_call: Option<Side> = None;
+    let mut dir_wins: u32 = 0;
+    let mut dir_total: u32 = 0;
+
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
     let mut rest_up: Option<(f64, f64)> = None; // (prix, taille)
     let mut rest_dn: Option<(f64, f64)> = None;
@@ -330,6 +338,20 @@ async fn quote_loop(
                         };
                         paper.resolve(up_won);
                         paper.persist();
+                        // PRÉCISION DIRECTIONNELLE : la conviction forte de Tokyo
+                        // pour cette fenêtre a-t-elle visé le bon gagnant ?
+                        if let Some(w) = dir_call.take() {
+                            dir_total += 1;
+                            let correct = (w == Side::Up) == up_won;
+                            if correct {
+                                dir_wins += 1;
+                            }
+                            tracing::info!(
+                                call = w.as_str(), gagnant = if up_won { "up" } else { "down" },
+                                correct, precision = format!("{dir_wins}/{dir_total}"),
+                                "précision directionnelle Tokyo"
+                            );
+                        }
                         let delta = paper.state.realized_pnl - last_realized;
                         last_realized = paper.state.realized_pnl;
                         // Disjoncteur BINAIRE (comportement mesuré de la cible sur 430+
@@ -636,6 +658,38 @@ async fn quote_loop(
         } else if let Some(d) = danger {
             desired.retain(|b| b.completion || b.side != d);
         }
+
+        // ═══ BIAS DIRECTIONNEL LÉGER + MESURE DE L'EDGE TOKYO ═══
+        // Conviction FORTE = le DRIFT (confirmation) ET l'OFI (anticipation)
+        // désignent le MÊME perdant → on connaît le gagnant présumé. On MÉMORISE
+        // cette conviction (compteur de précision, sans risque) et, si
+        // SC_DIR_TILT>0, on TOLÈRE de tenir jusqu'à ce nombre de parts nettes du
+        // GAGNANT sans les compléter : petit pari sur Tokyo (on ne FORCE pas
+        // l'achat — on laisse juste le surplus gagnant vivre au lieu de le
+        // neutraliser). Borné, abandonné dès que le signal faiblit/se retourne.
+        let dir_winner = match (
+            endangered_side(drift_ps, cfg.sc_taker_drift),
+            endangered_side(ofi, cfg.sc_ofi_pull),
+        ) {
+            (Some(a), Some(b)) if a == b => Some(a.opposite()), // même perdant → gagnant
+            _ => None,
+        };
+        if let Some(w) = dir_winner {
+            dir_call = Some(w); // dernière conviction forte → mesurée à la résolution
+        }
+        // Tient-on un pari directionnel (surplus du gagnant ≤ tilt) ? Sert à NE
+        // PAS le compléter (ni maker ci-dessous, ni taker plus bas).
+        let hold_dir_bet = cfg.sc_dir_tilt > 0.0
+            && dir_winner.is_some_and(|w| {
+                let surplus = if w == Side::Up { sc.imbalance() } else { -sc.imbalance() };
+                surplus > 1e-9 && surplus <= cfg.sc_dir_tilt
+            });
+        if hold_dir_bet {
+            // compléter = acheter le PERDANT → on retire cette complétion pour
+            // laisser le pari courir jusqu'à la résolution.
+            let loser = dir_winner.unwrap().opposite();
+            desired.retain(|b| !(b.completion && b.side == loser));
+        }
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
         #[cfg(feature = "live")]
@@ -904,6 +958,7 @@ async fn quote_loop(
                 deficit_side, drift_ps, cfg.sc_taker_drift,
             );
             if enabled
+                && !hold_dir_bet // pari directionnel en cours → on le laisse courir, pas de complétion
                 && sc.imbalance().abs() >= 5.0
                 && ((10..=20).contains(&remaining_l) || (taker_drift_urgent && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
@@ -1178,6 +1233,8 @@ async fn quote_loop(
             d.pair_cost = sc.pair_cost().unwrap_or(0.0);
             d.merge_pair_avg = if win_merge_n > 0 { win_merge_cost_sum / win_merge_n as f64 } else { 0.0 };
             d.taker_fees_window = win_taker_fees;
+            d.dir_wins = dir_wins;
+            d.dir_total = dir_total;
             d.deployed = win_deployed;
             d.window_start = m.window_ts;
             d.params = crate::dashboard::StrategyParams {
