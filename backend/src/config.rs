@@ -90,6 +90,7 @@ pub struct Config {
     pub sc_trend_confirm_s: i64,   // le drift doit garder son signe N s avant d'armer le directionnel (anti flip-flop)
     pub sc_ofi_confirm: bool,      // veto OFI : pas de directionnel si le flux d'ordres Binance contredit le drift
     pub sc_ofi_min: f64,           // seuil de contradiction (|OFI| ≥ min contre nous → veto ; en-dessous = bruit, on laisse)
+    pub sc_ofi_pull: f64,          // |OFI| ≥ seuil → PULL RAPIDE de l'ouverture menacée (OFI fenêtre 5s = leader ; le drift 25s réagit trop tard). [-1,1], défaut 0.4
     pub sc_rebate_rate: f64,       // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
     pub sc_streak_soft: u32,       // pertes consécutives → taille ×0.25
     pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
@@ -228,6 +229,7 @@ impl Config {
             sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),
             sc_ofi_confirm: env_or("SC_OFI_CONFIRM", true),
             sc_ofi_min: env_or("SC_OFI_MIN", 0.15),
+            sc_ofi_pull: env_or("SC_OFI_PULL", 0.4),
             sc_rebate_rate: env_or("SC_REBATE_RATE", 0.20),
             sc_streak_soft: env_or("SC_STREAK_SOFT", 4),
             sc_streak_hard: env_or("SC_STREAK_HARD", 6),

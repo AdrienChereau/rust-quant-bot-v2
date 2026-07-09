@@ -612,14 +612,29 @@ async fn quote_loop(
         //    prendre). Les complétions survivent TOUJOURS (le côté qui crashe est
         //    précisément celui qu'un déficit veut acheter moins cher).
         use crate::engines::spread_capture::endangered_side;
+        // Deux horloges : le DRIFT (EMA halflife 25 s) confirme un mouvement
+        // installé ; l'OFI (flux d'ordres, fenêtre 5 s — « le plus prédictif du
+        // prochain tick ») l'ANTICIPE. Sur un marché aussi rapide, le drift réagit
+        // trop tard : le temps qu'il quitte « neutre », on s'est déjà fait remplir
+        // le perdant. On pull donc sur le RAPIDE (OFI) autant que sur le lent
+        // (drift) — 9 juil. : OBI/OFI « ACHAT fort » pendant que le drift affichait
+        // « neutre ». Signal positif (pression acheteuse) → le prix monte → c'est
+        // la jambe DOWN qui va crasher → on retire son ouverture.
         let drift_danger = endangered_side(drift_ps, cfg.sc_urgency_drift);
+        let ofi_danger = endangered_side(ofi, cfg.sc_ofi_pull);
+        let danger = match (drift_danger, ofi_danger) {
+            (Some(a), Some(b)) if a == b => Some(a), // les deux d'accord
+            (Some(a), None) => Some(a),              // drift seul (mouvement installé)
+            (None, Some(b)) => Some(b),              // OFI seul (anticipation — le cas clé)
+            _ => None,                               // rien, ou contradiction = bruit
+        };
         if paused {
-            match drift_danger {
-                Some(danger) => desired.retain(|b| b.completion || b.side != danger),
-                None => desired.retain(|b| b.completion), // KILL + direction illisible → les 2 sautent
+            match danger {
+                Some(d) => desired.retain(|b| b.completion || b.side != d),
+                None => desired.retain(|b| b.completion), // KILL + illisible → les 2 sautent
             }
-        } else if let Some(danger) = drift_danger {
-            desired.retain(|b| b.completion || b.side != danger);
+        } else if let Some(d) = danger {
+            desired.retain(|b| b.completion || b.side != d);
         }
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).

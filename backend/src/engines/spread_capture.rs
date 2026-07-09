@@ -806,6 +806,18 @@ mod tests {
         assert_eq!(endangered_side(-0.000024, 0.0004), None, "l'ancien seuil ratait le trend");
     }
 
+    #[test]
+    fn ofi_pull_anticipates_before_drift() {
+        // `endangered_side` sert AUSSI de pull rapide sur l'OFI ([-1,1], seuil
+        // prod 0.4). Cas du 9 juil. : OFI « ACHAT fort » (+0.6) alors que le drift
+        // est neutre → pression acheteuse → le prix va monter → Down va crasher →
+        // on retire l'ouverture DOWN, AVANT que le drift (25 s) ne réagisse.
+        let ofi_thr = 0.4_f64;
+        assert_eq!(endangered_side(0.6, ofi_thr), Some(Side::Down), "flux acheteur → pull Down");
+        assert_eq!(endangered_side(-0.6, ofi_thr), Some(Side::Up), "flux vendeur → pull Up");
+        assert_eq!(endangered_side(0.2, ofi_thr), None, "flux faible → pas de pull (anti-churn)");
+    }
+
     // ── MODE SYMÉTRIQUE ──
     #[test]
     fn symmetric_balanced_quotes_both_sides_pair_guaranteed() {
