@@ -914,7 +914,18 @@ async fn quote_loop(
                     (true, ask_up, ask_up_sz)
                 };
                 let avg_excess_ins = sc.avg(if is_up { Side::Down } else { Side::Up });
-                let pair_room_ins = cfg.sc_completion_max_pair - avg_excess_ins;
+                // PLAFOND DE PAIRE DU SAUVETAGE — RAMPE TEMPORELLE (9 juil.).
+                // Payer `a` pour la jambe gagnante est +EV ssi P(gagne) > a. Or
+                // près de la résolution, le prix du marché EST P → on peut payer
+                // cher en confiance ; loin, une tendance n'est pas une certitude →
+                // on reste prudent. Donc le plafond monte de `sc_completion_max_pair`
+                // (loin, ~1.02) vers `sc_rescue_max_pair` (tout près, ~1.23),
+                // linéaire sur les 120 dernières secondes. C'est le profil de la
+                // cible 0xb27b : ses complétions à 1.23 sont TARDIVES et confiantes.
+                let ramp = ((120 - remaining_l).max(0) as f64 / 120.0).clamp(0.0, 1.0);
+                let rescue_pair = cfg.sc_completion_max_pair
+                    + ramp * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
+                let pair_room_ins = rescue_pair - avg_excess_ins;
                 if ask > 0.0 && ask <= 0.99 && ask <= pair_room_ins + 1e-9 {
                     // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
                     // par les minimums relançait la spirale). Sous les minimums →
@@ -924,11 +935,13 @@ async fn quote_loop(
                     if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
                         let cause = if taker_drift_urgent && remaining_l > 20 { "drift fort" } else { "fin de fenêtre" };
+                        let pair_now = ask + avg_excess_ins;
                         tracing::info!(
                             side = if is_up { "up" } else { "down" }, ask = format!("{ask:.3}"),
                             size = format!("{sz:.1}"), rem = remaining_l,
                             drift = format!("{drift_ps:+.5}"), cause,
-                            "complétion TAKER (paie le marché pour compléter la paire)"
+                            pair = format!("{pair_now:.3}"), cap = format!("{rescue_pair:.3}"),
+                            "SAUVETAGE taker (paie le marché pour compléter la paire)"
                         );
                         lv.place_insurance_fak(is_up, ask, sz).await;
                     }
