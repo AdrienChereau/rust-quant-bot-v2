@@ -651,6 +651,14 @@ async fn quote_loop(
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
             let mut harvested: Vec<crate::live::engine::LiveFill> = Vec::new();
+            // ═══ VÉRITÉ CLOB D'ABORD (principe : décider sur le CLOB, jamais
+            // sur le miroir/dashboard) : on synchronise nos ordres restants avec
+            // le carnet RÉEL (poll /data/orders + balayage des ordres fantômes)
+            // AVANT toute décision de pose. Résultat : les slots lrest reflètent
+            // la réalité Polymarket → on ne pose jamais atop un ordre en attente
+            // qu'on n'aurait pas vu, ni ne reprice un ordre déjà fillé.
+            let mut fills = lv.drain_ws(&mut lrest_up, &mut lrest_dn);
+            fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
             // KILL/pause → tout annuler — mais JAMAIS sans récolter d'abord
             // (un cancel aveugle perd le fill arrivé entre-temps).
             if sleeping || !enabled {
@@ -812,11 +820,9 @@ async fn quote_loop(
                     }
                 }
             }
-            // Fills réels : WS temps réel (trade + états d'ordres) + récoltes
-            // pré-annulation + poll (autorité + balayage anti double-ordre).
-            let mut fills = lv.drain_ws(&mut lrest_up, &mut lrest_dn);
+            // Fills : ceux du CLOB drainés en tête de bloc (avant la pose) +
+            // ceux récoltés pendant la pose (reprice/cancel de CE tick).
             fills.append(&mut harvested);
-            fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
             for f in fills {
                 last_fill_wall_ms = now_ms_books as i64;
                 lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
@@ -916,26 +922,33 @@ async fn quote_loop(
                 win_merged += p;
                 tracing::info!(pairs_tx = pairs_done, credited = p, "merge on-chain appliqué (crédit exact)");
             }
-            // MERGE = pompe à volume : dès le seuil technique atteint, sans
-            // attendre (spec 8 juil. — le capital qui dort ne génère pas de
-            // rebates). Le blended >1$ ne bloque PAS le merge : il gèle
-            // seulement l'escalade (ci-dessus).
-            let mirror_pairs = paper.state.up_balance.min(paper.state.down_balance);
-            if mirror_pairs >= cfg.min_merge_threshold && lv.merge_available() {
-                let pairs = mirror_pairs.floor();
-                match lv.start_merge(pairs).await {
-                    crate::live::engine::MergeStart::WouldRevert => {
-                        // AMBIGU (leçon du 8 juil. 18:15) : « would revert » peut
-                        // vouloir dire (a) merge précédent déjà passé, ou (b) les
-                        // tokens fraîchement fillés ne sont PAS ENCORE réglés
-                        // on-chain. Créditer ici a fabriqué un déficit fantôme →
-                        // sur-achat. On ne crédite RIEN : resync forcé, la vérité
-                        // on-chain tranche, et la tentative revient dans 45 s.
-                        lv.force_cash_resync();
-                        tracing::warn!(pairs_tx = pairs,
-                            "merge simulé refusé (would revert) — AUCUN crédit, resync on-chain forcé");
+            // MERGE = pompe à volume, mais action ON-CHAIN IRRÉVERSIBLE : on ne
+            // la déclenche JAMAIS sur le miroir. On lit les positions RÉELLES du
+            // CLOB juste avant, et on merge min(real_up, real_down). La chaîne ne
+            // montre jamais de tokens non encore réglés → merger min(real) est
+            // conservateur par construction (fini les "would revert" sur paires
+            // fantômes). On ne réaligne PAS le moteur ici (la chaîne peut laguer
+            // un fill tout frais → sous-compte → sur-achat) : ce réalignement
+            // reste dans le bloc gardé settle-quiet, juste en dessous.
+            if lv.merge_available() {
+                if let Some((ru, rd)) = lv.positions_force().await {
+                    let pairs = ru.min(rd).floor();
+                    if pairs >= cfg.min_merge_threshold {
+                        match lv.start_merge(pairs).await {
+                            crate::live::engine::MergeStart::WouldRevert => {
+                                // « would revert » = les tokens ne sont pas (ou
+                                // plus) mergeables on-chain. On ne crédite RIEN :
+                                // resync forcé, la vérité on-chain tranche, retry
+                                // dans 45 s. (Avec le merge sur min(real), ce cas
+                                // devient rare : on ne demande que ce que la
+                                // chaîne confirme déjà détenir.)
+                                lv.force_cash_resync();
+                                tracing::warn!(pairs_tx = pairs,
+                                    "merge refusé (would revert) — AUCUN crédit, resync on-chain forcé");
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
                 }
             }
 

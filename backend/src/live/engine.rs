@@ -234,6 +234,25 @@ impl LiveCtx {
         }
     }
 
+    /// Positions RÉELLES on-chain, lecture directe — pour l'AMONT d'une décision
+    /// irréversible (merge), qui ne doit JAMAIS partir sur le miroir. N'affecte
+    /// pas la cadence de `real_positions` (le réalignement du moteur reste, lui,
+    /// gardé par le settle-quiet). Interroge balance-allowance CONDITIONAL.
+    pub async fn positions_force(&mut self) -> Option<(f64, f64)> {
+        if self.up_token.is_empty() {
+            return None;
+        }
+        let up = super::auth::get_conditional_balance(&self.creds, &self.up_token).await;
+        let dn = super::auth::get_conditional_balance(&self.creds, &self.dn_token).await;
+        match (up, dn) {
+            (Ok(u), Ok(d)) => Some((u, d)),
+            (u, d) => {
+                tracing::warn!(?u, ?d, "lecture positions on-chain (merge) échouée — merge sauté ce tick");
+                None
+            }
+        }
+    }
+
     /// Lance un MERGE on-chain de `pairs` paires (un seul en vol, cooldown 45 s).
     /// `WouldRevert` = la simulation du relayer refuse — quasi toujours parce que
     /// les paires sont DÉJÀ mergées on-chain (tx précédente passée malgré un
