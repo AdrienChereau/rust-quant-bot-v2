@@ -4,7 +4,7 @@ const f = (n, d = 2) => (n == null || isNaN(n)) ? '–' : Number(n).toFixed(d);
 const money = (n) => (n >= 0 ? '+' : '') + f(n, 2) + '$';
 const cents = (n) => (n == null || isNaN(n) || n === 0) ? '–' : f(n * 100, 1) + '¢';
 const symlog = (v) => Math.sign(v) * Math.log10(1 + Math.abs(v));
-const CH = { pxmon: 210, imb: 80, pc: 100, cum: 120 };
+const CH = { pxmon: 400, cum: 200 };
 // Réécrit un innerHTML seulement s'il change : supprime le "rafraîchissement"
 // visible toutes les 2 s (le DOM n'était pas sale, on le réécrivait quand même).
 function setHtml(id, html) { const el = $(id); if (el.__last !== html) { el.__last = html; el.innerHTML = html; } }
@@ -57,69 +57,40 @@ function drawPxMonitor(s) {
     const tS = Date.parse(e.ts) / 1000 - winStart;
     if (!(tS >= 0 && tS <= 300)) return;
     if (e.kind === 'buy') {
-      const px = X(tS), py = Y(e.price * 100);
-      x.fillStyle = e.side === 'up' ? '#4caf6a' : '#e2604a';
-      x.beginPath(); x.moveTo(px, py - 5); x.lineTo(px - 4.5, py + 4); x.lineTo(px + 4.5, py + 4);
+      const px = X(tS), py = Y(e.price * 100), up = e.side === 'up';
+      x.fillStyle = up ? '#4caf6a' : '#e2604a';
+      x.beginPath();
+      if (up) { x.moveTo(px, py - 6); x.lineTo(px - 5, py + 4); x.lineTo(px + 5, py + 4); } // ▲ achat Up
+      else { x.moveTo(px, py + 6); x.lineTo(px - 5, py - 4); x.lineTo(px + 5, py - 4); }     // ▼ achat Down
       x.closePath(); x.fill();
       x.strokeStyle = '#0d0f12'; x.lineWidth = 1; x.stroke();
     } else if (e.kind === 'merge') {
       const px = X(tS), py = Y(50);
       x.fillStyle = '#4aa3ff';
-      x.beginPath(); x.arc(px, py, 4, 0, 7); x.fill();
-      x.strokeStyle = '#0d0f12'; x.stroke();
+      x.beginPath(); x.arc(px, py, 5, 0, 7); x.fill();
+      x.strokeStyle = '#0d0f12'; x.lineWidth = 1.5; x.stroke();
     }
   });
-}
-
-function drawImb() {
-  const [x, w, h] = ctx('imb');
-  if (!winStart) return;
-  const ws = winStart * 1000;
-  const pts = series.filter((p) => p.t >= ws);
-  if (pts.length < 2) return;
-  const sv = pts.map((p) => symlog(p.imb || 0));
-  const lim = Math.max(Math.abs(Math.min(...sv, 0)), Math.abs(Math.max(...sv, 0)), symlog(50));
-  const X = (i) => 34 + ((pts[i].t - ws) / 300000) * (w - 42);
-  const Y = (v) => h / 2 - (v / lim) * (h / 2 - 10);
-  x.font = '9px ui-monospace,monospace';
-  [0, 50, -50, 200, -200].forEach((t) => {
-    const y = Y(symlog(t));
-    if (y > 4 && y < h - 4) {
-      x.strokeStyle = t === 0 ? '#555' : '#2a2f38';
-      x.setLineDash(t === 0 ? [3, 3] : [2, 4]);
-      x.beginPath(); x.moveTo(34, y); x.lineTo(w - 8, y); x.stroke(); x.setLineDash([]);
-      x.fillStyle = '#8a919c'; x.fillText(t > 0 ? '+' + t : String(t), 2, y + 3);
-    }
-  });
-  x.strokeStyle = '#a78bfa'; x.lineWidth = 2; x.beginPath();
-  pts.forEach((p, i) => {
-    const y = Y(symlog(p.imb || 0));
-    i ? x.lineTo(X(i), y) : x.moveTo(X(i), y);
-  });
-  x.stroke();
-}
-
-function drawWindows(ws) {
-  // barres coût de paire (60 dernières)
-  let [x, w2, h2] = ctx('pc');
-  const wsc = ws.slice(-60);
-  if (wsc.length) {
-    const bw = Math.max(3, Math.min(30, (w2 - 40) / wsc.length - 3));
-    const vals = wsc.map((q) => (q.pair_cost || 0) * 100);
-    const mx = Math.max(...vals, 110);
-    const y100 = h2 - 12 - (100 / mx) * (h2 - 20);
-    x.strokeStyle = '#555'; x.setLineDash([3, 3]);
-    x.beginPath(); x.moveTo(30, y100); x.lineTo(w2 - 6, y100); x.stroke(); x.setLineDash([]);
-    x.fillStyle = '#8a919c'; x.font = '10px ui-monospace,monospace'; x.fillText('100', 4, y100 + 3);
-    wsc.forEach((q, i) => {
-      const v = (q.pair_cost || 0) * 100;
-      const bh = (v / mx) * (h2 - 20);
-      x.fillStyle = v > 0 && v < 100 ? '#4caf6a' : '#e2604a';
-      x.fillRect(30 + i * (bw + 3), h2 - 12 - bh, bw, bh);
-    });
+  // Overlay valeurs courantes (comme la capture) : prix Up + minuteur.
+  const last = pts[pts.length - 1];
+  if (last) {
+    const up = (last.up_mid * 100);
+    x.font = '600 15px ui-monospace,monospace'; x.textAlign = 'right';
+    x.fillStyle = '#4caf6a'; x.fillText('Up ' + up.toFixed(1) + '¢', w - padR - 2, Y(up) - 6);
+    x.textAlign = 'left';
   }
+  if (window.__rem != null) {
+    const mm = Math.floor(window.__rem / 60), ssv = window.__rem % 60;
+    x.font = '600 16px ui-monospace,monospace'; x.textAlign = 'right';
+    x.fillStyle = window.__rem < 30 ? '#e0a24a' : '#8a919c';
+    x.fillText(mm + ':' + String(ssv).padStart(2, '0'), w - padR - 2, padT + 14);
+    x.textAlign = 'left';
+  }
+}
+
+function drawCum(ws) {
   // cumul trading vs trading+rebate
-  [x, w2, h2] = ctx('cum');
+  const [x, w2, h2] = ctx('cum');
   if (ws.length) {
     let a = 0, b = 0;
     const t1 = ws.map((q) => a += (q.pnl || 0));
@@ -201,8 +172,21 @@ async function tick() {
   $('lud').textContent = `${f(s.up_bal, 0)}/${f(s.down_bal, 0)}`;
   const imbNow = (s.up_bal || 0) - (s.down_bal || 0);
   const li = $('li'); li.textContent = (imbNow > 0 ? '+' : '') + f(imbNow, 0);
-  li.className = 'cv ' + (Math.abs(imbNow) > 100 ? 'neg' : '');
   $('lpc').textContent = cents(s.pair_cost);
+
+  // ── BANDEAU DE VALEURS EXPLOITABLES (au-dessus du grand graphique) ──
+  window.__rem = s.remaining_s;
+  const setIs = (id, txt, cls) => { const e = $(id); if (!e) return; e.textContent = txt; e.className = 'isv' + (cls ? ' ' + cls : ''); };
+  const lat = s.signal_age_ms || 0;
+  setIs('ilat', lat ? lat + ' ms' : '–', lat > 2000 ? 'neg' : lat > 500 ? 'warn' : 'pos');
+  setIs('iord', (s.open_orders != null ? s.open_orders : '–') + '/2', s.open_orders === 2 ? 'pos' : s.open_orders === 0 ? 'mut' : '');
+  setIs('ifil', s.fills || 0);
+  setIs('imrg', s.merges || 0, 'pos');
+  setIs('iud', `${f(s.up_bal, 0)} / ${f(s.down_bal, 0)}`);
+  setIs('iimb', (imbNow > 0 ? '+' : '') + f(imbNow, 0), Math.abs(imbNow) > 12 ? 'neg' : '');
+  setIs('ipc', cents(s.pair_cost));
+  const rem = s.remaining_s || 0;
+  setIs('iclk', Math.floor(rem / 60) + ':' + String(rem % 60).padStart(2, '0'), rem < 30 ? 'warn' : '');
   const ldir = $('ldir');
   if (ldir) {
     const dt = s.dir_total || 0, dw = s.dir_wins || 0;
@@ -255,7 +239,7 @@ async function tick() {
         `<td>${f(w.merged, 0)}</td><td class="pos">${f(w.rebate, 2)}</td><td class="${cls}">${money(w.pnl)}</td></tr>`;
     }).join('') || '<tr><td class="empty">en attente…</td></tr>');
 
-  drawPxMonitor(s); drawImb(); drawWindows(ws);
+  drawPxMonitor(s); drawCum(ws);
 }
 
 async function tickEvents() {

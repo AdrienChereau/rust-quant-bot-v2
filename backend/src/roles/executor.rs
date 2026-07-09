@@ -458,7 +458,7 @@ async fn quote_loop(
         // last_spot (le gel du 6 juil. a fait trader/résoudre sur un spot mort).
         let t_secs = m.time_remaining_sec().max(0) as f64;
         let t_years = pricing::years_from_secs(t_secs);
-        let (spot, sigma, drift_ps, obi, ofi) = if cfg.use_udp_transport {
+        let (spot, sigma, drift_ps, obi, ofi, sig_age_ms) = if cfg.use_udp_transport {
             let snap = *remote_rx.borrow();
             let Some((t, recv_ms)) = snap else {
                 // JAMAIS rien reçu : dire pourquoi le bot ne fait rien (le cas
@@ -504,7 +504,7 @@ async fn quote_loop(
                 tracing::warn!(age_ms, "signal Tokyo PÉRIMÉ — quotes retirées");
                 continue;
             }
-            (t.spot, t.sigma, t.drift, t.obi, t.ofi)
+            (t.spot, t.sigma, t.drift, t.obi, t.ofi, age_ms)
         } else {
             let bu = spot_rx.borrow().clone();
             let Some(bu) = bu else { continue };
@@ -525,7 +525,7 @@ async fn quote_loop(
             if let (Some(bb), Some(ba)) = (bu.book.best_bid(), bu.book.best_ask()) {
                 ofi_eng.update(tick.ts_ms, bb, bid_sz, ba, ask_sz);
             }
-            (spot, *sigma_rx.borrow(), drift_eng.per_sec(), obi, ofi_eng.value_norm())
+            (spot, *sigma_rx.borrow(), drift_eng.per_sec(), obi, ofi_eng.value_norm(), tick_age_ms)
         };
         last_spot = Some(spot);
 
@@ -1223,6 +1223,8 @@ async fn quote_loop(
             d.down_bid = buy_cap_dn;
             d.down_ask = ask_dn;
             d.in_band = rest_up.is_some() || rest_dn.is_some();
+            d.signal_age_ms = sig_age_ms;
+            d.open_orders = rest_up.is_some() as u32 + rest_dn.is_some() as u32;
             if d.last_block_reason.starts_with("SIGNAL TOKYO") {
                 d.last_block_reason.clear();
             }

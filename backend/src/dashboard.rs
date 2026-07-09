@@ -52,6 +52,10 @@ pub struct DashboardState {
     pub pulled_up: bool,   // bid Up retiré (côté qui décroche)
     pub pulled_down: bool, // bid Down retiré
     pub in_band: bool,
+    #[serde(default)]
+    pub signal_age_ms: i64, // latence : âge du dernier signal Tokyo (fraîcheur des données)
+    #[serde(default)]
+    pub open_orders: u32,   // nombre de bids restants au carnet (0/1/2)
     // Spread-capture v5
     pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
     #[serde(default)]

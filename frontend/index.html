@@ -22,14 +22,24 @@
   </div>
 </header>
 <main>
+<div class="panel">
+  <div class="ph">Monitor prix Polymarket — Up (vert) / Down (rouge) · ▲▼ fills · ● merges · <span id="lslug" class="mut">…</span> · <span id="lelapsed" class="mut"></span> · <span id="lstate" class="mut"></span></div>
+  <div class="infostrip">
+    <div class="is"><span class="isl">latence signal</span><span class="isv" id="ilat">–</span></div>
+    <div class="is"><span class="isl">ordres ouverts</span><span class="isv" id="iord">–</span></div>
+    <div class="is"><span class="isl">fills</span><span class="isv" id="ifil">–</span></div>
+    <div class="is"><span class="isl">merges</span><span class="isv" id="imrg">–</span></div>
+    <div class="is"><span class="isl">Up / Down</span><span class="isv" id="iud">–</span></div>
+    <div class="is"><span class="isl">imbalance</span><span class="isv" id="iimb">–</span></div>
+    <div class="is"><span class="isl">coût paire</span><span class="isv" id="ipc">–</span></div>
+    <div class="is"><span class="isl">reste</span><span class="isv" id="iclk">–</span></div>
+  </div>
+  <canvas id="pxmon" height="400"></canvas>
+</div>
 <div class="grid2">
   <div class="panel">
-    <div class="ph">Fenêtre en cours — <span id="lslug" class="mut">…</span> · <span id="lelapsed"></span> · <span id="lstate" class="mut"></span></div>
+    <div class="ph">Fenêtre en cours — indicateurs</div>
     <div class="livegrid">
-      <div class="card"><div class="cl">fills</div><div class="cv" id="lf">0</div></div>
-      <div class="card"><div class="cl">Up / Down</div><div class="cv" id="lud">0/0</div></div>
-      <div class="card"><div class="cl">imbalance</div><div class="cv" id="li">0</div></div>
-      <div class="card"><div class="cl">coût paire</div><div class="cv" id="lpc">–</div></div>
       <div class="card"><div class="cl">paire au merge</div><div class="cv" id="lmpa">–</div></div>
       <div class="card"><div class="cl">taxe taker</div><div class="cv" id="ltf">–</div></div>
       <div class="card"><div class="cl">précision Tokyo</div><div class="cv" id="ldir">–</div></div>
@@ -38,19 +48,17 @@
       <div class="card"><div class="cl">facteur taille</div><div class="cv" id="lsf">×1</div></div>
       <div class="card"><div class="cl">cash</div><div class="cv" id="lc">–</div></div>
     </div>
-    <div class="ph" style="margin-top:12px">Monitor prix — Up (vert) / Down (rouge) · ▲ achats · ● merges</div>
-    <canvas id="pxmon" height="210"></canvas>
-    <div class="ph" style="margin-top:12px">Exposition nette (Up − Down)</div>
-    <canvas id="imb" height="80"></canvas>
-  </div>
-  <div class="panel">
-    <div class="ph">Coût de paire par fenêtre (¢) · vert &lt; 100¢</div>
-    <canvas id="pc" height="100"></canvas>
-    <div class="ph" style="margin-top:12px">Cumul : trading (orange) · trading+rebate (violet)</div>
-    <canvas id="cum" height="120"></canvas>
-    <div class="ph" style="margin-top:12px">Derniers fills</div>
+    <div class="ph" style="margin-top:12px">Derniers fills &amp; merges</div>
     <div class="feed" id="feed"></div>
   </div>
+  <div class="panel">
+    <div class="ph">Cumul : trading (orange) · trading+rebate (violet)</div>
+    <canvas id="cum" height="200"></canvas>
+  </div>
+</div>
+<!-- tiles miroir (masquées, conservées pour compat JS) -->
+<div style="display:none">
+  <span id="lf"></span><span id="lud"></span><span id="li"></span><span id="lpc"></span>
 </div>
 <div class="panel">
   <div class="ph">Bilan par jour</div>

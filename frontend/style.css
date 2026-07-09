@@ -10,7 +10,12 @@ header{display:flex;justify-content:space-between;align-items:center;padding:14p
 .hl .l{color:var(--mut);font-size:11px}
 .hl .v{font-size:18px;font-weight:600;font-family:ui-monospace,monospace}
 .clock{color:var(--mut);font-family:ui-monospace,monospace}
-.pos{color:var(--pos)}.neg{color:var(--neg)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:#e0a24a}
+/* bandeau de valeurs exploitables au-dessus du grand graphique */
+.infostrip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.infostrip .is{background:#0f1116;border:1px solid var(--border);border-radius:8px;padding:6px 12px;min-width:96px;flex:1 1 96px}
+.infostrip .isl{display:block;color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}
+.infostrip .isv{display:block;font-size:18px;font-weight:600;font-family:ui-monospace,monospace;margin-top:2px}
 main{padding:14px 20px;display:grid;gap:14px}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .ph{font-size:12px;color:var(--mut);margin-bottom:8px;text-transform:uppercase;letter-spacing:.04em}
