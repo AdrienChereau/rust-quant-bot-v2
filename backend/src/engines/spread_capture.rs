@@ -788,6 +788,24 @@ mod tests {
         assert_eq!(endangered_side(0.0001, 0.0004), None); // illisible → retirer les 2
     }
 
+    #[test]
+    fn defensive_layer_fires_at_calibrated_scale_not_on_noise() {
+        // Seuil calibré ÉCHELLE PAR-SECONDE (défaut prod 2e-5). Le drift réel
+        // ~1e-5 pour 60 $/min ; le bruit EMA ~8e-6. La défense doit s'activer sur
+        // un vrai trend et rester muette sur le bruit — sinon elle churne (9 juil.).
+        let thr = 0.00002_f64; // SC_URGENCY_DRIFT prod
+        // trend down franc (~-90 $/min → -2,4e-5) : l'OUVERTURE Up est en danger
+        // (Up crashe) ET compléter un déficit DOWN devient urgent (Down renchérit).
+        assert_eq!(endangered_side(-0.000024, thr), Some(Side::Up));
+        assert!(completion_urgent(Side::Down, -0.000024, thr));
+        // bruit (~5e-6) : AUCUNE réaction (pas de churn)
+        assert_eq!(endangered_side(0.000005, thr), None);
+        assert!(!completion_urgent(Side::Up, 0.000005, thr));
+        assert!(!completion_urgent(Side::Down, -0.000005, thr));
+        // l'ancien seuil 4e-4 (bug) ne se déclenchait QUE sur un krach ~1500 $/min
+        assert_eq!(endangered_side(-0.000024, 0.0004), None, "l'ancien seuil ratait le trend");
+    }
+
     // ── MODE SYMÉTRIQUE ──
     #[test]
     fn symmetric_balanced_quotes_both_sides_pair_guaranteed() {

@@ -95,7 +95,10 @@ pub struct Config {
     pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
     pub sc_bankroll_pct: f64,      // >0 : budget/fenêtre = pct × bankroll (recalculé au rollover) ; 0 = cap fixe
     pub sc_symmetric: bool,        // MODE SYMÉTRIQUE : 2 bids simultanés (paire ≤ pair_target par construction), AUCUNE jambe directionnelle
-    pub sc_urgency_drift: f64,     // |drift Tokyo| ≥ seuil → complétion URGENTE (bid à ask−tick) + KILL asymétrique
+    // Seuils du drift Tokyo — ÉCHELLE PAR-SECONDE (log-return/s). Le drift réel
+    // vaut ~1e-5 pour un trend BTC de 60 $/min ; le bruit de l'EMA ~8e-6. Donc :
+    pub sc_urgency_drift: f64,     // ≥ ce drift/s → PULL de l'ouverture menacée + complétion maker agressive (ask−tick). Défaut 2e-5 (~74 $/min, ~2,4σ au-dessus du bruit)
+    pub sc_taker_drift: f64,       // ≥ ce drift/s → complétion TAKER immédiate (paie le marché pour ne pas mourir nu). Défaut 4e-5 (~150 $/min, mouvement franc)
 
     // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
     pub sc_sleep_hours_utc: Vec<u32>,
@@ -230,7 +233,8 @@ impl Config {
             sc_streak_hard: env_or("SC_STREAK_HARD", 6),
             sc_bankroll_pct: env_or("SC_BANKROLL_PCT", 0.0),
             sc_symmetric: env_or("SC_SYMMETRIC", false),
-            sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.0004),
+            sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00002),
+            sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.00004),
 
             sc_sleep_hours_utc: std::env::var("SC_SLEEP_HOURS_UTC")
                 .unwrap_or_else(|_| "22,23,0,1,2,3,8".into())

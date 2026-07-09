@@ -598,18 +598,28 @@ async fn quote_loop(
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
 
-        // ═══ Signal Tokyo au service de l'INVENTAIRE (8 juil.) ═══
+        // ═══ Signal Tokyo au service de l'INVENTAIRE ═══
         let mut desired = desired;
-        // KILL ASYMÉTRIQUE : sur alerte radar, seule l'ouverture EN DANGER est
-        // retirée (celle que le mouvement va traverser) ; l'autre garde sa file.
-        // Les complétions survivent toujours : le côté qui crashe, c'est
-        // précisément celui qu'un déficit veut acheter moins cher.
+        // PULL DÉFENSIF de l'ouverture EN DANGER (celle que le mouvement va
+        // traverser → sélection adverse : on se ferait remplir le PERDANT). Deux
+        // déclencheurs :
+        //  · KILL radar (OBI/vélocité) → pull, et si la direction est illisible,
+        //    on retire les DEUX ouvertures (prudence maximale) ;
+        //  · MICRO-PULL drift (seuil calibré `sc_urgency_drift`, échelle
+        //    par-seconde) → même hors KILL, on retire la jambe menacée. C'est LA
+        //    défense contre le résidu perdant : ne pas l'acquérir (8 juil. : 3,3 Up
+        //    nus, invendables sous le minimum 5 parts — mieux vaut ne jamais les
+        //    prendre). Les complétions survivent TOUJOURS (le côté qui crashe est
+        //    précisément celui qu'un déficit veut acheter moins cher).
+        use crate::engines::spread_capture::endangered_side;
+        let drift_danger = endangered_side(drift_ps, cfg.sc_urgency_drift);
         if paused {
-            use crate::engines::spread_capture::endangered_side;
-            match endangered_side(drift_ps, cfg.sc_urgency_drift) {
+            match drift_danger {
                 Some(danger) => desired.retain(|b| b.completion || b.side != danger),
-                None => desired.retain(|b| b.completion), // direction illisible → les 2 ouvertures sautent
+                None => desired.retain(|b| b.completion), // KILL + direction illisible → les 2 sautent
             }
+        } else if let Some(danger) = drift_danger {
+            desired.retain(|b| b.completion || b.side != danger);
         }
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
@@ -866,11 +876,21 @@ async fn quote_loop(
             // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
             // au plus 1 tentative / 3 s (le fill revient par le WS).
             let remaining_l = m.time_remaining_sec();
-            // FAK = DERNIER recours : le maker agressif a eu t-45→t-20 pour
-            // compléter sans taxe ; sous t-20 on paie pour ne pas mourir nu.
+            // Deux déclencheurs pour PAYER le marché (taker) et compléter :
+            //  · FIN DE FENÊTRE (t-20 → t-10) : dernier recours, plus le temps
+            //    d'espérer un fill maker ;
+            //  · DRIFT FORT (seuil `sc_taker_drift`, ~2× le seuil de pull) : le
+            //    sous-jacent renchérit franchement notre déficit → on complète
+            //    MAINTENANT au marché plutôt que de laisser la jambe partir nue
+            //    (« compenser la perte » demandé le 9 juil.). Borné au plafond de
+            //    paire : au-delà, résidu accepté (perte bornée).
+            let deficit_side = if sc.imbalance() > 0.0 { Side::Down } else { Side::Up };
+            let taker_drift_urgent = crate::engines::spread_capture::completion_urgent(
+                deficit_side, drift_ps, cfg.sc_taker_drift,
+            );
             if enabled
-                && (10..=20).contains(&remaining_l)
                 && sc.imbalance().abs() >= 5.0
+                && ((10..=20).contains(&remaining_l) || (taker_drift_urgent && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
                 let (is_up, ask, ask_sz) = if sc.imbalance() > 0.0 {
@@ -888,6 +908,13 @@ async fn quote_loop(
                     let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask).ceil());
                     if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
+                        let cause = if taker_drift_urgent && remaining_l > 20 { "drift fort" } else { "fin de fenêtre" };
+                        tracing::info!(
+                            side = if is_up { "up" } else { "down" }, ask = format!("{ask:.3}"),
+                            size = format!("{sz:.1}"), rem = remaining_l,
+                            drift = format!("{drift_ps:+.5}"), cause,
+                            "complétion TAKER (paie le marché pour compléter la paire)"
+                        );
                         lv.place_insurance_fak(is_up, ask, sz).await;
                     }
                 }
