@@ -914,21 +914,24 @@ async fn quote_loop(
                     (true, ask_up, ask_up_sz)
                 };
                 let avg_excess_ins = sc.avg(if is_up { Side::Down } else { Side::Up });
-                // PLAFOND DE PAIRE DU SAUVETAGE — RAMPE AFFINE dans le temps.
-                // Payer `a` pour la jambe gagnante est +EV ssi P(gagne) > a. Or
-                // près de la résolution, le prix du marché EST P → on peut payer
-                // cher en confiance ; loin, une tendance n'est pas une certitude →
-                // on reste prudent. Interpolation LINÉAIRE CONTINUE (recalculée à
-                // la seconde) du plafond, de `sc_completion_max_pair` (à t ≥
-                // `sc_rescue_ramp_s`) vers `sc_rescue_max_pair` (à t = 0) :
-                //   ramp(t) = clamp((RAMP_S − t) / RAMP_S, 0, 1)
-                //   cap(t)  = base + ramp(t) · (rescue_max − base)
-                // Ex. RAMP_S=120 : t=91 s → 1.071, t=90 → 1.073, sans palier.
-                // Profil 0xb27b : complétions à 1.23 TARDIVES et confiantes.
+                // PLAFOND DE PAIRE DU SAUVETAGE — piloté par la CONFIANCE.
+                // Payer `a` pour la jambe gagnante est +EV ssi P(gagne) > a. La
+                // confiance vient de DEUX sources, on prend la plus forte :
+                //  · TEMPS : près de la résolution, le prix du marché EST P →
+                //    rampe affine `clamp((RAMP_S − t)/RAMP_S, 0, 1)` (continue).
+                //  · SIGNAL : un drift qui dépasse franchement le seuil taker =
+                //    forte conviction de direction, MÊME loin de la fin (15:28 le
+                //    9 juil. : drift −1e-4 = 4× le seuil à 70 s → le sauvetage
+                //    aurait dû tirer, le plafond purement temporel l'a bloqué à 1¢).
+                //    `clamp((|drift| − taker_thr)/(2·taker_thr), 0, 1)`.
+                //   cap = base + max(conf_temps, conf_signal) · (rescue_max − base)
                 let ramp_s = cfg.sc_rescue_ramp_s.max(1.0);
-                let ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
+                let time_ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
+                let taker_thr = cfg.sc_taker_drift.max(1e-9);
+                let sig_ramp = ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
+                let conf = time_ramp.max(sig_ramp);
                 let rescue_pair = cfg.sc_completion_max_pair
-                    + ramp * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
+                    + conf * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;
                 if ask > 0.0 && ask <= 0.99 && ask <= pair_room_ins + 1e-9 {
                     // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
