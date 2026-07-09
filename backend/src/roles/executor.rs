@@ -757,6 +757,16 @@ async fn quote_loop(
                 // faisabilité : commune ≥ minimums des 2 côtés ET ≤ tailles engine ;
                 // vide (marché décidé) → AUCUNE ouverture.
                 let min_shares = m.min_order_size.max(1.0);
+                // Buffer anti-cross ADAPTATIF au σ, sur les OUVERTURES uniquement :
+                // plus le marché bouge, plus on pose profond sous l'ask pour ne pas
+                // croiser sur un saut d'ask pendant la latence du POST (9 juil. :
+                // 3 crosses/fenêtre). Calme → ask−1 tick (on maximise les fills/
+                // rebates) ; volatil → jusqu'à ask−3. Complétions/FAK gardent le
+                // droit de croiser (ask−1) : ce sont des voies d'assurance.
+                let open_extra = ((sigma - cfg.sc_cross_vol_lo) / cfg.sc_cross_vol_span.max(1e-9))
+                    .floor()
+                    .clamp(0.0, cfg.sc_cross_max_extra);
+                let open_buf = (1.0 + open_extra) * tick_sz;
                 let open_common: Option<f64> = {
                     let ou = desired.iter().find(|b| b.side == Side::Up && !b.completion);
                     let od = desired.iter().find(|b| b.side == Side::Down && !b.completion);
@@ -803,10 +813,13 @@ async fn quote_loop(
                     (&mut lrest_dn, Side::Down, ask_dn),
                 ] {
                     let want = desired.iter().find(|b| b.side == side);
-                    // ANTI-CROSS : un GTC au prix de l'ask deviendrait taker →
-                    // on clampe strictement sous l'ask (préserve le statut maker).
+                    let is_comp = want.map(|b| b.completion).unwrap_or(false);
+                    // ANTI-CROSS : on clampe sous l'ask (préserve le maker). Les
+                    // OUVERTURES prennent le buffer adaptatif (ask−open_buf) ; les
+                    // COMPLÉTIONS restent à ask−1 tick (droit de croiser assumé).
+                    let buf = if is_comp { tick_sz } else { open_buf };
                     let want_px = want.map(|b| {
-                        let cap = if ask > 0.0 { ask - tick_sz } else { b.price };
+                        let cap = if ask > 0.0 { ask - buf } else { b.price };
                         ((b.price.min(cap)) / tick_sz).floor() * tick_sz
                     });
                     // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
@@ -877,8 +890,8 @@ async fn quote_loop(
                                 // croise = taxe taker + rebate perdu.
                                 let tok = if side == Side::Up { &m.up_token_id } else { &m.down_token_id };
                                 let fa = fresh_ask(tok, ask);
-                                let px = if fa > tick_sz {
-                                    px.min(((fa - tick_sz) / tick_sz).floor() * tick_sz)
+                                let px = if fa > buf {
+                                    px.min(((fa - buf) / tick_sz).floor() * tick_sz)
                                 } else {
                                     px
                                 };
@@ -1237,6 +1250,7 @@ async fn quote_loop(
             d.taker_fees_window = win_taker_fees;
             d.dir_wins = dir_wins;
             d.dir_total = dir_total;
+            d.merged_window = win_merged;
             d.deployed = win_deployed;
             d.window_start = m.window_ts;
             d.params = crate::dashboard::StrategyParams {

@@ -103,6 +103,10 @@ pub struct Config {
     pub sc_rescue_max_pair: f64,   // plafond de paire du SAUVETAGE taker à t=0 (fin de rampe). Défaut 1.23 (profil 0xb27b : complétions tardives confiantes)
     pub sc_rescue_ramp_s: f64,     // durée (s) de la rampe AFFINE du plafond : base→rescue_max sur les N dernières s. Défaut 120
     pub sc_dir_tilt: f64,          // BIAS DIRECTIONNEL léger : parts nettes du GAGNANT tolérées sans compléter quand drift+OFI confirment (petit pari sur Tokyo). 0 = désactivé (mesure seule). Défaut 6
+    // Buffer anti-cross ADAPTATIF au σ sur les OUVERTURES (les complétions/FAK gardent le droit de croiser) : bid = ask − (1 + extra)·tick, extra = clamp(⌊(σ−lo)/span⌋, 0, max).
+    pub sc_cross_max_extra: f64,   // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
+    pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
+    pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
 
     // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
     pub sc_sleep_hours_utc: Vec<u32>,
@@ -243,6 +247,9 @@ impl Config {
             sc_rescue_max_pair: env_or("SC_RESCUE_MAX_PAIR", 1.23),
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
+            sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),
+            sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
+            sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),
 
             sc_sleep_hours_utc: std::env::var("SC_SLEEP_HOURS_UTC")
                 .unwrap_or_else(|_| "22,23,0,1,2,3,8".into())

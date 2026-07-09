@@ -63,6 +63,8 @@ pub struct DashboardState {
     #[serde(default)]
     pub taker_fees_window: f64, // taxe taker payée cette fenêtre (7% × p(1−p) × taille par fill taker) — cible : 0
     #[serde(default)]
+    pub merged_window: f64, // paires mergées dans la fenêtre COURANTE ($ recouvré ≈ paires)
+    #[serde(default)]
     pub dir_wins: u32, // fenêtres où la conviction directionnelle FORTE de Tokyo a visé juste
     #[serde(default)]
     pub dir_total: u32, // fenêtres avec conviction forte (précision = wins/total ; l'edge Tokyo se juge ici)

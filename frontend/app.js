@@ -4,7 +4,7 @@ const f = (n, d = 2) => (n == null || isNaN(n)) ? '–' : Number(n).toFixed(d);
 const money = (n) => (n >= 0 ? '+' : '') + f(n, 2) + '$';
 const cents = (n) => (n == null || isNaN(n) || n === 0) ? '–' : f(n * 100, 1) + '¢';
 const symlog = (v) => Math.sign(v) * Math.log10(1 + Math.abs(v));
-const CH = { pxmon: 400, cum: 200 };
+const CH = { pxmon: 400 };
 // Réécrit un innerHTML seulement s'il change : supprime le "rafraîchissement"
 // visible toutes les 2 s (le DOM n'était pas sale, on le réécrivait quand même).
 function setHtml(id, html) { const el = $(id); if (el.__last !== html) { el.__last = html; el.innerHTML = html; } }
@@ -88,31 +88,6 @@ function drawPxMonitor(s) {
   }
 }
 
-function drawCum(ws) {
-  // cumul trading vs trading+rebate
-  const [x, w2, h2] = ctx('cum');
-  if (ws.length) {
-    let a = 0, b = 0;
-    const t1 = ws.map((q) => a += (q.pnl || 0));
-    const t2 = ws.map((q, i) => b += (q.pnl || 0) + (q.rebate || 0));
-    const all = t1.concat(t2);
-    const mn = Math.min(...all, 0), mx = Math.max(...all, 1);
-    const X = (i) => 40 + (i / Math.max(ws.length - 1, 1)) * (w2 - 48);
-    const Y = (v) => h2 - 14 - ((v - mn) / (mx - mn || 1)) * (h2 - 22);
-    x.font = '10px ui-monospace,monospace';
-    x.strokeStyle = '#555'; x.setLineDash([3, 3]);
-    x.beginPath(); x.moveTo(40, Y(0)); x.lineTo(w2 - 6, Y(0)); x.stroke(); x.setLineDash([]);
-    x.fillStyle = '#8a919c'; x.fillText(f(mx, 0), 2, Y(mx) + 8); x.fillText(f(mn, 0), 2, Y(mn) - 2);
-    const line = (arr, color) => {
-      x.strokeStyle = color; x.lineWidth = 2; x.beginPath();
-      arr.forEach((v, i) => { i ? x.lineTo(X(i), Y(v)) : x.moveTo(X(i), Y(v)); });
-      x.stroke();
-    };
-    line(t1, '#e0a24a');
-    line(t2, '#a78bfa');
-  }
-}
-
 async function tick() {
   const s = await j('/state');
   if (!s) return;
@@ -181,7 +156,8 @@ async function tick() {
   setIs('ilat', lat ? lat + ' ms' : '–', lat > 2000 ? 'neg' : lat > 500 ? 'warn' : 'pos');
   setIs('iord', (s.open_orders != null ? s.open_orders : '–') + '/2', s.open_orders === 2 ? 'pos' : s.open_orders === 0 ? 'mut' : '');
   setIs('ifil', s.fills || 0);
-  setIs('imrg', s.merges || 0, 'pos');
+  // merges de la FENÊTRE courante (paires ≈ $ recouvré), pas le cumul de toujours
+  setIs('imrg', f(s.merged_window || 0, 0), (s.merged_window || 0) > 0 ? 'pos' : 'mut');
   setIs('iud', `${f(s.up_bal, 0)} / ${f(s.down_bal, 0)}`);
   setIs('iimb', (imbNow > 0 ? '+' : '') + f(imbNow, 0), Math.abs(imbNow) > 12 ? 'neg' : '');
   setIs('ipc', cents(s.pair_cost));
@@ -239,7 +215,7 @@ async function tick() {
         `<td>${f(w.merged, 0)}</td><td class="pos">${f(w.rebate, 2)}</td><td class="${cls}">${money(w.pnl)}</td></tr>`;
     }).join('') || '<tr><td class="empty">en attente…</td></tr>');
 
-  drawPxMonitor(s); drawCum(ws);
+  drawPxMonitor(s);
 }
 
 async function tickEvents() {
