@@ -378,12 +378,6 @@ impl LiveCtx {
         }
     }
 
-    pub async fn cancel(&self, order_id: &str) {
-        if self.armed {
-            let _ = orders::cancel_order(&self.creds, order_id).await;
-        }
-    }
-
     /// TROU CRITIQUE corrigé (7 juil. : −21$ invisibles) : avant d'annuler un
     /// ordre (reprice/retrait/rollover), on RÉCOLTE son size_matched — tout
     /// fill partiel survenu pendant sa vie est comptabilisé, plus jamais perdu.
