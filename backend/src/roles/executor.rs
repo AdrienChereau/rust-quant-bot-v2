@@ -914,15 +914,19 @@ async fn quote_loop(
                     (true, ask_up, ask_up_sz)
                 };
                 let avg_excess_ins = sc.avg(if is_up { Side::Down } else { Side::Up });
-                // PLAFOND DE PAIRE DU SAUVETAGE — RAMPE TEMPORELLE (9 juil.).
+                // PLAFOND DE PAIRE DU SAUVETAGE — RAMPE AFFINE dans le temps.
                 // Payer `a` pour la jambe gagnante est +EV ssi P(gagne) > a. Or
                 // près de la résolution, le prix du marché EST P → on peut payer
                 // cher en confiance ; loin, une tendance n'est pas une certitude →
-                // on reste prudent. Donc le plafond monte de `sc_completion_max_pair`
-                // (loin, ~1.02) vers `sc_rescue_max_pair` (tout près, ~1.23),
-                // linéaire sur les 120 dernières secondes. C'est le profil de la
-                // cible 0xb27b : ses complétions à 1.23 sont TARDIVES et confiantes.
-                let ramp = ((120 - remaining_l).max(0) as f64 / 120.0).clamp(0.0, 1.0);
+                // on reste prudent. Interpolation LINÉAIRE CONTINUE (recalculée à
+                // la seconde) du plafond, de `sc_completion_max_pair` (à t ≥
+                // `sc_rescue_ramp_s`) vers `sc_rescue_max_pair` (à t = 0) :
+                //   ramp(t) = clamp((RAMP_S − t) / RAMP_S, 0, 1)
+                //   cap(t)  = base + ramp(t) · (rescue_max − base)
+                // Ex. RAMP_S=120 : t=91 s → 1.071, t=90 → 1.073, sans palier.
+                // Profil 0xb27b : complétions à 1.23 TARDIVES et confiantes.
+                let ramp_s = cfg.sc_rescue_ramp_s.max(1.0);
+                let ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
                 let rescue_pair = cfg.sc_completion_max_pair
                     + ramp * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;

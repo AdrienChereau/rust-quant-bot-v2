@@ -100,7 +100,8 @@ pub struct Config {
     // vaut ~1e-5 pour un trend BTC de 60 $/min ; le bruit de l'EMA ~8e-6. Donc :
     pub sc_urgency_drift: f64,     // ≥ ce drift/s → PULL de l'ouverture menacée + complétion maker agressive (ask−tick). Défaut 2e-5 (~74 $/min, ~2,4σ au-dessus du bruit)
     pub sc_taker_drift: f64,       // ≥ ce drift/s → complétion TAKER immédiate (paie le marché pour ne pas mourir nu). Défaut 2.5e-5 (~93 $/min, juste au-dessus du seuil de pull)
-    pub sc_rescue_max_pair: f64,   // plafond de paire du SAUVETAGE taker en fin de fenêtre (rampe 1.02→ce plafond sur les 120 dernières s). Défaut 1.23 (profil 0xb27b : complétions tardives confiantes)
+    pub sc_rescue_max_pair: f64,   // plafond de paire du SAUVETAGE taker à t=0 (fin de rampe). Défaut 1.23 (profil 0xb27b : complétions tardives confiantes)
+    pub sc_rescue_ramp_s: f64,     // durée (s) de la rampe AFFINE du plafond : base→rescue_max sur les N dernières s. Défaut 120
 
     // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
     pub sc_sleep_hours_utc: Vec<u32>,
@@ -239,6 +240,7 @@ impl Config {
             sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00002),
             sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.000025),
             sc_rescue_max_pair: env_or("SC_RESCUE_MAX_PAIR", 1.23),
+            sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
 
             sc_sleep_hours_utc: std::env::var("SC_SLEEP_HOURS_UTC")
                 .unwrap_or_else(|_| "22,23,0,1,2,3,8".into())
