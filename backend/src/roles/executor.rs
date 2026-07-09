@@ -635,8 +635,11 @@ async fn quote_loop(
                     let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room)) / tick_sz)
                         .floor() * tick_sz;
                     if capped > b.price + 1e-9 {
+                        // Distinguer les deux déclencheurs : le drift=+0.0000 des
+                        // logs du 8 juil. venait de la fin de fenêtre, PAS de Tokyo.
+                        let cause = if endgame { "fin de fenêtre" } else { "drift Tokyo" };
                         tracing::info!(side = ?b.side, from = b.price, to = capped,
-                            drift = format!("{drift_ps:+.4}"), "complétion URGENTE (Tokyo)");
+                            drift = format!("{drift_ps:+.4}"), cause, "complétion agressive (maker)");
                         b.price = capped;
                     }
                 }
