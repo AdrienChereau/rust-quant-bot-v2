@@ -204,6 +204,7 @@ async fn quote_loop(
         completion_max_price: cfg.sc_completion_max_price,
         completion_max_pair: cfg.sc_completion_max_pair,
         opening_stop_s: cfg.sc_opening_stop_s,
+        open_max_price: cfg.sc_open_max_price,
     });
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash, cfg.max_position, cfg.min_merge_threshold, cfg.safety_mult,

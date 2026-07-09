@@ -50,6 +50,10 @@ pub struct SpreadCaptureConfig {
     /// Plus d'ouvertures sous N s restantes (0xb27b coupe ~t=240 s) ;
     /// complétions et assurance continuent jusqu'au bout.
     pub opening_stop_s: i64,
+    /// Prix MAX d'une jambe d'OUVERTURE : au-delà, le marché est déjà tranché de
+    /// ce côté → on croiserait le spread (taker) pour une marge nulle. On n'ouvre
+    /// pas (atomique : les deux jambes ou aucune). N'affecte PAS les complétions.
+    pub open_max_price: f64,
 }
 
 /// Durée d'une fenêtre (marchés 5 min uniquement).
@@ -477,6 +481,14 @@ impl SpreadCaptureEngine {
             if price < 0.01 {
                 continue;
             }
+            if !completion && price > c.open_max_price + 1e-9 {
+                // Marché déjà TRANCHÉ de ce côté (jambe chère) : on croiserait le
+                // spread (taker) pour une paire à marge nulle — aucun intérêt pour
+                // un market maker (8 juil. 23:33 : ouverture Down 6@80¢ taker dans
+                // un marché à 82/18, puis 18 Up nus). Atomique : l'autre ouverture
+                // (bon marché) tombera via la règle « les deux ou aucune ».
+                continue;
+            }
             let mut size = size;
             if !completion {
                 size = size.min(c.max_clip_usdc / price.max(0.01));
@@ -573,6 +585,7 @@ mod tests {
             completion_max_price: 0.35,
             completion_max_pair: 0.99,
             opening_stop_s: 0, // tests : pas de coupure d'ouverture par défaut
+            open_max_price: 0.75,
         }
     }
 
@@ -825,6 +838,19 @@ mod tests {
         let pair_target = e.cfg.completion_max_pair.min(0.999);
         let complement = pair_target - 0.60;
         assert!(q[0].price <= complement + 1e-9, "paie ≤ complément: {} vs {}", q[0].price, complement);
+    }
+
+    #[test]
+    fn symmetric_no_opening_in_decided_market() {
+        let mut e = eng();
+        e.cfg.open_max_price = 0.75;
+        // marché tranché ~82/18 : bb_up 0.17, bb_dn 0.81 → jambe Down ~0.82 > 0.75
+        // → AUCUNE ouverture (atomique), pas de cross taker.
+        let q = e.desired_bids_symmetric(0.17, 0.81, 200, 100, 0.01, 1.0);
+        assert!(q.is_empty(), "marché décidé → aucune ouverture: {q:?}");
+        // marché équilibré 55/45 : les deux ouvertures passent.
+        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0);
+        assert_eq!(q2.iter().filter(|b| !b.completion).count(), 2, "{q2:?}");
     }
 
     #[test]
