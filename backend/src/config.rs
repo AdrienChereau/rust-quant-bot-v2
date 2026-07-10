@@ -107,6 +107,7 @@ pub struct Config {
     pub sc_cross_max_extra: f64,   // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
     pub sc_ladder_levels: u32,     // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
+    pub sc_dust_tol: f64,          // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
     pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
     pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
 
@@ -252,6 +253,7 @@ impl Config {
             sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),
             sc_ladder_levels: env_or("SC_LADDER_LEVELS", 2.0) as u32,
             sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 2.0),
+            sc_dust_tol: env_or("SC_DUST_TOL", 1.0),
             sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
             sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),
 

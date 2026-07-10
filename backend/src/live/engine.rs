@@ -366,7 +366,14 @@ impl LiveCtx {
             }
             Ok(PlaceResult::PostOnlyRejected) | Ok(PlaceResult::DryRun) => None,
             Err(e) => {
-                tracing::warn!(error = %e, is_up, price, size, "place_bid refusé");
+                let msg = e.to_string();
+                if msg.contains("post-only") || msg.contains("POST_ONLY") {
+                    // Le CLOB renvoie le rejet post-only en HTTP 400 (pas dans le
+                    // corps 200) : comportement VOULU, pas une erreur.
+                    tracing::info!(is_up, price, "post-only rejeté (aurait croisé) — repose au tick suivant");
+                } else {
+                    tracing::warn!(error = %msg, is_up, price, size, "place_bid refusé");
+                }
                 None
             }
         }

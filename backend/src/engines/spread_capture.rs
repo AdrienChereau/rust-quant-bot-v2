@@ -50,6 +50,11 @@ pub struct SpreadCaptureConfig {
     /// Plus d'ouvertures sous N s restantes (0xb27b coupe ~t=240 s) ;
     /// complétions et assurance continuent jusqu'au bout.
     pub opening_stop_s: i64,
+    /// TOLÉRANCE POUSSIÈRE : un résidu ≤ ce seuil (parts) ne déclenche PAS de
+    /// complétion (sous les minimums PM de toute façon) et ne BLOQUE PAS les
+    /// ouvertures (10 juil. 01:35 : un lot impair de 5,992221 a laissé 0,99 Up
+    /// résiduel → bot paralysé 4 min). Le FLATTEN de fin de fenêtre le liquide.
+    pub dust_tol: f64,
     /// Prix MAX d'une jambe d'OUVERTURE : au-delà, le marché est déjà tranché de
     /// ce côté → on croiserait le spread (taker) pour une marge nulle. On n'ouvre
     /// pas (atomique : les deux jambes ou aucune). N'affecte PAS les complétions.
@@ -440,8 +445,8 @@ impl SpreadCaptureEngine {
                 Side::Up => (self.shares_up, self.shares_dn, best_bid_up, best_bid_dn),
                 Side::Down => (self.shares_dn, self.shares_up, best_bid_dn, best_bid_up),
             };
-            if bb <= 0.0 || my > other + 1e-9 {
-                continue; // côté excédentaire : on attend d'être apparié
+            if bb <= 0.0 || my > other + c.dust_tol {
+                continue; // côté excédentaire (au-delà de la poussière) : on attend d'être apparié
             }
             let last = match side {
                 Side::Up => self.last_clip_up,
@@ -451,7 +456,7 @@ impl SpreadCaptureEngine {
                 continue;
             }
             let deficit = other - my;
-            let (price_cap, size, completion) = if deficit > 1e-9 {
+            let (price_cap, size, completion) = if deficit > c.dust_tol {
                 // COMPLÉTION : on se pose au prix COMPLÉMENTAIRE de ce qu'a
                 // coûté la jambe excédentaire (paire ≤ pair_target) et on
                 // laisse l'oscillation venir se faire fill. Chasser le touch
@@ -592,6 +597,7 @@ mod tests {
             completion_max_pair: 0.99,
             opening_stop_s: 0, // tests : pas de coupure d'ouverture par défaut
             open_max_price: 0.75,
+            dust_tol: 1.0,
         }
     }
 
@@ -906,6 +912,22 @@ mod tests {
         // marché équilibré 55/45 : les deux ouvertures passent.
         let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0);
         assert_eq!(q2.iter().filter(|b| !b.completion).count(), 2, "{q2:?}");
+    }
+
+    #[test]
+    fn dust_residual_does_not_paralyze_openings() {
+        let mut e = eng();
+        // Lot impair (10 juil. : fill 5,992221 → résidu 0,99 Up après merges).
+        e.on_fill(Side::Up, 0.55, 0.99, 0);
+        let q = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0);
+        // Les DEUX ouvertures reprennent (pas de complétion 0,99 impossible,
+        // pas de blocage) — le flatten de fin de fenêtre nettoiera le résidu.
+        assert_eq!(q.iter().filter(|b| !b.completion).count(), 2, "{q:?}");
+        assert!(q.iter().all(|b| !b.completion));
+        // Au-delà de la poussière (déficit 6) : la complétion reprend la main.
+        e.on_fill(Side::Up, 0.55, 6.0, 1);
+        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 200, 0.01, 1.0);
+        assert!(q2.iter().any(|b| b.completion && b.side == Side::Down), "{q2:?}");
     }
 
     #[test]
