@@ -310,7 +310,7 @@ async fn quote_loop(
                             // Récolter les fills des ordres encore restants AVANT de
                             // les annuler — ils appartiennent à la fenêtre qui se clôt.
                             for slot in std::mem::take(&mut lrest) {
-                                if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                                if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
                                     let side = if f.is_up { Side::Up } else { Side::Down };
                                     paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
                                     sc.on_fill(side, f.price, f.size, now_s_roll);
@@ -490,7 +490,7 @@ async fn quote_loop(
                     // perdu (famille des incidents des 7-8 juil.). La récolte lit
                     // size_matched d'abord ; en échec, l'ordre part en AUDIT.
                     for slot in std::mem::take(&mut lrest) {
-                        if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                        if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
                             let side = if f.is_up { Side::Up } else { Side::Down };
                             paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
                             sc.on_fill(side, f.price, f.size, chrono::Utc::now().timestamp());
@@ -741,7 +741,7 @@ async fn quote_loop(
             if sleeping || !enabled {
                 if !lrest.is_empty() {
                     for slot in std::mem::take(&mut lrest) {
-                        if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                        if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
                             harvested.push(f);
                         }
                     }
@@ -886,8 +886,15 @@ async fn quote_loop(
                                     let mut old_was_filled = false;
                                     if let Some(i) = cur {
                                         let slot = lrest.remove(i);
-                                        if let Some(f) = lv.harvest_and_cancel(&slot.r, is_up).await {
+                                        let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
+                                        if let Some(f) = f {
                                             harvested.push(f);
+                                            old_was_filled = true;
+                                        }
+                                        // Cancel non confirmé = fill en vol probable
+                                        // (course 02:02 : les DEUX ordres exécutés).
+                                        // On ne pose PAS le remplacement ce tick.
+                                        if !safe {
                                             old_was_filled = true;
                                         }
                                     }
@@ -918,7 +925,7 @@ async fn quote_loop(
                             }
                             (None, Some(i)) => {
                                 let slot = lrest.remove(i);
-                                if let Some(f) = lv.harvest_and_cancel(&slot.r, is_up).await {
+                                if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, is_up).await {
                                     harvested.push(f);
                                 }
                             }
@@ -1172,7 +1179,14 @@ async fn quote_loop(
                     );
                     paper.state.up_balance = ru;
                     paper.state.down_balance = rd;
-                    // le moteur suit aussi (imbalance/complétion sur la vérité)
+                    // le moteur suit aussi (imbalance/complétion sur la vérité) —
+                    // et les COÛTS sont mis à l'échelle : ajuster les parts sans
+                    // les coûts gonfle l'avg (10 juil. 02:01 : 18→12 Down sans
+                    // scaling → blended fantôme 1.248 → escalade gelée à tort).
+                    let scale_u = if sc.shares_up > 1e-9 { ru / sc.shares_up } else { 0.0 };
+                    let scale_d = if sc.shares_dn > 1e-9 { rd / sc.shares_dn } else { 0.0 };
+                    sc.cost_up = (sc.cost_up * scale_u.min(1.0)).max(0.0);
+                    sc.cost_dn = (sc.cost_dn * scale_d.min(1.0)).max(0.0);
                     sc.shares_up = ru;
                     sc.shares_dn = rd;
                 }

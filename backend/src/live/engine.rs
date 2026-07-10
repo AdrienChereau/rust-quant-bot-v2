@@ -456,13 +456,25 @@ impl LiveCtx {
     /// TROU CRITIQUE corrigé (7 juil. : −21$ invisibles) : avant d'annuler un
     /// ordre (reprice/retrait/rollover), on RÉCOLTE son size_matched — tout
     /// fill partiel survenu pendant sa vie est comptabilisé, plus jamais perdu.
-    pub async fn harvest_and_cancel(&mut self, r: &RestingOrder, is_up: bool) -> Option<LiveFill> {
+    /// Renvoie (fill récolté éventuel, `safe_to_replace`). `safe_to_replace` =
+    /// false quand le cancel N'EST PAS confirmé et qu'aucun fill n'a été lu :
+    /// l'ordre a probablement été fillé PENDANT le vol du cancel (course du
+    /// 10 juil. 02:02 : complétion 0.41 remplacée par 0.35, les DEUX exécutées
+    /// → sur-complétion ×2). Dans ce cas : pas de remplacement ce tick, l'ordre
+    /// part en AUDIT et le poll tranchera.
+    pub async fn harvest_and_cancel(
+        &mut self,
+        r: &RestingOrder,
+        is_up: bool,
+    ) -> (Option<LiveFill>, bool) {
         let mut fill = None;
+        let mut read_ok = false;
         if self.armed {
             match super::auth::l2_request(
                 &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
             ).await {
                 Ok(text) => {
+                    read_ok = true;
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     let v = v.get("data").cloned().unwrap_or(v);
                     let matched: f64 = v.get("size_matched")
@@ -481,9 +493,21 @@ impl LiveCtx {
                     self.audit.push((r.clone(), is_up, 0));
                 }
             }
-            let _ = orders::cancel_order(&self.creds, &r.order_id).await;
+            let canceled = orders::cancel_order(&self.creds, &r.order_id)
+                .await
+                .unwrap_or(false);
+            if !canceled && fill.is_none() {
+                // Cancel non confirmé + rien lu : fill en vol probable. AUDIT
+                // (sauf si déjà audité par l'échec de lecture ci-dessus).
+                if read_ok {
+                    self.audit.push((r.clone(), is_up, 0));
+                }
+                tracing::info!(order_id = %r.order_id.chars().take(12).collect::<String>(),
+                    "cancel non confirmé — remplacement différé (fill en vol probable)");
+                return (fill, false);
+            }
         }
-        fill
+        (fill, true)
     }
 
     pub async fn cancel_all(&self) {
