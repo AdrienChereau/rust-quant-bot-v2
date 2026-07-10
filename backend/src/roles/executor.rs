@@ -1037,16 +1037,28 @@ async fn quote_loop(
                     }
                 }
             }
-            // ═══ FLATTEN DU RÉSIDU (t-9 → t-3) : ce que l'assurance n'a pas pu
-            // compléter (sous les minimums, ou plafond de paire atteint) est
-            // VENDU en FAK — l'exécution immédiate n'est pas soumise au plancher
-            // de 5 parts (prouvé le 9 juil. : vente manuelle de 0,99 part). On
-            // récupère la valeur résiduelle au lieu du pile-ou-face à la
-            // résolution. Sauf pari directionnel assumé (dir_tilt) : lui court.
+            // ═══ FLATTEN DU RÉSIDU — deux déclencheurs :
+            //  · POUSSIÈRE (n'importe quand) : un résidu ≤ dust_tol est
+            //    INCOMPLÉTABLE par définition (sous le minimum 5 parts) —
+            //    attendre n'apporte RIEN et expose au directionnel (10 juil. :
+            //    0,99 Up porté 4 min). Vendu IMMÉDIATEMENT, dès 5 s de calme
+            //    après le dernier fill (ne pas vendre au milieu d'un fill
+            //    partiel en cours, qui ressemble transitoirement à de la
+            //    poussière).
+            //  · FIN DE FENÊTRE (t-9 → t-3) : tout résidu que l'assurance n'a
+            //    pas pu compléter (plafond de paire, minimums).
+            // Vente FAK : l'exécution immédiate n'est pas soumise au plancher de
+            // 5 parts (prouvé les 9-10 juil.). Sauf pari directionnel (dir_tilt).
+            let imb_abs = sc.imbalance().abs();
+            let fill_quiet_ms = now_ms_books as i64 - last_fill_wall_ms;
+            let dust_case = imb_abs > 0.05
+                && imb_abs <= cfg.sc_dust_tol
+                && fill_quiet_ms >= 5_000
+                && remaining_l > 9;
+            let endgame_case = (3..=9).contains(&remaining_l) && imb_abs > 0.4;
             if enabled
                 && !hold_dir_bet
-                && (3..=9).contains(&remaining_l)
-                && sc.imbalance().abs() > 0.4
+                && (dust_case || endgame_case)
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
                 let excess_up = sc.imbalance() > 0.0;
@@ -1073,10 +1085,11 @@ async fn quote_loop(
                                 sc.cost_dn = (sc.cost_dn - avg_cost * sold).max(0.0);
                             }
                         }
+                        let cause = if dust_case { "poussière (incomplétable)" } else { "fin de fenêtre" };
                         tracing::info!(
                             side = side.as_str(), sold = format!("{sold:.2}"),
                             px = format!("{avg:.3}"), recupere = format!("{:.2}", avg * sold),
-                            fee = format!("{fee:.3}"), rem = remaining_l,
+                            fee = format!("{fee:.3}"), rem = remaining_l, cause,
                             "FLATTEN résidu — vendu au marché (au lieu de mourir nu)"
                         );
                     }
