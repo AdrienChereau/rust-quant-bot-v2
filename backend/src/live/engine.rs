@@ -103,6 +103,9 @@ pub struct LiveCtx {
     last_merge_attempt_ms: i64, // cooldown anti-spam (429 Cloudflare du 7 juil.)
     last_pos_sync_ms: i64,
     pub positions_dirty: bool, // merge/redeem incertain → resync des positions
+    /// RTT de la DERNIÈRE requête CLOB (ms) : POST d'ordre ou poll /data/orders.
+    /// C'est la latence réseau réelle Dublin → serveur Polymarket → Dublin.
+    pub last_rtt_ms: u64,
     /// Fills constatés à la RÉPONSE du POST (GTC marketable) : émis au prix
     /// moyen réellement exécuté, dès le tick courant (le journal doit montrer
     /// le prix PAYÉ, pas notre limite — écarts 45,0 vs 45,7 du 8 juil.).
@@ -165,6 +168,7 @@ impl LiveCtx {
             last_merge_attempt_ms: 0,
             last_pos_sync_ms: 0,
             positions_dirty: false,
+            last_rtt_ms: 0,
             post_fills: Vec::new(),
             sell_ids: std::collections::HashSet::new(),
             audit: Vec::new(),
@@ -347,7 +351,8 @@ impl LiveCtx {
         let token = if is_up { &self.up_token } else { &self.dn_token };
         let args = OrderArgs { price, size, is_sell: false, gtc: true, post_only };
         match orders::place_order(self.armed, &self.creds, token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+                self.last_rtt_ms = post_ms;
                 self.order_side.insert(order_id.clone(), (is_up, true));
                 // Enregistre l'ordre au grand livre (counted=0), puis crédite le
                 // fill immédiat éventuel (GTC marketable) au prix RÉEL — taker.
@@ -412,7 +417,8 @@ impl LiveCtx {
         }
         let args = OrderArgs { price: px, size: sz, is_sell: true, gtc: false, post_only: false };
         match orders::place_order(self.armed, &self.creds, &token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+                self.last_rtt_ms = post_ms;
                 self.sell_ids.insert(order_id);
                 let sold = filled_size.unwrap_or(0.0);
                 if sold > 1e-9 {
@@ -438,7 +444,8 @@ impl LiveCtx {
         let token = if is_up { &self.up_token } else { &self.dn_token };
         let args = OrderArgs { price, size, is_sell: false, gtc: false, post_only: false };
         match orders::place_order(self.armed, &self.creds, token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+                self.last_rtt_ms = post_ms;
                 self.order_side.insert(order_id.clone(), (is_up, false));
                 let matched = filled_size.unwrap_or(0.0);
                 let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
@@ -650,8 +657,12 @@ impl LiveCtx {
         }
         audit.retain(|(_, _, t)| *t != u32::MAX);
         self.audit = audit;
+        let t0 = std::time::Instant::now();
         let open = match orders::open_orders(&self.creds, &self.condition_id).await {
-            Ok(o) => o,
+            Ok(o) => {
+                self.last_rtt_ms = t0.elapsed().as_millis() as u64;
+                o
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "poll /data/orders échoué");
                 return out;

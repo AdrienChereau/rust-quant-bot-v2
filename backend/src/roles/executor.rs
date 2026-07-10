@@ -1201,6 +1201,7 @@ async fn quote_loop(
                 let mut d = dash.write().await;
                 d.live_collateral = lv.cash;
                 d.live_wallet_pnl = lv.cash - lv.baseline;
+                d.order_rtt_ms = lv.last_rtt_ms;
             }
             // Miroir des bids pour le dashboard.
             // Affichage : le MEILLEUR bid (niveau le plus haut) par côté + le

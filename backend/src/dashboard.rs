@@ -55,7 +55,9 @@ pub struct DashboardState {
     #[serde(default)]
     pub signal_age_ms: i64, // latence : âge du dernier signal Tokyo (fraîcheur des données)
     #[serde(default)]
-    pub open_orders: u32,   // nombre de bids restants au carnet (0/1/2)
+    pub open_orders: u32,   // nombre de bids restants au carnet (échelle : 0-4)
+    #[serde(default)]
+    pub order_rtt_ms: u64,  // RTT réel de la dernière requête CLOB (POST d'ordre ou poll) — Dublin ↔ serveur Polymarket
     // Spread-capture v5
     pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
     #[serde(default)]

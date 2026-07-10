@@ -154,6 +154,10 @@ async function tick() {
   const setIs = (id, txt, cls) => { const e = $(id); if (!e) return; e.textContent = txt; e.className = 'isv' + (cls ? ' ' + cls : ''); };
   const lat = s.signal_age_ms || 0;
   setIs('ilat', lat ? lat + ' ms' : '–', lat > 2000 ? 'neg' : lat > 500 ? 'warn' : 'pos');
+  // RTT réel de la dernière requête CLOB (POST d'ordre ou poll 3 s) :
+  // l'aller-retour Dublin ↔ serveur Polymarket. <120 ms sain, >500 ms suspect.
+  const rtt = s.order_rtt_ms || 0;
+  setIs('irtt', rtt ? rtt + ' ms' : '–', rtt > 500 ? 'neg' : rtt > 120 ? 'warn' : 'pos');
   setIs('iord', (s.open_orders != null ? s.open_orders : '–') + '/2', s.open_orders === 2 ? 'pos' : s.open_orders === 0 ? 'mut' : '');
   setIs('ifil', s.fills || 0);
   // merges de la FENÊTRE courante (paires ≈ $ recouvré), pas le cumul de toujours
