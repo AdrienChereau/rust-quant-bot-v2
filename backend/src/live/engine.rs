@@ -39,6 +39,16 @@ pub struct LiveFill {
     pub maker: bool,
 }
 
+/// Un slot de l'ÉCHELLE de quoting : un ordre restant + son adresse
+/// (côté, niveau). Niveau 0 = bb+tick (ou complétion), niveau 1 = un cran
+/// plus bas — un vrai MM échelonne sa présence au carnet.
+#[derive(Debug, Clone)]
+pub struct LiveSlot {
+    pub r: RestingOrder,
+    pub is_up: bool,
+    pub level: u8,
+}
+
 /// Un de NOS ordres restants.
 #[derive(Debug, Clone)]
 pub struct RestingOrder {
@@ -525,11 +535,7 @@ impl LiveCtx {
     /// statut (MATCHED/MINED/CONFIRMED) et ils portent des montants PAR TRADE —
     /// les compter quadruplait l'inventaire (23:33 le 8 juil.). Le poll et le
     /// POST couvrent tout fill qu'un event `order` raterait, avec le même absolu.
-    pub fn drain_ws(
-        &mut self,
-        rest_up: &mut Option<RestingOrder>,
-        rest_dn: &mut Option<RestingOrder>,
-    ) -> Vec<LiveFill> {
+    pub fn drain_ws(&mut self, rest: &mut Vec<LiveSlot>) -> Vec<LiveFill> {
         let mut out = std::mem::take(&mut self.post_fills);
         while let Ok(u) = self.fill_rx.try_recv() {
             if u.size_matched <= 0.0 {
@@ -560,17 +566,13 @@ impl LiveCtx {
                 out.push(f);
             }
         }
-        // Slots : matched recopié du grand livre + libération si complet.
-        for rest in [rest_up, rest_dn] {
-            if let Some(r) = rest.as_mut() {
-                if let Some(e) = self.ledger.get(&r.order_id) {
-                    r.matched = e.counted;
-                }
-            }
-            if rest.as_ref().is_some_and(|r| r.matched >= r.size - 1e-6) {
-                *rest = None;
+        // Slots : matched recopié du grand livre + libération des complets.
+        for s in rest.iter_mut() {
+            if let Some(e) = self.ledger.get(&s.r.order_id) {
+                s.r.matched = e.counted;
             }
         }
+        rest.retain(|s| s.r.matched < s.r.size - 1e-6);
         out
     }
 
@@ -578,12 +580,7 @@ impl LiveCtx {
     /// `size_matched` ABSOLU de chaque ordre → on le passe à `credit` : il émet
     /// le delta manqué par le WS, ou rien s'il est déjà compté. Même absolu, même
     /// choke-point que le temps réel → jamais de double comptage entre les voies.
-    pub async fn reconcile(
-        &mut self,
-        rest_up: &mut Option<RestingOrder>,
-        rest_dn: &mut Option<RestingOrder>,
-        now_ms: i64,
-    ) -> Vec<LiveFill> {
+    pub async fn reconcile(&mut self, rest: &mut Vec<LiveSlot>, now_ms: i64) -> Vec<LiveFill> {
         let mut out = Vec::new();
         if !self.armed || self.condition_id.is_empty() || now_ms - self.last_poll_ms < 3_000 {
             return out;
@@ -630,34 +627,39 @@ impl LiveCtx {
             }
         };
         let mut tracked_ids: Vec<String> = self.audit.iter().map(|(o, _, _)| o.order_id.clone()).collect();
-        tracked_ids.extend(rest_up.iter().map(|r| r.order_id.clone()));
-        tracked_ids.extend(rest_dn.iter().map(|r| r.order_id.clone()));
+        tracked_ids.extend(rest.iter().map(|s| s.r.order_id.clone()));
         let mut new_audit: Vec<(RestingOrder, bool, u32)> = Vec::new();
-        for (rest, is_up) in [(rest_up, true), (rest_dn, false)] {
-            let Some(r) = rest.as_mut() else { continue };
-            match open.iter().find(|o| o.id == r.order_id) {
+        let mut i = 0;
+        while i < rest.len() {
+            let (order_id, size, price, matched0, placed_ms, is_up) = {
+                let s = &rest[i];
+                (s.r.order_id.clone(), s.r.size, s.r.price, s.r.matched, s.r.placed_ms, s.is_up)
+            };
+            match open.iter().find(|o| o.id == order_id) {
                 Some(o) => {
                     if let Some(f) = Self::credit(
-                        &mut self.ledger, &r.order_id, is_up, r.size, o.matched(), r.price, true,
+                        &mut self.ledger, &order_id, is_up, size, o.matched(), price, true,
                     ) {
-                        tracing::info!(order_id = %r.order_id, delta = f.size, "fill rattrapé par le poll");
+                        tracing::info!(order_id = %order_id, delta = f.size, "fill rattrapé par le poll");
                         out.push(f);
                     }
-                    if let Some(e) = self.ledger.get(&r.order_id) {
-                        r.matched = e.counted;
+                    if let Some(e) = self.ledger.get(&order_id) {
+                        rest[i].r.matched = e.counted;
                     }
+                    i += 1;
                 }
                 None => {
                     // LAG D'INDEXATION (8 juil. 18:16) : un ordre posté il y a
                     // <10 s peut ne pas encore apparaître dans /data/orders —
                     // le slot libéré à tort = ordre DOUBLE posé par-dessus.
-                    if now_ms - r.placed_ms < 10_000 {
+                    if now_ms - placed_ms < 10_000 {
+                        i += 1;
                         continue;
                     }
                     // Absent du carnet = fillé en entier ou annulé : on lit son
                     // size_matched final et on crédite le reliquat éventuel.
                     match super::auth::l2_request(
-                        &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
+                        &self.creds, "GET", &format!("/data/order/{}", order_id), None, "",
                     ).await {
                         Ok(text) => {
                             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -666,19 +668,22 @@ impl LiveCtx {
                                 .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
                                 .unwrap_or(0.0);
                             if let Some(f) = Self::credit(
-                                &mut self.ledger, &r.order_id, is_up, r.size, matched, r.price, true,
+                                &mut self.ledger, &order_id, is_up, size, matched, price, true,
                             ) {
-                                tracing::info!(order_id = %r.order_id, delta = f.size, "fill final rattrapé (ordre clos)");
+                                tracing::info!(order_id = %order_id, delta = f.size, "fill final rattrapé (ordre clos)");
                                 out.push(f);
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, order_id = %r.order_id,
+                            tracing::warn!(error = %e, order_id = %order_id,
                                 "GET /data/order échoué (ordre clos) → AUDIT");
-                            new_audit.push((r.clone(), is_up, 0));
+                            new_audit.push((RestingOrder {
+                                order_id: order_id.clone(), price, size,
+                                matched: matched0, placed_ms,
+                            }, is_up, 0));
                         }
                     }
-                    *rest = None; // l'ordre n'existe plus → re-quote au tick suivant
+                    rest.remove(i); // l'ordre n'existe plus → re-quote au tick suivant
                 }
             }
         }

@@ -119,10 +119,12 @@ impl PaperEngine {
     }
 
     /// Comptabilise un fill RÉEL déjà exécuté on-chain — SANS AUCUN REJET.
+    /// (Chemin live uniquement — le build paper ne l'appelle pas.)
     /// (Bug du 8 juil. : `try_buy` refusait silencieusement les fills réels
     /// quand le cash MIROIR était épuisé → dashboard à 18 Up quand la réalité
     /// en avait 36, moteur aveugle qui ré-ouvrait en boucle. Le miroir
     /// enregistre la réalité, il ne la valide pas.)
+    #[allow(dead_code)] // chemin live (cfg feature)
     pub fn apply_live_fill(&mut self, side: &str, price: f64, size: f64, liquidity_type: &str) {
         if size <= 0.0 {
             return;

@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::connectors::binance;
 use crate::connectors::pm_ws;
 #[cfg(feature = "live")]
-use crate::live::engine::{LiveCtx, RestingOrder};
+use crate::live::engine::{LiveCtx, LiveSlot};
 use crate::connectors::polymarket::{Market, PolyBook, PolymarketClient};
 use crate::dashboard::{Shared, SeriesPoint, WindowResult};
 use crate::engines::spread_capture::{Side, SpreadCaptureConfig, SpreadCaptureEngine};
@@ -146,14 +146,14 @@ async fn quote_loop(
     if !cfg.dry_run {
         anyhow::bail!("DRY_RUN=false requiert un build `--features live` (rustc ≥ 1.91)");
     }
+    // ÉCHELLE de quoting : jusqu'à N niveaux de prix par côté (LiveSlot = ordre
+    // + adresse côté/niveau). Le grand livre s'en fiche (comptage par order_id).
     #[cfg(feature = "live")]
-    let mut lrest_up: Option<RestingOrder> = None;
-    #[cfg(feature = "live")]
-    let mut lrest_dn: Option<RestingOrder> = None;
+    let mut lrest: Vec<LiveSlot> = Vec::new();
     #[cfg(feature = "live")]
     let mut last_insurance_ms: i64 = 0;
     #[cfg(feature = "live")]
-    let mut last_place_ms: [i64; 2] = [0, 0]; // anti-churn : ≥4 s entre replaces par côté
+    let mut last_place_ms: [[i64; 4]; 2] = [[0; 4]; 2]; // anti-churn par (côté, niveau)
     // Cooldown STRATÉGIQUE (spec volume/rebates) : après un merge à paire > 1$,
     // pas d'ESCALADE (urgence) pendant 45 s — mais ouvertures et complétions au
     // complément continuent : elles ABAISSENT le blended (moyenne à la baisse).
@@ -260,6 +260,8 @@ async fn quote_loop(
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
     let mut rest_up: Option<(f64, f64)> = None; // (prix, taille)
     let mut rest_dn: Option<(f64, f64)> = None;
+    #[allow(unused_assignments, unused_mut)]
+    let mut live_open_ct: Option<u32> = None; // live : nb réel d'ordres ouverts (échelle)
     let mut win_rebate = 0.0f64; // rebate estimé de la fenêtre
     let mut win_merged = 0.0f64; // $ récupérés par merges dans la fenêtre
     let mut win_deployed = 0.0f64; // $ TOTAL achetés (cumulatif — sc.deployed() devient net des merges)
@@ -306,14 +308,12 @@ async fn quote_loop(
                         if let Some(lv) = live.as_mut() {
                             // Récolter les fills des ordres encore restants AVANT de
                             // les annuler — ils appartiennent à la fenêtre qui se clôt.
-                            for (r, is_up) in [(lrest_up.take(), true), (lrest_dn.take(), false)] {
-                                if let Some(r) = r {
-                                    if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
-                                        let side = if f.is_up { Side::Up } else { Side::Down };
-                                        paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
-                                        sc.on_fill(side, f.price, f.size, now_s_roll);
-                                        lv.note_fill_cash(f.price, f.size);
-                                    }
+                            for slot in std::mem::take(&mut lrest) {
+                                if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                                    let side = if f.is_up { Side::Up } else { Side::Down };
+                                    paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
+                                    sc.on_fill(side, f.price, f.size, now_s_roll);
+                                    lv.note_fill_cash(f.price, f.size);
                                 }
                             }
                             // REDEEM on-chain des résidus (gagnants + poussière) de la
@@ -411,8 +411,7 @@ async fn quote_loop(
                     #[cfg(feature = "live")]
                     if let Some(lv) = live.as_mut() {
                         lv.on_new_market(&m.condition_id, &m.up_token_id, &m.down_token_id).await;
-                        lrest_up = None;
-                        lrest_dn = None;
+                        lrest.clear();
                     }
                     // Budget de fenêtre en % de bankroll (SC_BANKROLL_PCT>0) —
                     // recalculé à CHAQUE rollover ; le recyclage par merge du
@@ -489,14 +488,12 @@ async fn quote_loop(
                     // JAMAIS de cancel aveugle : un fill arrivé entre-temps serait
                     // perdu (famille des incidents des 7-8 juil.). La récolte lit
                     // size_matched d'abord ; en échec, l'ordre part en AUDIT.
-                    for (lrest, is_up) in [(&mut lrest_up, true), (&mut lrest_dn, false)] {
-                        if let Some(r) = lrest.take() {
-                            if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
-                                let side = if f.is_up { Side::Up } else { Side::Down };
-                                paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
-                                sc.on_fill(side, f.price, f.size, chrono::Utc::now().timestamp());
-                                lv.note_fill_cash(f.price, f.size);
-                            }
+                    for slot in std::mem::take(&mut lrest) {
+                        if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                            let side = if f.is_up { Side::Up } else { Side::Down };
+                            paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
+                            sc.on_fill(side, f.price, f.size, chrono::Utc::now().timestamp());
+                            lv.note_fill_cash(f.price, f.size);
                         }
                     }
                     lv.cancel_all().await;
@@ -736,17 +733,15 @@ async fn quote_loop(
             // AVANT toute décision de pose. Résultat : les slots lrest reflètent
             // la réalité Polymarket → on ne pose jamais atop un ordre en attente
             // qu'on n'aurait pas vu, ni ne reprice un ordre déjà fillé.
-            let mut fills = lv.drain_ws(&mut lrest_up, &mut lrest_dn);
-            fills.extend(lv.reconcile(&mut lrest_up, &mut lrest_dn, now_ms_books as i64).await);
+            let mut fills = lv.drain_ws(&mut lrest);
+            fills.extend(lv.reconcile(&mut lrest, now_ms_books as i64).await);
             // KILL/pause → tout annuler — mais JAMAIS sans récolter d'abord
             // (un cancel aveugle perd le fill arrivé entre-temps).
             if sleeping || !enabled {
-                if lrest_up.is_some() || lrest_dn.is_some() {
-                    for (lrest, is_up) in [(&mut lrest_up, true), (&mut lrest_dn, false)] {
-                        if let Some(r) = lrest.take() {
-                            if let Some(f) = lv.harvest_and_cancel(&r, is_up).await {
-                                harvested.push(f);
-                            }
+                if !lrest.is_empty() {
+                    for slot in std::mem::take(&mut lrest) {
+                        if let Some(f) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
+                            harvested.push(f);
                         }
                     }
                     lv.cancel_all().await;
@@ -808,10 +803,7 @@ async fn quote_loop(
                 if veto_openings {
                     tracing::info!("veto ouverture : carnet en mouvement (ask en baisse) — on repasse au tick suivant");
                 }
-                for (lrest, side, ask) in [
-                    (&mut lrest_up, Side::Up, ask_up),
-                    (&mut lrest_dn, Side::Down, ask_dn),
-                ] {
+                for (side, ask) in [(Side::Up, ask_up), (Side::Down, ask_dn)] {
                     let want = desired.iter().find(|b| b.side == side);
                     let is_comp = want.map(|b| b.completion).unwrap_or(false);
                     // ANTI-CROSS : on clampe sous l'ask (préserve le maker). Les
@@ -824,10 +816,8 @@ async fn quote_loop(
                     });
                     // Valeurs RAW Polymarket : taille ≥ min_order_size du marché,
                     // et jamais plus que le cash réel restant.
-                    // Tailles (8 juil. — fin des 95 orphelines) :
-                    //  · COMPLÉTION : jamais plus que le déficit. Si les minimums
-                    //    PM (5 parts / 1$) exigeraient de SUR-acheter → résidu
-                    //    accepté (perte bornée, spirale évitée).
+                    //  · COMPLÉTION : jamais plus que le déficit (sous les minimums
+                    //    → résidu accepté — désormais FLATTEN en fin de fenêtre).
                     //  · OUVERTURE : taille commune pré-calculée (ou rien).
                     let want_sz: Option<f64> = match (want, want_px) {
                         (Some(b), Some(px)) => {
@@ -853,66 +843,86 @@ async fn quote_loop(
                         }
                         _ => None,
                     };
-                    let side_ix = if side == Side::Up { 0 } else { 1 };
-                    match (want_sz, want_px, &*lrest) {
-                        (Some(sz), Some(px), cur) if px >= 0.01 && px * sz <= lv.cash => {
-                            // ANTI-CHURN (leçon du 7 juil. : replace toutes les 1-3 s =
-                            // chasse le prix + fills partiels éparpillés) : reprice
-                            // seulement si l'écart dépasse 2 ticks ET ≥4 s depuis le
-                            // dernier placement de ce côté.
-                            let reprice = match cur {
-                                Some(r) => {
-                                    (px - r.price).abs() > 2.0 * tick_sz + 1e-9
-                                        && now_ms_books as i64 - last_place_ms[side_ix] >= 4_000
+                    let is_up = side == Side::Up;
+                    let side_ix = if is_up { 0 } else { 1 };
+                    // ÉCHELLE : complétion = 1 niveau (taille = déficit exact) ;
+                    // ouverture = sc_ladder_levels niveaux espacés de
+                    // sc_ladder_step_ticks — présence continue au carnet, capte
+                    // les dips profonds à meilleur prix (profil vrai MM).
+                    let n_levels: u8 = if is_comp { 1 } else { cfg.sc_ladder_levels.clamp(1, 4) as u8 };
+                    for lvl in 0..4u8 {
+                        // cible de CE niveau (None = rien à poser → retrait)
+                        let target: Option<(f64, f64)> = match (want_sz, want_px) {
+                            (Some(sz), Some(px0)) if lvl < n_levels => {
+                                let px = ((px0 - lvl as f64 * cfg.sc_ladder_step_ticks * tick_sz)
+                                    / tick_sz)
+                                    .floor()
+                                    * tick_sz;
+                                let min_req = min_shares.max((1.0_f64 / px.max(0.01)).ceil());
+                                if px >= 0.01 && sz + 1e-9 >= min_req && px * sz <= lv.cash {
+                                    Some((px, sz))
+                                } else {
+                                    None
                                 }
-                                None => now_ms_books as i64 - last_place_ms[side_ix] >= 4_000,
-                            };
-                            if reprice {
-                                let mut old_was_filled = false;
-                                if let Some(r) = lrest.take() {
-                                    if let Some(f) = lv.harvest_and_cancel(&r, side == Side::Up).await {
-                                        harvested.push(f);
-                                        old_was_filled = true;
+                            }
+                            _ => None,
+                        };
+                        let slot_pos = lrest.iter().position(|s| s.is_up == is_up && s.level == lvl);
+                        match (target, slot_pos) {
+                            (Some((px, sz)), cur) => {
+                                // ANTI-CHURN (7 juil.) : reprice seulement si l'écart
+                                // dépasse 2 ticks ET ≥4 s depuis le dernier placement
+                                // de ce (côté, niveau).
+                                let cooled =
+                                    now_ms_books as i64 - last_place_ms[side_ix][lvl as usize] >= 4_000;
+                                let reprice = match cur {
+                                    Some(i) => {
+                                        (px - lrest[i].r.price).abs() > 2.0 * tick_sz + 1e-9 && cooled
+                                    }
+                                    None => cooled,
+                                };
+                                if reprice {
+                                    let mut old_was_filled = false;
+                                    if let Some(i) = cur {
+                                        let slot = lrest.remove(i);
+                                        if let Some(f) = lv.harvest_and_cancel(&slot.r, is_up).await {
+                                            harvested.push(f);
+                                            old_was_filled = true;
+                                        }
+                                    }
+                                    if old_was_filled {
+                                        // L'ordre à repricer était DÉJÀ fillé :
+                                        // l'inventaire vient de changer — rien posé
+                                        // ce tick (19:25 le 8 juil. : achat DOUBLE).
+                                        continue;
+                                    }
+                                    // RE-CLAMP au dernier moment : ask le plus frais
+                                    // juste avant le POST.
+                                    let tok = if is_up { &m.up_token_id } else { &m.down_token_id };
+                                    let fa = fresh_ask(tok, ask);
+                                    let px = if fa > buf {
+                                        px.min(((fa - buf) / tick_sz).floor() * tick_sz)
+                                    } else {
+                                        px
+                                    };
+                                    if px >= 0.01 {
+                                        // OUVERTURES en POST-ONLY : croiser = rejet
+                                        // propre du CLOB (zéro taxe accidentelle).
+                                        if let Some(r) = lv.place_bid(is_up, px, sz, !is_comp).await {
+                                            lrest.push(LiveSlot { r, is_up, level: lvl });
+                                        }
+                                        last_place_ms[side_ix][lvl as usize] = now_ms_books as i64;
                                     }
                                 }
-                                if old_was_filled {
-                                    // L'ordre qu'on voulait repricer était DÉJÀ
-                                    // fillé : l'inventaire vient de changer — on
-                                    // ne pose RIEN ce tick (19:25 le 8 juil. :
-                                    // remplacer un ordre déjà rempli = achat en
-                                    // DOUBLE, 12 Up au lieu de 6 + taxe taker).
-                                    // Le tick suivant re-décide sur l'état à jour.
-                                    continue;
-                                }
-                                // RE-CLAMP au dernier moment : l'ask le plus
-                                // frais juste avant le POST (les awaits ci-dessus
-                                // ont pu durer des centaines de ms). Un GTC qui
-                                // croise = taxe taker + rebate perdu.
-                                let tok = if side == Side::Up { &m.up_token_id } else { &m.down_token_id };
-                                let fa = fresh_ask(tok, ask);
-                                let px = if fa > buf {
-                                    px.min(((fa - buf) / tick_sz).floor() * tick_sz)
-                                } else {
-                                    px
-                                };
-                                if px >= 0.01 {
-                                    // OUVERTURES en POST-ONLY : croiser = rejet du
-                                    // CLOB (zéro taxe taker accidentelle, natif) —
-                                    // on repose au tick suivant. Les COMPLÉTIONS
-                                    // gardent le droit de croiser (assurance).
-                                    *lrest = lv.place_bid(side == Side::Up, px, sz, !is_comp).await;
-                                    last_place_ms[side_ix] = now_ms_books as i64;
+                            }
+                            (None, Some(i)) => {
+                                let slot = lrest.remove(i);
+                                if let Some(f) = lv.harvest_and_cancel(&slot.r, is_up).await {
+                                    harvested.push(f);
                                 }
                             }
+                            (None, None) => {}
                         }
-                        (None, _, Some(r)) => {
-                            let r2 = r.clone();
-                            if let Some(f) = lv.harvest_and_cancel(&r2, side == Side::Up).await {
-                                harvested.push(f);
-                            }
-                            *lrest = None;
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -1165,8 +1175,15 @@ async fn quote_loop(
                 d.live_wallet_pnl = lv.cash - lv.baseline;
             }
             // Miroir des bids pour le dashboard.
-            rest_up = lrest_up.as_ref().map(|r| (r.price, r.size));
-            rest_dn = lrest_dn.as_ref().map(|r| (r.price, r.size));
+            // Affichage : le MEILLEUR bid (niveau le plus haut) par côté + le
+            // compte réel d'ordres ouverts (échelle comprise).
+            rest_up = lrest.iter().filter(|s| s.is_up)
+                .max_by(|a, b| a.r.price.total_cmp(&b.r.price))
+                .map(|s| (s.r.price, s.r.size));
+            rest_dn = lrest.iter().filter(|s| !s.is_up)
+                .max_by(|a, b| a.r.price.total_cmp(&b.r.price))
+                .map(|s| (s.r.price, s.r.size));
+            live_open_ct = Some(lrest.len() as u32);
         }
 
         let live_mode = !cfg.dry_run;
@@ -1286,7 +1303,8 @@ async fn quote_loop(
             d.down_ask = ask_dn;
             d.in_band = rest_up.is_some() || rest_dn.is_some();
             d.signal_age_ms = sig_age_ms;
-            d.open_orders = rest_up.is_some() as u32 + rest_dn.is_some() as u32;
+            d.open_orders = live_open_ct
+                .unwrap_or(rest_up.is_some() as u32 + rest_dn.is_some() as u32);
             if d.last_block_reason.starts_with("SIGNAL TOKYO") {
                 d.last_block_reason.clear();
             }

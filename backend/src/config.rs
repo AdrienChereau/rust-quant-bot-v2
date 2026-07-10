@@ -105,6 +105,8 @@ pub struct Config {
     pub sc_dir_tilt: f64,          // BIAS DIRECTIONNEL léger : parts nettes du GAGNANT tolérées sans compléter quand drift+OFI confirment (petit pari sur Tokyo). 0 = désactivé (mesure seule). Défaut 6
     // Buffer anti-cross ADAPTATIF au σ sur les OUVERTURES (les complétions/FAK gardent le droit de croiser) : bid = ask − (1 + extra)·tick, extra = clamp(⌊(σ−lo)/span⌋, 0, max).
     pub sc_cross_max_extra: f64,   // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
+    pub sc_ladder_levels: u32,     // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
+    pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
     pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
 
@@ -248,6 +250,8 @@ impl Config {
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
             sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),
+            sc_ladder_levels: env_or("SC_LADDER_LEVELS", 2.0) as u32,
+            sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 2.0),
             sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
             sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),
 
