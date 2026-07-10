@@ -508,7 +508,13 @@ impl SpreadCaptureEngine {
                 let capital_room = c.max_capital_per_market - self.deployed();
                 size = size.min((capital_room / price).max(0.0));
             }
-            size = (size * size_factor).floor();
+            size *= size_factor;
+            // Granularité : OUVERTURES en parts entières (échelle propre) ;
+            // COMPLÉTIONS à 2 décimales (LOT_SIZE_SCALE Polymarket) — un déficit
+            // FRACTIONNAIRE (fill impair 5,995453 le 10 juil.) doit être apparié
+            // en entier : l'arrondir à l'entier (5 au lieu de 5,99) fabriquait
+            // ~1 part de poussière achetée ~56¢ et bradée ~35¢ à chaque lot impair.
+            size = if completion { (size * 100.0).floor() / 100.0 } else { size.floor() };
             if size < 1.0 {
                 continue;
             }
@@ -912,6 +918,18 @@ mod tests {
         // marché équilibré 55/45 : les deux ouvertures passent.
         let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0);
         assert_eq!(q2.iter().filter(|b| !b.completion).count(), 2, "{q2:?}");
+    }
+
+    #[test]
+    fn fractional_deficit_completed_to_2_decimals() {
+        let mut e = eng();
+        e.cfg.completion_max_price = 0.99;
+        // Fill impair (10 juil. : 5,995453/6) → déficit fractionnaire.
+        e.on_fill(Side::Up, 0.56, 5.995453, 0);
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0);
+        let comp = q.iter().find(|b| b.completion && b.side == Side::Down).expect("complétion");
+        // 5,99 (2 décimales), PAS 5 (entier) — sinon 0,99 de poussière garantie.
+        assert!((comp.size - 5.99).abs() < 1e-9, "complète le déficit entier: {}", comp.size);
     }
 
     #[test]
