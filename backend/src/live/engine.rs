@@ -97,6 +97,9 @@ pub struct LiveCtx {
     /// moyen réellement exécuté, dès le tick courant (le journal doit montrer
     /// le prix PAYÉ, pas notre limite — écarts 45,0 vs 45,7 du 8 juil.).
     post_fills: Vec<LiveFill>,
+    /// Ordres de VENTE (flatten FAK) : leurs events WS ne doivent JAMAIS être
+    /// crédités comme des achats par le grand livre.
+    sell_ids: std::collections::HashSet<String>,
     /// Ordres retirés SANS lecture réussie de leur size_matched (GET /data/order
     /// en échec au moment du cancel). Un fill ne doit JAMAIS être perdu : le poll
     /// réinterroge ces ordres jusqu'à obtenir la vérité (incident du 8 juil. :
@@ -153,6 +156,7 @@ impl LiveCtx {
             last_pos_sync_ms: 0,
             positions_dirty: false,
             post_fills: Vec::new(),
+            sell_ids: std::collections::HashSet::new(),
             audit: Vec::new(),
         })
     }
@@ -169,6 +173,7 @@ impl LiveCtx {
         self.dn_token = dn_token.to_string();
         self.order_side.clear();
         self.ledger.clear(); // nouveau marché = nouveaux order_ids
+        self.sell_ids.clear();
         let _ = self.cond_tx.send(Some(condition_id.to_string()));
         // Métadonnées RAW du nouveau marché (tick exact par token).
         if let Err(e) = orders::preload_token_meta(&[up_token, dn_token]).await {
@@ -327,9 +332,10 @@ impl LiveCtx {
         is_up: bool,
         price: f64,
         size: f64,
+        post_only: bool,
     ) -> Option<RestingOrder> {
         let token = if is_up { &self.up_token } else { &self.dn_token };
-        let args = OrderArgs { price, size, is_sell: false, gtc: true };
+        let args = OrderArgs { price, size, is_sell: false, gtc: true, post_only };
         match orders::place_order(self.armed, &self.creds, token, args).await {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
                 self.order_side.insert(order_id.clone(), (is_up, true));
@@ -348,9 +354,61 @@ impl LiveCtx {
                 let counted = self.ledger.get(&order_id).map(|e| e.counted).unwrap_or(matched);
                 Some(RestingOrder { order_id, price, size, matched: counted, placed_ms: chrono::Utc::now().timestamp_millis() })
             }
-            Ok(PlaceResult::DryRun) => None,
+            Ok(PlaceResult::PostOnlyRejected) | Ok(PlaceResult::DryRun) => None,
             Err(e) => {
                 tracing::warn!(error = %e, is_up, price, size, "place_bid refusé");
+                None
+            }
+        }
+    }
+
+    /// FLATTEN d'un résidu : VENTE FAK immédiate (exécution marché — la preuve
+    /// du 9 juil. : une vente de 0,99 part passe, le plancher 5 parts ne
+    /// s'applique qu'aux ordres RESTANTS). Récupère la valeur résiduelle au
+    /// lieu du pile-ou-face à la résolution. Renvoie (parts vendues, prix moyen).
+    pub async fn flatten_sell(
+        &mut self,
+        is_up: bool,
+        size: f64,
+        bid: f64,
+        tick: f64,
+    ) -> Option<(f64, f64)> {
+        if !self.armed || bid <= 0.0 {
+            return None;
+        }
+        let token = if is_up { self.up_token.clone() } else { self.dn_token.clone() };
+        // Taille TRONQUÉE vers le bas (jamais vendre plus qu'on détient — leçon
+        // mémoire : round_dp arrondirait 4.9958 → 5.00 → rejet balance).
+        let sz = (size * 100.0).floor() / 100.0;
+        if sz <= 0.0 {
+            return None;
+        }
+        // Marketable : limite 2 ticks SOUS le bid pour balayer, plancher 1¢.
+        let px = ((bid - 2.0 * tick).max(0.01) / tick).floor() * tick;
+        // Prérequis sig_type 3 : rafraîchir l'allowance CONDITIONAL avant un SELL
+        // (sinon rejet « balance 0 » — note mémoire).
+        if let Err(e) =
+            super::auth::sync_balance_allowance(&self.creds, "CONDITIONAL", Some(&token)).await
+        {
+            tracing::warn!(error = %e, "allowance CONDITIONAL avant SELL échouée — flatten sauté ce tick");
+            return None;
+        }
+        let args = OrderArgs { price: px, size: sz, is_sell: true, gtc: false, post_only: false };
+        match orders::place_order(self.armed, &self.creds, &token, args).await {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
+                self.sell_ids.insert(order_id);
+                let sold = filled_size.unwrap_or(0.0);
+                if sold > 1e-9 {
+                    let avg = avg_price.filter(|p| *p > 0.0).unwrap_or(px);
+                    self.cash += avg * sold; // produit de la vente → wallet
+                    Some((sold, avg))
+                } else {
+                    None
+                }
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "flatten SELL refusé");
                 None
             }
         }
@@ -361,7 +419,7 @@ impl LiveCtx {
     /// sans dépendre du WS (un FAK invisible relançait l'assurance en boucle).
     pub async fn place_insurance_fak(&mut self, is_up: bool, price: f64, size: f64) {
         let token = if is_up { &self.up_token } else { &self.dn_token };
-        let args = OrderArgs { price, size, is_sell: false, gtc: false };
+        let args = OrderArgs { price, size, is_sell: false, gtc: false, post_only: false };
         match orders::place_order(self.armed, &self.creds, token, args).await {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price, .. }) => {
                 self.order_side.insert(order_id.clone(), (is_up, false));
@@ -373,7 +431,7 @@ impl LiveCtx {
                     self.post_fills.push(f);
                 }
             }
-            Ok(PlaceResult::DryRun) => {}
+            Ok(_) => {} // DryRun ; PostOnlyRejected impossible (FAK, post_only=false)
             Err(e) => tracing::warn!(error = %e, "assurance FAK refusée"),
         }
     }
@@ -477,7 +535,18 @@ impl LiveCtx {
             if u.size_matched <= 0.0 {
                 continue;
             }
-            // Côté déduit de l'asset_id (robuste), secours order_side.
+            // ATTRIBUTION STRICTE : on ne crédite que les ACHATS QUE NOUS avons
+            // posés. Une VENTE (flatten) ou un ordre MANUEL de l'utilisateur sur
+            // le même compte serait sinon compté comme un achat du bot
+            // (inventaire fantôme — famille du 8 juil.).
+            if self.sell_ids.contains(&u.order_id) {
+                continue;
+            }
+            if !self.order_side.contains_key(&u.order_id) {
+                tracing::info!(order_id = %u.order_id.chars().take(12).collect::<String>(),
+                    "event order EXTERNE (manuel/vente ?) — ignoré par la compta bot");
+                continue;
+            }
             let is_up = if !u.asset_id.is_empty() {
                 u.asset_id == self.up_token
             } else {

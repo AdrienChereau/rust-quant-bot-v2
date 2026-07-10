@@ -896,7 +896,11 @@ async fn quote_loop(
                                     px
                                 };
                                 if px >= 0.01 {
-                                    *lrest = lv.place_bid(side == Side::Up, px, sz).await;
+                                    // OUVERTURES en POST-ONLY : croiser = rejet du
+                                    // CLOB (zéro taxe taker accidentelle, natif) —
+                                    // on repose au tick suivant. Les COMPLÉTIONS
+                                    // gardent le droit de croiser (assurance).
+                                    *lrest = lv.place_bid(side == Side::Up, px, sz, !is_comp).await;
                                     last_place_ms[side_ix] = now_ms_books as i64;
                                 }
                             }
@@ -1019,6 +1023,51 @@ async fn quote_loop(
                             "SAUVETAGE taker (paie le marché pour compléter la paire)"
                         );
                         lv.place_insurance_fak(is_up, ask, sz).await;
+                    }
+                }
+            }
+            // ═══ FLATTEN DU RÉSIDU (t-9 → t-3) : ce que l'assurance n'a pas pu
+            // compléter (sous les minimums, ou plafond de paire atteint) est
+            // VENDU en FAK — l'exécution immédiate n'est pas soumise au plancher
+            // de 5 parts (prouvé le 9 juil. : vente manuelle de 0,99 part). On
+            // récupère la valeur résiduelle au lieu du pile-ou-face à la
+            // résolution. Sauf pari directionnel assumé (dir_tilt) : lui court.
+            if enabled
+                && !hold_dir_bet
+                && (3..=9).contains(&remaining_l)
+                && sc.imbalance().abs() > 0.4
+                && now_ms_books as i64 - last_insurance_ms >= 3_000
+            {
+                let excess_up = sc.imbalance() > 0.0;
+                let side = if excess_up { Side::Up } else { Side::Down };
+                let held = if excess_up { paper.state.up_balance } else { paper.state.down_balance };
+                let sz = sc.imbalance().abs().min(held);
+                let bid = if excess_up { bb_up } else { bb_dn };
+                if sz > 0.0 && bid > 0.0 {
+                    last_insurance_ms = now_ms_books as i64;
+                    if let Some((sold, avg)) = lv.flatten_sell(excess_up, sz, bid, tick_sz).await {
+                        // Comptabilité : vente réelle → miroir + moteur + frais taker.
+                        let fee = 0.07 * avg * (1.0 - avg) * sold;
+                        lv.cash -= fee;
+                        win_taker_fees += fee;
+                        paper.try_sell(side.as_str(), avg, sold, "taker");
+                        let avg_cost = sc.avg(side);
+                        match side {
+                            Side::Up => {
+                                sc.shares_up = (sc.shares_up - sold).max(0.0);
+                                sc.cost_up = (sc.cost_up - avg_cost * sold).max(0.0);
+                            }
+                            Side::Down => {
+                                sc.shares_dn = (sc.shares_dn - sold).max(0.0);
+                                sc.cost_dn = (sc.cost_dn - avg_cost * sold).max(0.0);
+                            }
+                        }
+                        tracing::info!(
+                            side = side.as_str(), sold = format!("{sold:.2}"),
+                            px = format!("{avg:.3}"), recupere = format!("{:.2}", avg * sold),
+                            fee = format!("{fee:.3}"), rem = remaining_l,
+                            "FLATTEN résidu — vendu au marché (au lieu de mourir nu)"
+                        );
                     }
                 }
             }

@@ -25,12 +25,19 @@ pub struct OrderArgs {
     pub size: f64,     // parts (arrondi 2 décimales — LOT_SIZE_SCALE)
     pub is_sell: bool, // false = BUY
     pub gtc: bool,     // true = GTC (bid restant) · false = FAK (taker)
+    /// GTC uniquement : l'ordre qui CROISERAIT le spread est REJETÉ au lieu
+    /// d'exécuter en taker (zéro taxe accidentelle par construction). On le
+    /// repose au tick suivant au nouveau prix.
+    pub post_only: bool,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PlaceResult {
     /// Signé + loggé, rien envoyé (LIVE_ARMED=false).
     DryRun,
+    /// Post-only refusé par le CLOB : l'ordre aurait croisé le spread.
+    /// Comportement ATTENDU (pas une erreur) — on repose au tick suivant.
+    PostOnlyRejected,
     Placed {
         order_id: String,
         filled_size: Option<f64>, // rempli immédiatement (FAK, ou GTC marketable)
@@ -128,6 +135,7 @@ pub async fn place_order(
         .price(price)
         .size(size)
         .order_type(order_type)
+        .post_only(args.post_only)
         .build()
         .await
         .map_err(|e| anyhow::anyhow!("build order: {e}"))?;
@@ -144,6 +152,7 @@ pub async fn place_order(
         price = %price,  // le Decimal réellement envoyé (arrondi tick + normalisé)
         size = %size,
         is_sell = args.is_sell,
+        post_only = args.post_only,
         "ordre LIVE signé"
     );
     if !live_armed {
@@ -156,6 +165,16 @@ pub async fn place_order(
         .await
         .map_err(|e| anyhow::anyhow!("POST /order: {e}"))?;
     let post_ms = t0.elapsed().as_millis() as u64;
+    // Le CLOB peut répondre 200 avec success=false + errorMsg (on l'ignorait !).
+    if !resp.success || resp.error_msg.as_deref().is_some_and(|m| !m.is_empty()) {
+        let msg = resp.error_msg.unwrap_or_default();
+        if msg.contains("POST_ONLY") {
+            // Comportement VOULU du post-only : croiser = rejet, pas de taxe.
+            tracing::info!(post_ms, "post-only rejeté (aurait croisé le spread) — repose au tick suivant");
+            return Ok(PlaceResult::PostOnlyRejected);
+        }
+        anyhow::bail!("ordre refusé par le CLOB: {msg}");
+    }
     let to_f64 = |d: &Decimal| f64::from_str(&d.to_string()).ok();
     let making = to_f64(&resp.making_amount);
     let taking = to_f64(&resp.taking_amount);
