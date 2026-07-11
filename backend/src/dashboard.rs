@@ -58,6 +58,8 @@ pub struct DashboardState {
     pub open_orders: u32,   // nombre de bids restants au carnet (échelle : 0-4)
     #[serde(default)]
     pub order_rtt_ms: u64,  // RTT réel de la dernière requête CLOB (POST d'ordre ou poll) — Dublin ↔ serveur Polymarket
+    #[serde(default)]
+    pub skew_side: String,  // "" = symétrique · "up"/"down" = MM incliné côté fort (mode skew actif)
     // Spread-capture v5
     pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
     #[serde(default)]

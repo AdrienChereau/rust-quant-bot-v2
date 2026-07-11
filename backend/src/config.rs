@@ -108,6 +108,15 @@ pub struct Config {
     pub sc_ladder_levels: u32,     // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_dust_tol: f64,          // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
+    // ── MODE SKEW (MM incliné) : quand un signal désigne le gagnant probable,
+    //    on se blinde du côté fort et on retire le côté faible ; retournement =
+    //    SORTIE ÉCLAIR en FAK. Le symétrique reste le régime par défaut. ──
+    pub sc_skew: bool,             // interrupteur maître du mode skew (défaut true)
+    pub sc_skew_mult: f64,         // multiplicateur de taille du côté fort (défaut 2.0 → clips 6→12)
+    pub sc_trend_net_cap: f64,     // exposition nette MAX du pari (parts, défaut 12)
+    pub sc_pm_mom: f64,            // momentum du carnet PM (Δmid sur look_s) qui arme le skew — attrape les glissements lents invisibles pour Binance (défaut 0.06)
+    pub sc_pm_mom_look_s: i64,     // horizon du momentum PM (défaut 20 s)
+    pub sc_skew_complete_below: f64, // le perdant sous ce prix → complétion autorisée (verrouille la paire grasse) (défaut 0.20)
     pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
     pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
 
@@ -254,6 +263,12 @@ impl Config {
             sc_ladder_levels: env_or("SC_LADDER_LEVELS", 2.0) as u32,
             sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 2.0),
             sc_dust_tol: env_or("SC_DUST_TOL", 1.0),
+            sc_skew: env_or("SC_SKEW", true),
+            sc_skew_mult: env_or("SC_SKEW_MULT", 2.0),
+            sc_trend_net_cap: env_or("SC_TREND_NET_CAP", 12.0),
+            sc_pm_mom: env_or("SC_PM_MOM", 0.06),
+            sc_pm_mom_look_s: env_or("SC_PM_MOM_LOOK_S", 20.0) as i64,
+            sc_skew_complete_below: env_or("SC_SKEW_COMPLETE_BELOW", 0.20),
             sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
             sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),
 

@@ -250,6 +250,14 @@ async fn quote_loop(
     let radar_obi = RadarEngine::new(cfg.obi_depth_levels, cfg.obi_threshold, cfg.velocity_threshold);
     let mut last_realized = paper.state.realized_pnl; // pour le delta par fenêtre
 
+    // MODE SKEW : momentum du carnet PM (ring 30 s), côté parié, cooldown
+    // post-retournement (anti-whipsaw), dernier état loggé.
+    let mut pm_hist: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::new();
+    #[allow(unused_mut)] // muté par la sortie éclair (chemin live uniquement)
+    let mut skew_cool_until: i64 = 0;
+    #[allow(unused_assignments, unused_mut, unused_variables)]
+    let mut bet_side: Option<Side> = None; // inventaire skew détenu (sortie éclair si retournement)
+    let mut last_skew_logged: Option<Side> = None;
     // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
     // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
     // au gagnant réel. dir_wins/dir_total = notre précision directionnelle live —
@@ -657,36 +665,84 @@ async fn quote_loop(
             desired.retain(|b| b.completion || b.side != d);
         }
 
-        // ═══ BIAS DIRECTIONNEL LÉGER + MESURE DE L'EDGE TOKYO ═══
-        // Conviction FORTE = le DRIFT (confirmation) ET l'OFI (anticipation)
-        // désignent le MÊME perdant → on connaît le gagnant présumé. On MÉMORISE
-        // cette conviction (compteur de précision, sans risque) et, si
-        // SC_DIR_TILT>0, on TOLÈRE de tenir jusqu'à ce nombre de parts nettes du
-        // GAGNANT sans les compléter : petit pari sur Tokyo (on ne FORCE pas
-        // l'achat — on laisse juste le surplus gagnant vivre au lieu de le
-        // neutraliser). Borné, abandonné dès que le signal faiblit/se retourne.
-        let dir_winner = match (
+        // ═══ MODE SKEW — MM incliné (validé utilisateur, test LIVE direct) ═══
+        // Le symétrique gagne quand la fenêtre CROISE ; elle perd gros quand la
+        // fenêtre meurt d'un côté sans croiser. Le skew détecte ce cas et se
+        // blinde du côté fort : plus de taille sur le gagnant probable, zéro
+        // ouverture côté faible, complétion PATIENTE (seulement quand le perdant
+        // est bradé → paire grasse), et SORTIE ÉCLAIR en FAK si retournement.
+        // Deux capteurs : Tokyo (drift+OFI alignés — les moves rapides) OU
+        // momentum du carnet PM (les glissements lents que Binance ne voit pas).
+        pm_hist.push_back((now_ms_books as i64, up_mid));
+        while pm_hist.front().is_some_and(|(t, _)| now_ms_books as i64 - t > 30_000) {
+            pm_hist.pop_front();
+        }
+        let look_ms = cfg.sc_pm_mom_look_s * 1000;
+        let pm_base = pm_hist
+            .iter()
+            .filter(|(t, _)| now_ms_books as i64 - t >= look_ms)
+            .next_back()
+            .map(|(_, p)| *p);
+        let pm_mom = pm_base.map(|b| up_mid - b).unwrap_or(0.0);
+        let pm_side = if pm_mom >= cfg.sc_pm_mom {
+            Some(Side::Up)
+        } else if pm_mom <= -cfg.sc_pm_mom {
+            Some(Side::Down)
+        } else {
+            None
+        };
+        let tokyo_winner = match (
             endangered_side(drift_ps, cfg.sc_taker_drift),
             endangered_side(ofi, cfg.sc_ofi_pull),
         ) {
             (Some(a), Some(b)) if a == b => Some(a.opposite()), // même perdant → gagnant
             _ => None,
         };
-        if let Some(w) = dir_winner {
-            dir_call = Some(w); // dernière conviction forte → mesurée à la résolution
+        if let Some(w) = tokyo_winner {
+            dir_call = Some(w); // compteur de précision (Tokyo seul, sémantique inchangée)
         }
-        // Tient-on un pari directionnel (surplus du gagnant ≤ tilt) ? Sert à NE
-        // PAS le compléter (ni maker ci-dessous, ni taker plus bas).
-        let hold_dir_bet = cfg.sc_dir_tilt > 0.0
-            && dir_winner.is_some_and(|w| {
-                let surplus = if w == Side::Up { sc.imbalance() } else { -sc.imbalance() };
-                surplus > 1e-9 && surplus <= cfg.sc_dir_tilt
-            });
+        let skew_winner: Option<Side> = if !cfg.sc_skew || paused || sleeping || now_s < skew_cool_until
+        {
+            None
+        } else {
+            tokyo_winner.or(pm_side)
+        };
+        if skew_winner != last_skew_logged {
+            if let Some(w) = skew_winner {
+                let px_w = if w == Side::Up { up_mid } else { down_mid };
+                tracing::info!(
+                    side = w.as_str(),
+                    source = if tokyo_winner.is_some() { "tokyo" } else { "pm-momentum" },
+                    px_gagnant = format!("{px_w:.2}"),
+                    pm_mom = format!("{pm_mom:+.3}"),
+                    drift = format!("{drift_ps:+.5}"),
+                    "SKEW armé — MM incliné côté fort"
+                );
+            } else if last_skew_logged.is_some() {
+                tracing::info!("SKEW désarmé — retour symétrique");
+            }
+            last_skew_logged = skew_winner;
+        }
+        // Pari en cours ? (surplus du gagnant ≤ net_cap) → on ne le complète pas
+        // TANT QUE le perdant n'est pas bradé (la complétion sous
+        // sc_skew_complete_below verrouille la paire grasse, sinon patience).
+        let net_cap = cfg.sc_trend_net_cap.max(cfg.sc_dir_tilt).max(1.0);
+        let hold_dir_bet = skew_winner.is_some_and(|w| {
+            let surplus = if w == Side::Up { sc.imbalance() } else { -sc.imbalance() };
+            surplus > 1e-9 && surplus <= net_cap + 1e-9
+        });
         if hold_dir_bet {
-            // compléter = acheter le PERDANT → on retire cette complétion pour
-            // laisser le pari courir jusqu'à la résolution.
-            let loser = dir_winner.unwrap().opposite();
-            desired.retain(|b| !(b.completion && b.side == loser));
+            let w = skew_winner.unwrap();
+            let loser = w.opposite();
+            let loser_bb = if loser == Side::Up { bb_up } else { bb_dn };
+            if loser_bb > cfg.sc_skew_complete_below {
+                desired.retain(|b| !(b.completion && b.side == loser));
+            }
+        }
+        // Côté faible : AUCUNE ouverture pendant le skew (le blindage est
+        // asymétrique par définition — c'est un pari assumé et borné).
+        if let Some(w) = skew_winner {
+            desired.retain(|b| b.completion || b.side == w);
         }
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
@@ -736,6 +792,63 @@ async fn quote_loop(
             // qu'on n'aurait pas vu, ni ne reprice un ordre déjà fillé.
             let mut fills = lv.drain_ws(&mut lrest);
             fills.extend(lv.reconcile(&mut lrest, now_ms_books as i64).await);
+            // ═══ SORTIE ÉCLAIR : le signal s'est RETOURNÉ contre l'inventaire
+            // skew → on vend TOUT DE SUITE en FAK (perdre un peu maintenant
+            // plutôt que beaucoup à la résolution), puis cooldown 60 s
+            // anti-whipsaw et retour au MM symétrique.
+            if let Some(held) = bet_side {
+                let surplus =
+                    if held == Side::Up { sc.imbalance() } else { -sc.imbalance() };
+                let flipped = skew_winner == Some(held.opposite())
+                    || (held == Side::Up && pm_mom <= -cfg.sc_pm_mom)
+                    || (held == Side::Down && pm_mom >= cfg.sc_pm_mom);
+                if surplus <= cfg.sc_dust_tol {
+                    bet_side = None; // pari soldé (mergé/flattené) — plus rien à surveiller
+                } else if flipped && enabled {
+                    let held_bal = if held == Side::Up {
+                        paper.state.up_balance
+                    } else {
+                        paper.state.down_balance
+                    };
+                    let bid = if held == Side::Up { bb_up } else { bb_dn };
+                    let sz = surplus.min(held_bal);
+                    if sz > 0.0 && bid > 0.0 {
+                        if let Some((sold, avg)) =
+                            lv.flatten_sell(held == Side::Up, sz, bid, tick_sz).await
+                        {
+                            let fee = 0.07 * avg * (1.0 - avg) * sold;
+                            lv.cash -= fee;
+                            win_taker_fees += fee;
+                            paper.try_sell(held.as_str(), avg, sold, "taker");
+                            let avg_cost = sc.avg(held);
+                            match held {
+                                Side::Up => {
+                                    sc.shares_up = (sc.shares_up - sold).max(0.0);
+                                    sc.cost_up = (sc.cost_up - avg_cost * sold).max(0.0);
+                                }
+                                Side::Down => {
+                                    sc.shares_dn = (sc.shares_dn - sold).max(0.0);
+                                    sc.cost_dn = (sc.cost_dn - avg_cost * sold).max(0.0);
+                                }
+                            }
+                            tracing::warn!(
+                                side = held.as_str(),
+                                sold = format!("{sold:.2}"),
+                                px = format!("{avg:.3}"),
+                                cout_moyen = format!("{avg_cost:.3}"),
+                                pm_mom = format!("{pm_mom:+.3}"),
+                                "SORTIE ÉCLAIR — retournement contre l'inventaire skew, vendu au marché"
+                            );
+                            skew_cool_until = now_s + 60;
+                            bet_side = None;
+                        }
+                    }
+                }
+            }
+            // le pari devient actif dès qu'un surplus skew existe
+            if bet_side.is_none() && hold_dir_bet {
+                bet_side = skew_winner;
+            }
             // KILL/pause → tout annuler — mais JAMAIS sans récolter d'abord
             // (un cancel aveugle perd le fill arrivé entre-temps).
             if sleeping || !enabled {
@@ -748,6 +861,7 @@ async fn quote_loop(
                     lv.cancel_all().await;
                 }
             } else {
+                let remaining_l_quote = m.time_remaining_sec();
                 // Ouvertures : tailles STRICTEMENT égales des deux côtés (le bump
                 // 1$ asymétrique a créé 95 orphelines le 7 juil.). Fenêtre de
                 // faisabilité : commune ≥ minimums des 2 côtés ET ≤ tailles engine ;
@@ -846,6 +960,35 @@ async fn quote_loop(
                     };
                     let is_up = side == Side::Up;
                     let side_ix = if is_up { 0 } else { 1 };
+                    // ═══ SKEW : quote d'ACCUMULATION du côté fort ═══
+                    // Indépendante de l'atomicité des ouvertures (le blindage est
+                    // asymétrique par définition). Taille = clip × mult, bornée
+                    // par le net_cap restant. Maker, post-only, échelle normale.
+                    let mut want_px = want_px;
+                    let mut want_sz = want_sz;
+                    let mut is_comp = is_comp;
+                    if skew_winner == Some(side) && !is_comp {
+                        let surplus = if is_up { sc.imbalance() } else { -sc.imbalance() };
+                        let cap_room = (net_cap - surplus).floor();
+                        let bb_side = if is_up { bb_up } else { bb_dn };
+                        if remaining_l_quote > cfg.sc_opening_stop_s
+                            && cap_room >= min_shares
+                            && bb_side > 0.0
+                            && bb_side <= cfg.sc_open_max_price
+                        {
+                            let cap = if ask > 0.0 { ask - open_buf } else { bb_side + tick_sz };
+                            let px = (((bb_side + tick_sz).min(cap)) / tick_sz).floor() * tick_sz;
+                            let sz = (cfg.sc_base_clip * cfg.sc_skew_mult).min(cap_room).floor();
+                            let min_req = min_shares.max((1.0_f64 / px.max(0.01)).ceil());
+                            if px >= 0.01 && sz >= min_req && px * sz <= lv.cash {
+                                want_px = Some(px);
+                                want_sz = Some(sz);
+                                is_comp = false;
+                            }
+                        } else {
+                            want_sz = None; // cap atteint / fin de fenêtre : plus d'accumulation
+                        }
+                    }
                     // ÉCHELLE : complétion = 1 niveau (taille = déficit exact) ;
                     // ouverture = sc_ladder_levels niveaux espacés de
                     // sc_ladder_step_ticks — présence continue au carnet, capte
@@ -1343,6 +1486,7 @@ async fn quote_loop(
             d.loss_streak = loss_streak;
             d.pair_cost = sc.pair_cost().unwrap_or(0.0);
             d.merge_pair_avg = if win_merge_n > 0 { win_merge_cost_sum / win_merge_n as f64 } else { 0.0 };
+            d.skew_side = skew_winner.map(|w| w.as_str().to_string()).unwrap_or_default();
             d.taker_fees_window = win_taker_fees;
             d.dir_wins = dir_wins;
             d.dir_total = dir_total;
