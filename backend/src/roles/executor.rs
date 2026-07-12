@@ -257,6 +257,11 @@ async fn quote_loop(
     let mut skew_cool_until: i64 = 0;
     #[allow(unused_assignments, unused_mut, unused_variables)]
     let mut bet_side: Option<Side> = None; // inventaire skew détenu (sortie éclair si retournement)
+    // Côté armé PERSISTANT (hystérésis) : armé au seuil plein, désarmé seulement
+    // quand le signal retombe sous la MOITIÉ du seuil (incident 12 juil. 16:51 :
+    // pm_mom oscillant pile à ±0.06 → arm/désarm toutes les 2-5 s → 2 sorties
+    // éclair dans la même fenêtre).
+    let mut skew_armed: Option<Side> = None;
     let mut last_skew_logged: Option<Side> = None;
     // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
     // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
@@ -402,6 +407,15 @@ async fn quote_loop(
                 Ok(Some(m)) => {
                     strike = binance::price_at_window_open(m.window_ts).await.ok();
                     sc.reset_window(); // état blended remis à zéro pour la nouvelle fenêtre
+                    // SKEW : état remis à zéro — l'historique PM de l'ANCIEN marché
+                    // comparé au mid du nouveau fabrique un momentum fantôme
+                    // (incident 12 juil. 16:50:01 : pm_mom=-0.49 au rollover →
+                    // 36 Down achetés sur du vide → sortie éclair -2,16 $).
+                    pm_hist.clear();
+                    skew_armed = None;
+                    bet_side = None;
+                    skew_cool_until = 0;
+                    last_skew_logged = None;
                     rest_up = None;
                     rest_dn = None;
                     win_rebate = 0.0;
@@ -701,12 +715,46 @@ async fn quote_loop(
         if let Some(w) = tokyo_winner {
             dir_call = Some(w); // compteur de précision (Tokyo seul, sémantique inchangée)
         }
-        let skew_winner: Option<Side> = if !cfg.sc_skew || paused || sleeping || now_s < skew_cool_until
-        {
-            None
-        } else {
-            tokyo_winner.or(pm_side)
+        // Armement avec HYSTÉRÉSIS : on arme au seuil plein, on ne désarme que
+        // quand le signal retombe sous la moitié du seuil (anti flip-flop), et
+        // tout désarmement impose un cooldown. À l'armement, gate de prix : un
+        // gagnant au-dessus de SC_OPEN_MAX_PRICE est injouable (accumulation
+        // veto de toute façon) → on n'arme pas à 0.91-0.95 pour rien.
+        skew_armed = match skew_armed {
+            Some(w) if cfg.sc_skew && !paused && !sleeping => {
+                let pm_keep = match w {
+                    Side::Up => pm_mom >= cfg.sc_pm_mom * 0.5,
+                    Side::Down => pm_mom <= -cfg.sc_pm_mom * 0.5,
+                };
+                let tokyo_keep = match (
+                    endangered_side(drift_ps, cfg.sc_taker_drift * 0.5),
+                    endangered_side(ofi, cfg.sc_ofi_pull * 0.5),
+                ) {
+                    (Some(a), Some(b)) if a == b => a.opposite() == w,
+                    _ => false,
+                };
+                if pm_keep || tokyo_keep {
+                    Some(w)
+                } else {
+                    // signal éteint → désarmement + cooldown (sans écraser un
+                    // cooldown plus long posé par la sortie éclair)
+                    skew_cool_until = skew_cool_until.max(now_s + 30);
+                    None
+                }
+            }
+            Some(_) => {
+                skew_cool_until = skew_cool_until.max(now_s + 30);
+                None
+            }
+            None if cfg.sc_skew && !paused && !sleeping && now_s >= skew_cool_until => {
+                tokyo_winner.or(pm_side).filter(|w| {
+                    let bb_w = if *w == Side::Up { bb_up } else { bb_dn };
+                    bb_w > 0.0 && bb_w <= cfg.sc_open_max_price
+                })
+            }
+            None => None,
         };
+        let skew_winner: Option<Side> = skew_armed;
         if skew_winner != last_skew_logged {
             if let Some(w) = skew_winner {
                 let px_w = if w == Side::Up { up_mid } else { down_mid };
@@ -967,9 +1015,19 @@ async fn quote_loop(
                     let mut want_px = want_px;
                     let mut want_sz = want_sz;
                     let mut is_comp = is_comp;
+                    let mut skew_acc = false;
                     if skew_winner == Some(side) && !is_comp {
                         let surplus = if is_up { sc.imbalance() } else { -sc.imbalance() };
-                        let cap_room = (net_cap - surplus).floor();
+                        // Le cap compte AUSSI ce qui est déjà posé au carnet côté
+                        // gagnant : sans ça, 2 niveaux × 12 + un repost = 36 parts
+                        // remplies en 3 s pour un cap de 12 (incident 12 juil.
+                        // 16:50:09, imb=-36).
+                        let resting_open: f64 = lrest
+                            .iter()
+                            .filter(|s| s.is_up == is_up)
+                            .map(|s| (s.r.size - s.r.matched).max(0.0))
+                            .sum();
+                        let cap_room = (net_cap - surplus - resting_open).floor();
                         let bb_side = if is_up { bb_up } else { bb_dn };
                         if remaining_l_quote > cfg.sc_opening_stop_s
                             && cap_room >= min_shares
@@ -984,6 +1042,7 @@ async fn quote_loop(
                                 want_px = Some(px);
                                 want_sz = Some(sz);
                                 is_comp = false;
+                                skew_acc = true;
                             }
                         } else {
                             want_sz = None; // cap atteint / fin de fenêtre : plus d'accumulation
@@ -993,7 +1052,13 @@ async fn quote_loop(
                     // ouverture = sc_ladder_levels niveaux espacés de
                     // sc_ladder_step_ticks — présence continue au carnet, capte
                     // les dips profonds à meilleur prix (profil vrai MM).
-                    let n_levels: u8 = if is_comp { 1 } else { cfg.sc_ladder_levels.clamp(1, 4) as u8 };
+                    // Accumulation skew = 1 SEUL niveau : chaque niveau supplémentaire
+                    // est une exposition nette additionnelle qui échappe au cap.
+                    let n_levels: u8 = if is_comp || skew_acc {
+                        1
+                    } else {
+                        cfg.sc_ladder_levels.clamp(1, 4) as u8
+                    };
                     for lvl in 0..4u8 {
                         // cible de CE niveau (None = rien à poser → retrait)
                         let target: Option<(f64, f64)> = match (want_sz, want_px) {
