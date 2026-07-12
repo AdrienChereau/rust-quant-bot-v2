@@ -1001,6 +1001,22 @@ async fn quote_loop(
                 if veto_openings {
                     tracing::info!("veto ouverture : carnet en mouvement (ask en baisse) — on repasse au tick suivant");
                 }
+                // ═══ GRAND LIVRE DE L'EXPOSITION (incident 12 juil. 17:18) ═══
+                // Compte par côté ce qui reste OUVERT au carnet. Deux règles au
+                // point de POST :
+                //  · une COMPLÉTION ne se pose que si PLUS RIEN d'autre ne reste
+                //    ouvert de son côté — son besoin = le déficit TOTAL, tout
+                //    résidu du même côté est un doublon en puissance (l'ouverture
+                //    Down 0.28 et la complétion 0.27 ont TOUTES DEUX été remplies
+                //    → 12 Down pour un besoin de 6, 6 orphelins morts à 0) ;
+                //  · un cancel non confirmé GÈLE son côté pour ce tick — l'ordre
+                //    est peut-être encore vivant, poster par-dessus = doublon.
+                let mut open_side: [f64; 2] = [0.0; 2];
+                for s in lrest.iter() {
+                    open_side[if s.is_up { 0 } else { 1 }] +=
+                        (s.r.size - s.r.matched).max(0.0);
+                }
+                let mut side_frozen: [bool; 2] = [false, false];
                 for (side, ask) in [(Side::Up, ask_up), (Side::Down, ask_dn)] {
                     let want = desired.iter().find(|b| b.side == side);
                     let is_comp = want.map(|b| b.completion).unwrap_or(false);
@@ -1137,7 +1153,11 @@ async fn quote_loop(
                                         // Cancel non confirmé = fill en vol probable
                                         // (course 02:02 : les DEUX ordres exécutés).
                                         // On ne pose PAS le remplacement ce tick.
-                                        if !safe {
+                                        if safe {
+                                            open_side[side_ix] -=
+                                                (slot.r.size - slot.r.matched).max(0.0);
+                                        } else {
+                                            side_frozen[side_ix] = true;
                                             old_was_filled = true;
                                         }
                                     }
@@ -1145,6 +1165,18 @@ async fn quote_loop(
                                         // L'ordre à repricer était DÉJÀ fillé :
                                         // l'inventaire vient de changer — rien posé
                                         // ce tick (19:25 le 8 juil. : achat DOUBLE).
+                                        continue;
+                                    }
+                                    // GARDE-FOU EXPOSITION : côté gelé → rien ce
+                                    // tick ; complétion → exclusivité totale (rien
+                                    // d'autre ne doit rester ouvert de ce côté).
+                                    if side_frozen[side_ix]
+                                        || (is_comp && open_side[side_ix] > 0.01)
+                                    {
+                                        tracing::warn!(side = ?side,
+                                            open = format!("{:.1}", open_side[side_ix]),
+                                            gele = side_frozen[side_ix],
+                                            "garde-fou exposition : POST refusé (résidu du même côté au carnet)");
                                         continue;
                                     }
                                     // RE-CLAMP au dernier moment : ask le plus frais
@@ -1160,6 +1192,7 @@ async fn quote_loop(
                                         // OUVERTURES en POST-ONLY : croiser = rejet
                                         // propre du CLOB (zéro taxe accidentelle).
                                         if let Some(r) = lv.place_bid(is_up, px, sz, !is_comp).await {
+                                            open_side[side_ix] += (r.size - r.matched).max(0.0);
                                             lrest.push(LiveSlot { r, is_up, level: lvl });
                                         }
                                         last_place_ms[side_ix][lvl as usize] = now_ms_books as i64;
@@ -1168,8 +1201,15 @@ async fn quote_loop(
                             }
                             (None, Some(i)) => {
                                 let slot = lrest.remove(i);
-                                if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, is_up).await {
+                                let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
+                                if let Some(f) = f {
                                     harvested.push(f);
+                                }
+                                if safe {
+                                    open_side[side_ix] -=
+                                        (slot.r.size - slot.r.matched).max(0.0);
+                                } else {
+                                    side_frozen[side_ix] = true;
                                 }
                             }
                             (None, None) => {}
@@ -1267,12 +1307,56 @@ async fn quote_loop(
                     + conf * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;
                 if ask > 0.0 && ask <= 0.99 && ask <= pair_room_ins + 1e-9 {
+                    // PURGE avant le FAK : tout ordre maker encore ouvert du même
+                    // côté (la complétion agressive, typiquement) doit être annulé
+                    // AVANT de payer le marché — sinon FAK + maker peuvent se
+                    // remplir tous les deux = sur-achat du même besoin. Un cancel
+                    // non confirmé (fill en vol) reporte le FAK au tick suivant.
+                    let mut purge_unsafe = false;
+                    let mut i = 0;
+                    while i < lrest.len() {
+                        if lrest[i].is_up == is_up {
+                            let slot = lrest.remove(i);
+                            let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
+                            if let Some(f) = f {
+                                // Fill récolté à la purge : la boucle de compta des
+                                // fills a DÉJÀ tourné ce tick → on comptabilise ici
+                                // (mêmes écritures), le déficit se recalcule dessous.
+                                last_fill_wall_ms = now_ms_books as i64;
+                                lv.note_fill_cash(f.price, f.size);
+                                let fside = if f.is_up { Side::Up } else { Side::Down };
+                                paper.apply_live_fill(fside.as_str(), f.price, f.size, "maker");
+                                sc.on_fill(fside, f.price, f.size, now_s);
+                                win_fills += 1;
+                                win_deployed += f.price * f.size;
+                                win_rebate +=
+                                    cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
+                                tracing::info!(
+                                    side = fside.as_str(),
+                                    px = format!("{:.3}", f.price),
+                                    size = format!("{:.1}", f.size),
+                                    imb = format!("{:.0}", sc.imbalance()),
+                                    "[LIVE] fill réel (purge pré-sauvetage)"
+                                );
+                            }
+                            if !safe {
+                                purge_unsafe = true;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
                     // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
                     // par les minimums relançait la spirale). Sous les minimums →
-                    // résidu accepté, perte bornée.
+                    // résidu accepté, perte bornée. Déficit RECALCULÉ après purge.
                     let sz = ((sc.imbalance().abs().min(ask_sz.max(1.0))) * 100.0).floor() / 100.0;
                     let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask).ceil());
-                    if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
+                    if purge_unsafe {
+                        tracing::warn!(
+                            side = if is_up { "up" } else { "down" },
+                            "sauvetage différé : cancel non confirmé du même côté (fill en vol probable)"
+                        );
+                    } else if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
                         let cause = if taker_drift_urgent && remaining_l > 20 { "drift fort" } else { "fin de fenêtre" };
                         let pair_now = ask + avg_excess_ins;
