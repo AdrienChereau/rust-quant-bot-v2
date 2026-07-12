@@ -171,6 +171,10 @@ async fn quote_loop(
     // du 8 juil. : 51,7¢ affiché = 50¢ exécuté + 0,105$ de frais sur 6 parts).
     let mut win_taker_fees = 0.0f64;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
+    // Throttle du log « complétion agressive » : la cible est recalculée à
+    // chaque boucle depuis le prix de base → sans mémoire, la même ligne
+    // partait CHAQUE seconde (12 juil. 17:19 : 20+ lignes identiques).
+    let mut last_aggr_px: [f64; 2] = [0.0; 2];
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
     let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
@@ -822,18 +826,37 @@ async fn quote_loop(
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
                 if ask > tick_sz {
-                    // Plafond DUR de paire (escalade) : avg jambe excédentaire + prix ≤ cap.
+                    // Plafond de paire RAMPÉ — même confiance que le sauvetage
+                    // taker (temps + signal). Incident 12 juil. 17:19 : plafond
+                    // fixe 1,02 → bid Up cloué à 0,74 pendant que l'ask filait à
+                    // 0,90+ ; à T−20 le taker était déjà hors plafond → 6 Down
+                    // morts au flatten. La fenêtre T−45→T−20 doit pouvoir suivre
+                    // l'ask (toujours maker, zéro frais) jusqu'au plafond rampé.
                     let avg_excess = sc.avg(match b.side { Side::Up => Side::Down, Side::Down => Side::Up });
-                    let pair_room = (cfg.sc_completion_max_pair - avg_excess).max(0.0);
+                    let ramp_s = cfg.sc_rescue_ramp_s.max(1.0);
+                    let time_ramp =
+                        ((ramp_s - m.time_remaining_sec() as f64) / ramp_s).clamp(0.0, 1.0);
+                    let taker_thr = cfg.sc_taker_drift.max(1e-9);
+                    let sig_ramp =
+                        ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
+                    let ramped_pair = cfg.sc_completion_max_pair
+                        + time_ramp.max(sig_ramp)
+                            * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
+                    let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
                     let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room)) / tick_sz)
                         .floor() * tick_sz;
                     if capped > b.price + 1e-9 {
                         // Distinguer les deux déclencheurs : le drift=+0.0000 des
                         // logs du 8 juil. venait de la fin de fenêtre, PAS de Tokyo.
-                        let cause = if endgame { "fin de fenêtre" } else { "drift Tokyo" };
-                        tracing::info!(side = ?b.side, from = b.price, to = capped,
-                            drift = format!("{drift_ps:+.4}"), cause, "complétion agressive (maker)");
+                        let side_ix = if b.side == Side::Up { 0 } else { 1 };
+                        if (capped - last_aggr_px[side_ix]).abs() > tick_sz / 2.0 {
+                            last_aggr_px[side_ix] = capped;
+                            let cause = if endgame { "fin de fenêtre" } else { "drift Tokyo" };
+                            tracing::info!(side = ?b.side, from = b.price, to = capped,
+                                cap_paire = format!("{ramped_pair:.3}"),
+                                drift = format!("{drift_ps:+.4}"), cause, "complétion agressive (maker)");
+                        }
                         b.price = capped;
                     }
                 }
