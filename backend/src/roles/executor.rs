@@ -692,10 +692,22 @@ async fn quote_loop(
             pm_hist.pop_front();
         }
         let look_ms = cfg.sc_pm_mom_look_s * 1000;
+        // Base du momentum : l'échantillon le plus récent d'âge ≥ look_s quand
+        // l'historique est plein ; SINON (début de fenêtre) le plus VIEUX
+        // échantillon du même marché dès qu'il a ≥ 5 s. Une fenêtre BTC 5min
+        // peut traverser 10→90¢ en 2-3 s : être aveugle 20 s raterait le move ;
+        // le seuil 0.06 sur 5 s est de facto PLUS strict par seconde, donc pas
+        // de sur-déclenchement au bruit d'ouverture. (pm_hist est vidé au
+        // rollover — jamais de comparaison inter-marchés.)
         let pm_base = pm_hist
             .iter()
             .filter(|(t, _)| now_ms_books as i64 - t >= look_ms)
             .next_back()
+            .or_else(|| {
+                pm_hist
+                    .front()
+                    .filter(|(t, _)| now_ms_books as i64 - t >= 5_000)
+            })
             .map(|(_, p)| *p);
         let pm_mom = pm_base.map(|b| up_mid - b).unwrap_or(0.0);
         let pm_side = if pm_mom >= cfg.sc_pm_mom {
