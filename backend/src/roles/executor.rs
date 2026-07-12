@@ -267,6 +267,7 @@ async fn quote_loop(
     // éclair dans la même fenêtre).
     let mut skew_armed: Option<Side> = None;
     let mut last_skew_logged: Option<Side> = None;
+    let mut last_pm_pull: Option<Side> = None; // pull demi-seuil (log de transition)
     // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
     // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
     // au gagnant réel. dir_wins/dir_total = notre précision directionnelle live —
@@ -808,6 +809,26 @@ async fn quote_loop(
         if let Some(w) = skew_winner {
             desired.retain(|b| b.completion || b.side == w);
         }
+        // PULL PM au DEMI-SEUIL (fenêtre 17:55, 12 juil.) : le skew respirait
+        // autour du seuil (armé +0.08 → désarmé → réarmé +0.16) et CHAQUE trou
+        // rouvrait les ouvertures des deux côtés — les 6 Down nus @0.36 sont
+        // partis dans un de ces trous. Gradation : carnet qui penche (≥ ½ seuil)
+        // → plus d'ouverture du côté mourant ; seuil plein → skew complet.
+        let pm_pull: Option<Side> = if pm_mom >= cfg.sc_pm_mom * 0.5 {
+            Some(Side::Down)
+        } else if pm_mom <= -cfg.sc_pm_mom * 0.5 {
+            Some(Side::Up)
+        } else {
+            None
+        };
+        if let Some(d) = pm_pull {
+            if last_pm_pull != Some(d) {
+                tracing::info!(cote_retire = d.as_str(), pm_mom = format!("{pm_mom:+.3}"),
+                    "PULL PM — le carnet penche : plus d'ouverture du côté mourant");
+            }
+            desired.retain(|b| b.completion || b.side != d);
+        }
+        last_pm_pull = pm_pull;
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
         #[cfg(feature = "live")]
@@ -819,9 +840,17 @@ async fn quote_loop(
         // compléter sans payer la taxe (profil 0xb27b : complétions maker).
         let endgame = (20..=45).contains(&m.time_remaining_sec());
         for b in desired.iter_mut() {
+            // URGENCE PM (fenêtre 17:55, 12 juil.) : le grind lent est INVISIBLE
+            // pour le drift Binance (0.0000 pendant que Up passait 0.69→0.90) —
+            // la complétion Up est restée clouée à 0.63 pendant 3 min. Le carnet
+            // PM, lui, le voit (pm_mom jusqu'à +0.16) : quand il penche (≥ demi-
+            // seuil) vers le côté qu'on doit acheter, la complétion CHASSE.
+            let pm_for = if b.side == Side::Up { pm_mom } else { -pm_mom };
+            let pm_urgent = pm_for >= cfg.sc_pm_mom * 0.5;
             if b.completion
                 && ((!urgency_blocked
-                    && crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift))
+                    && (crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
+                        || pm_urgent))
                     || endgame)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
@@ -839,8 +868,13 @@ async fn quote_loop(
                     let taker_thr = cfg.sc_taker_drift.max(1e-9);
                     let sig_ramp =
                         ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
+                    // Confiance PM : un momentum du carnet nettement au-dessus du
+                    // seuil = conviction du marché → payer l'assurance plus cher
+                    // est +EV (même logique que la rampe signal du sauvetage).
+                    let pm_ramp =
+                        ((pm_for - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
                     let ramped_pair = cfg.sc_completion_max_pair
-                        + time_ramp.max(sig_ramp)
+                        + time_ramp.max(sig_ramp).max(pm_ramp)
                             * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
                     let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
@@ -1302,7 +1336,12 @@ async fn quote_loop(
                 let time_ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
                 let taker_thr = cfg.sc_taker_drift.max(1e-9);
                 let sig_ramp = ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
-                let conf = time_ramp.max(sig_ramp);
+                // Confiance PM : même composante que la complétion maker — un
+                // carnet qui pousse fort vers le gagnant justifie de payer plus.
+                let pm_for_ins = if is_up { pm_mom } else { -pm_mom };
+                let pm_ramp_ins =
+                    ((pm_for_ins - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
+                let conf = time_ramp.max(sig_ramp).max(pm_ramp_ins);
                 let rescue_pair = cfg.sc_completion_max_pair
                     + conf * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;
