@@ -62,6 +62,10 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
     let mut was_connected = false;
     let mut last_micro = 0.0f64;
     let mut micro_still_since: u64 = 0;
+    // CHEMIN CHAUD (passe 3) : ring ~800 ms du micro-price — l'impulsion est
+    // le déplacement relatif sur ~500 ms. Une explosion de fenêtre (5 s) se
+    // voit ici en 300-500 ms, là où l'EMA drift (halflife 25 s) met ~2 s.
+    let mut imp_ring: std::collections::VecDeque<(u64, f64)> = std::collections::VecDeque::new();
     let mut stale_warned = false;
 
     loop {
@@ -84,6 +88,21 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
             if let (Some(bb), Some(ba)) = (update.book.best_bid(), update.book.best_ask()) {
                 ofi_eng.update(update.ts_ms, bb, bid_sz, ba, ask_sz);
             }
+            imp_ring.push_back((update.ts_ms, micro));
+            while imp_ring
+                .front()
+                .is_some_and(|(t0, _)| update.ts_ms.saturating_sub(*t0) > 800)
+            {
+                imp_ring.pop_front();
+            }
+            // Base : l'échantillon le plus récent d'âge ≥ 400 ms (fenêtre réelle
+            // 400-800 ms selon la cadence du feed).
+            let impulse = imp_ring
+                .iter()
+                .filter(|(t0, _)| update.ts_ms.saturating_sub(*t0) >= 400)
+                .next_back()
+                .map(|(_, p0)| if *p0 > 0.0 { (micro - p0) / p0 } else { 0.0 })
+                .unwrap_or(0.0);
             seq += 1;
             let t = WireTick {
                 seq,
@@ -94,6 +113,7 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                 ofi: ofi_eng.value_norm(),
                 obi,
                 velocity: maybe_kill.is_some() as u8 as f64, // 1.0 = KILL armé ce tick (la vélocité brute reste interne au RadarEngine)
+                impulse,
             };
             if let Err(e) = transport.send_signal(Signal::Tick(t)).await {
                 tracing::error!(error = %e, "échec d'émission du tick signal");

@@ -328,7 +328,10 @@ async fn quote_loop(
     let mut strike: Option<f64> = None;
     let mut last_spot: Option<f64> = None;
     let mut last_window_slug: Option<String> = None;
-    let mut poll = tokio::time::interval(Duration::from_millis(250));
+    // CHEMIN CHAUD (passe 3) : 100 ms — aligné sur la cadence du feed Binance
+    // (depth20@100ms). Chaîne impulsion : détection 300-500 ms + UDP 105 ms +
+    // boucle ≤ 100 ms + POST ≈ t+1 s sur une explosion de 5 s.
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
     let mut persist_ctr: u32 = 0;
 
     // Signal directionnel (Radar Tokyo). En mode `combined`, on le calcule localement
@@ -618,7 +621,7 @@ async fn quote_loop(
         // last_spot (le gel du 6 juil. a fait trader/résoudre sur un spot mort).
         let t_secs = m.time_remaining_sec().max(0) as f64;
         let t_years = pricing::years_from_secs(t_secs);
-        let (spot, sigma, drift_ps, obi, ofi, sig_age_ms) = if cfg.use_udp_transport {
+        let (spot, sigma, drift_ps, obi, ofi, impulse, sig_age_ms) = if cfg.use_udp_transport {
             let snap = *remote_rx.borrow();
             let Some((t, recv_ms)) = snap else {
                 // JAMAIS rien reçu : dire pourquoi le bot ne fait rien (le cas
@@ -674,7 +677,7 @@ async fn quote_loop(
                 tracing::warn!(age_ms, "signal Tokyo PÉRIMÉ — quotes retirées");
                 continue;
             }
-            (t.spot, t.sigma, t.drift, t.obi, t.ofi, age_ms)
+            (t.spot, t.sigma, t.drift, t.obi, t.ofi, t.impulse, age_ms)
         } else {
             let bu = spot_rx.borrow().clone();
             let Some(bu) = bu else { continue };
@@ -706,6 +709,7 @@ async fn quote_loop(
                 drift_eng.per_sec(),
                 obi,
                 ofi_eng.value_norm(),
+                0.0, // impulsion : calculée au radar (chemin UDP) uniquement
                 tick_age_ms,
             )
         };
@@ -824,7 +828,15 @@ async fn quote_loop(
         // (contact/retrait, tailles asymétriques, patience de complétion) dans
         // desired_bids_symmetric — aucun état, aucun cooldown, aucun flip-flop.
         use crate::engines::spread_capture::endangered_side;
-        let tilt_raw = (drift_ps / (2.0 * cfg.sc_taker_drift.max(1e-9))).clamp(-1.0, 1.0);
+        let tilt_drift = (drift_ps / (2.0 * cfg.sc_taker_drift.max(1e-9))).clamp(-1.0, 1.0);
+        // CHEMIN CHAUD : l'impulsion (déplacement 500 ms, vue en <1 s) prend la
+        // main quand elle est plus forte que le drift (EMA 25 s, vue en ~2 s).
+        let tilt_imp = (impulse / (2.0 * cfg.sc_impulse.max(1e-9))).clamp(-1.0, 1.0);
+        let tilt_raw = if tilt_imp.abs() > tilt_drift.abs() {
+            tilt_imp
+        } else {
+            tilt_drift
+        };
         let tilt = if cfg.sc_ofi_confirm
             && ofi.abs() >= cfg.sc_ofi_min
             && ofi.signum() * drift_ps.signum() < 0.0
@@ -840,7 +852,10 @@ async fn quote_loop(
         ) {
             (Some(a), Some(b)) if a == b => Some(a.opposite()),
             _ => None,
-        };
+        }
+        // L'IMPULSION seule suffit : une explosion de 5 s ne laisse pas le
+        // temps d'attendre l'accord drift+OFI (fenêtre-explosion utilisateur).
+        .or_else(|| endangered_side(impulse, cfg.sc_impulse).map(|s| s.opposite()));
         if let Some(w) = tokyo_winner {
             dir_call = Some(w);
         }
@@ -908,7 +923,11 @@ async fn quote_loop(
         // (drift) — 9 juil. : OBI/OFI « ACHAT fort » pendant que le drift affichait
         // « neutre ». Signal positif (pression acheteuse) → le prix monte → c'est
         // la jambe DOWN qui va crasher → on retire son ouverture.
-        let drift_danger = endangered_side(drift_ps, cfg.sc_urgency_drift);
+        let drift_danger = endangered_side(drift_ps, cfg.sc_urgency_drift)
+            // CHEMIN CHAUD : l'impulsion vaut un drift urgent — le cancel du
+            // côté menacé part au tick de boucle (≤100 ms), c'est LE « il
+            // annule son up » de la fenêtre-explosion.
+            .or(endangered_side(impulse, cfg.sc_impulse));
         let ofi_danger = endangered_side(ofi, cfg.sc_ofi_pull);
         let danger = match (drift_danger, ofi_danger) {
             (Some(a), Some(b)) if a == b => Some(a), // les deux d'accord
@@ -1205,12 +1224,15 @@ async fn quote_loop(
                     let want_px = want_px;
                     let want_sz = want_sz;
                     let is_comp = is_comp;
-                    // ÉCHELLE : complétion = 1 niveau (taille = déficit exact) ;
-                    // ouverture = sc_ladder_levels niveaux espacés de
-                    // sc_ladder_step_ticks — présence continue au carnet, capte
-                    // les dips profonds à meilleur prix (profil vrai MM).
+                    // ÉCHELONNEMENT 0xb (passe 2) : la complétion se pose en
+                    // TRANCHES sur la chute du mourant (cap, ⅔·cap, ⅓·cap — le
+                    // « 30/20/10 » utilisateur) dès que le déficit offre
+                    // ≥ min_shares par tranche. Un reverse profond remplit les
+                    // tranches basses → paire grasse ; sinon la tranche haute
+                    // assure seule. Ouvertures : échelle classique.
                     let n_levels: u8 = if is_comp {
-                        1
+                        let total = want_sz.unwrap_or(0.0);
+                        ((total / min_shares.max(1.0)).floor() as u8).clamp(1, 3)
                     } else {
                         cfg.sc_ladder_levels.clamp(1, 4) as u8
                     };
@@ -1218,10 +1240,27 @@ async fn quote_loop(
                         // cible de CE niveau (None = rien à poser → retrait)
                         let target: Option<(f64, f64)> = match (want_sz, want_px) {
                             (Some(sz), Some(px0)) if lvl < n_levels => {
-                                let px = ((px0 - lvl as f64 * cfg.sc_ladder_step_ticks * tick_sz)
-                                    / tick_sz)
-                                    .floor()
-                                    * tick_sz;
+                                let (px, sz) = if is_comp && n_levels > 1 {
+                                    // Tranches : prix = cap × (n−lvl)/n, taille
+                                    // = déficit/n (la tranche 0 prend le reste).
+                                    let n = n_levels as f64;
+                                    let frac = (n - lvl as f64) / n;
+                                    let px = ((px0 * frac) / tick_sz).floor() * tick_sz;
+                                    let part = ((sz / n) * 100.0).floor() / 100.0;
+                                    let part = if lvl == 0 {
+                                        ((sz - part * (n - 1.0)) * 100.0).floor() / 100.0
+                                    } else {
+                                        part
+                                    };
+                                    (px, part)
+                                } else {
+                                    let px = ((px0
+                                        - lvl as f64 * cfg.sc_ladder_step_ticks * tick_sz)
+                                        / tick_sz)
+                                        .floor()
+                                        * tick_sz;
+                                    (px, sz)
+                                };
                                 let min_req = min_shares.max((1.0_f64 / px.max(0.01)).ceil());
                                 if px >= 0.01 && sz + 1e-9 >= min_req && px * sz <= lv.cash {
                                     Some((px, sz))
@@ -1276,12 +1315,14 @@ async fn quote_loop(
                                         continue;
                                     }
                                     // GARDE-FOU EXPOSITION : côté gelé → rien ce
-                                    // tick ; complétion → exclusivité totale (rien
-                                    // d'autre ne doit rester ouvert de ce côté).
+                                    // tick ; complétion → le TOTAL posé (tranches
+                                    // comprises) ne dépasse jamais le déficit.
+                                    let comp_total = want_sz.unwrap_or(0.0) + 0.01;
                                     if side_frozen[side_ix]
                                         || (is_comp
-                                            && (open_side[side_ix] > 0.01
-                                                || exposure.completion_side(is_up) > 0.01))
+                                            && (open_side[side_ix] + sz > comp_total
+                                                || exposure.completion_side(is_up) + sz
+                                                    > comp_total))
                                     {
                                         tracing::warn!(side = ?side,
                                             open = format!("{:.1}", open_side[side_ix]),

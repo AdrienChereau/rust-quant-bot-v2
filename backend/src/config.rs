@@ -126,6 +126,7 @@ pub struct Config {
     pub sc_pm_persist_s: i64, // le lean PM doit garder son SIGNE N s avant que le pm puisse armer/puller — un rebond de 20 s ne tient pas, un grind oui (défaut 12)
     pub sc_skew_fak: bool, // l'accumulation PAIE l'ask en FAK à l'armement (une fois par armement) — convertit les grinds fermes que le maker passif rate (défaut true)
     pub sc_skew_fak_max: f64, // prix max payé par le FAK d'accumulation (défaut 0.70)
+    pub sc_impulse: f64, // CHEMIN CHAUD : |déplacement micro-price ~500 ms| ≥ seuil = impulsion (défaut 2.5e-4 ≈ 15 $ en 0,5 s à 62k) — tilt plein, pull immédiat, FAK
     pub sc_skew_complete_below: f64, // le perdant sous ce prix → complétion autorisée (verrouille la paire grasse) (défaut 0.20)
     pub sc_cross_vol_lo: f64,        // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
     pub sc_cross_vol_span: f64,      // σ par tick supplémentaire (défaut 0.4)
@@ -293,6 +294,7 @@ impl Config {
             sc_pm_persist_s: env_or("SC_PM_PERSIST_S", 12.0) as i64,
             sc_skew_fak: env_or("SC_SKEW_FAK", true),
             sc_skew_fak_max: env_or("SC_SKEW_FAK_MAX", 0.70),
+            sc_impulse: env_or("SC_IMPULSE", 0.00025),
             sc_skew_complete_below: env_or("SC_SKEW_COMPLETE_BELOW", 0.20),
             sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
             sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),

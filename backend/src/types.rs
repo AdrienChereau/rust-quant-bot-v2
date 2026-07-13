@@ -127,11 +127,15 @@ pub struct WireTick {
     pub ofi: f64,     // order flow imbalance normalisé
     pub obi: f64,
     pub velocity: f64,
+    /// CHEMIN CHAUD (passe 3) : déplacement du micro-price sur ~500 ms —
+    /// détecteur d'IMPULSION, voit en <1 s ce que l'EMA drift (25 s) met
+    /// 2 s à confirmer. 0.0 si absent (rétro-compatibilité 65 octets).
+    pub impulse: f64,
 }
 
 impl WireTick {
-    pub fn encode(&self) -> [u8; 65] {
-        let mut b = [0u8; 65];
+    pub fn encode(&self) -> [u8; 73] {
+        let mut b = [0u8; 73];
         b[0] = 0x54;
         for (i, v) in [
             self.seq,
@@ -142,6 +146,7 @@ impl WireTick {
             self.ofi.to_bits(),
             self.obi.to_bits(),
             self.velocity.to_bits(),
+            self.impulse.to_bits(),
         ]
         .iter()
         .enumerate()
@@ -159,6 +164,12 @@ impl WireTick {
         for (i, slot) in w.iter_mut().enumerate() {
             *slot = u64::from_le_bytes(b[1 + i * 8..9 + i * 8].try_into().ok()?);
         }
+        // Rétro-compatible : une trame 65 octets (ancien radar) = impulse 0.
+        let impulse = if b.len() >= 73 {
+            f64::from_bits(u64::from_le_bytes(b[65..73].try_into().ok()?))
+        } else {
+            0.0
+        };
         Some(Self {
             seq: w[0],
             ts_ms: w[1],
@@ -168,6 +179,7 @@ impl WireTick {
             ofi: f64::from_bits(w[5]),
             obi: f64::from_bits(w[6]),
             velocity: f64::from_bits(w[7]),
+            impulse,
         })
     }
 }
@@ -208,11 +220,16 @@ mod wire_tests {
             ofi: 0.77,
             obi: -0.31,
             velocity: 1.0,
+            impulse: 0.00031,
         };
         let b = t.encode();
-        assert_eq!(b.len(), 65);
+        assert_eq!(b.len(), 73);
         assert_eq!(b[0], 0x54);
         assert_eq!(WireTick::decode(&b), Some(t));
+        // rétro-compatibilité : trame courte (ancien radar 65 octets) → impulse 0
+        let old = WireTick::decode(&b[..65]).expect("trame 65 acceptée");
+        assert_eq!(old.impulse, 0.0);
+        assert_eq!(old.drift, t.drift);
         // trames invalides
         assert_eq!(WireTick::decode(&b[..64]), None);
         let mut bad = b;
