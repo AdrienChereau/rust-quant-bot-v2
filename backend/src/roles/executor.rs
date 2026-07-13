@@ -310,7 +310,9 @@ async fn quote_loop(
         if let Ok(txt) = std::fs::read_to_string(&windows_path) {
             for line in txt.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(w) = serde_json::from_str::<WindowResult>(line) {
-                    loaded.push(w);
+                    if w.deployed > 0.01 {
+                        loaded.push(w); // fenêtres jouées uniquement
+                    }
                 }
             }
         }
@@ -513,22 +515,27 @@ async fn quote_loop(
                             pnl_unattributed: delta,
                             ..rec
                         };
-                        // Persiste la fenêtre (append-only) avant de l'ajouter à l'affichage.
-                        if let Ok(line) = serde_json::to_string(&final_rec) {
-                            use std::io::Write;
-                            if let Ok(mut fh) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&windows_path)
-                            {
-                                let _ = writeln!(fh, "{line}");
+                        // FENÊTRES JOUÉES UNIQUEMENT (13 juil.) : une fenêtre sans
+                        // le moindre déploiement (sommeil, pause, aucun fill) n'a
+                        // rien à dire — ni au dashboard, ni au journal.
+                        if final_rec.deployed > 0.01 {
+                            // Persiste la fenêtre (append-only) avant l'affichage.
+                            if let Ok(line) = serde_json::to_string(&final_rec) {
+                                use std::io::Write;
+                                if let Ok(mut fh) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&windows_path)
+                                {
+                                    let _ = writeln!(fh, "{line}");
+                                }
                             }
-                        }
-                        let mut d = dash.write().await;
-                        d.windows.push(final_rec);
-                        let n = d.windows.len();
-                        if n > 2000 {
-                            d.windows.drain(0..n - 2000);
+                            let mut d = dash.write().await;
+                            d.windows.push(final_rec);
+                            let n = d.windows.len();
+                            if n > 2000 {
+                                d.windows.drain(0..n - 2000);
+                            }
                         }
                     }
                     None => tracing::warn!("résolution sautée : ni close kline ni spot disponible"),
