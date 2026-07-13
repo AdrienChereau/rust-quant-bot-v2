@@ -978,13 +978,20 @@ async fn quote_loop(
         // compléter sans payer la taxe (profil 0xb27b : complétions maker).
         let endgame = (20..=45).contains(&m.time_remaining_sec());
         for b in desired.iter_mut() {
+            // URGENCE PRIX (13 juil. 19:31 : 10 Down @0.295 pendant que Up
+            // grindait à 0.90 avec un tilt à 0.42 — AUCUN signal Binance ne
+            // tirait, mais le marché avait déjà voté). Le côté qu'on doit
+            // acheter est devenu le FAVORI (≥ 0.60) = le prix EST le signal :
+            // la phase 2 de 0xb aspire le mourant sans condition de signal.
+            let bb_deficit = if b.side == Side::Up { bb_up } else { bb_dn };
+            let price_urgent = b.completion && bb_deficit >= 0.60;
             if b.completion
                 && ((!urgency_blocked
-                    && crate::engines::spread_capture::completion_urgent(
+                    && (crate::engines::spread_capture::completion_urgent(
                         b.side,
                         drift_ps,
                         cfg.sc_urgency_drift,
-                    ))
+                    ) || price_urgent))
                     || endgame)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
@@ -1014,6 +1021,10 @@ async fn quote_loop(
                         Side::Down => -tilt,
                     }
                     .clamp(0.0, 1.0);
+                    // Confiance PRIX : payer `a` pour le favori est +EV ssi
+                    // P(gagne) > a — et le prix du favori EST P. À bb 0.85 →
+                    // conf 0.7 → plafond ~1.17 → la chasse colle à l'ask.
+                    let price_conf = ((bb_deficit - 0.5) * 2.0).clamp(0.0, 1.0);
                     let base_pair = cfg.sc_completion_max_pair.min(1.0);
                     let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                         cfg.sc_rescue_max_pair
@@ -1021,7 +1032,8 @@ async fn quote_loop(
                         base_pair
                     };
                     let ramped_pair = base_pair
-                        + time_ramp.max(sig_ramp).max(tilt_chase) * (rescue_ceiling - base_pair);
+                        + time_ramp.max(sig_ramp).max(tilt_chase).max(price_conf)
+                            * (rescue_ceiling - base_pair);
                     let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
                     let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room))
@@ -1485,10 +1497,15 @@ async fn quote_loop(
             // un achat qui la RÉDUIT est une assurance → JAMAIS de délai. Le
             // signal BRUT (tilt fort — impulsion comprise — ou Tokyo lent)
             // contre notre surplus déclenche le rééquilibrage immédiat.
+            let bb_deficit_ins = if deficit_side == Side::Up { bb_up } else { bb_dn };
             let signal_against_surplus = match deficit_side {
                 Side::Up => tilt >= 0.5,
                 Side::Down => tilt <= -0.5,
-            } || tokyo_slow == Some(deficit_side);
+            } || tokyo_slow == Some(deficit_side)
+                // URGENCE PRIX : le côté à acheter est le favori ≥ 0.60 — le
+                // marché a voté, pas besoin de Binance (19:31 : tilt 0.42,
+                // Down @0.085, rien ne tirait).
+                || bb_deficit_ins >= 0.60;
             if enabled
                 && sc.imbalance().abs() >= 5.0
                 && ((10..=20).contains(&remaining_l)
@@ -1521,7 +1538,8 @@ async fn quote_loop(
                 // monte à ~1,14 — la chasse/le FAK rattrapent le marché au lieu
                 // de courir dessous (fenêtre 18:50).
                 let tilt_ramp_ins = if is_up { tilt } else { -tilt }.clamp(0.0, 1.0);
-                let conf = time_ramp.max(sig_ramp).max(tilt_ramp_ins);
+                let price_conf_ins = ((bb_deficit_ins - 0.5) * 2.0).clamp(0.0, 1.0);
+                let conf = time_ramp.max(sig_ramp).max(tilt_ramp_ins).max(price_conf_ins);
                 let base_pair = cfg.sc_completion_max_pair.min(1.0);
                 let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                     cfg.sc_rescue_max_pair
