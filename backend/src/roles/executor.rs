@@ -1591,7 +1591,13 @@ async fn quote_loop(
                     // par les minimums relançait la spirale). Sous les minimums →
                     // résidu accepté, perte bornée. Déficit RECALCULÉ après purge.
                     let sz = ((sc.imbalance().abs().min(ask_sz.max(1.0))) * 100.0).floor() / 100.0;
-                    let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask).ceil());
+                    // FAK = exécution immédiate : le minimum de 5 parts ne
+                    // s'applique QU'AUX ordres restants (prouvé 9-10 juil. :
+                    // vente FAK de 0,56 part). Un déficit SOUS-MINIMUM (fill
+                    // partiel — 13 juil. 19:35 : 4,37 Up, complétion refusée
+                    // 3 min 30, morts à zéro) se complète en FAK : c'est la
+                    // SEULE voie, le resting < 5 étant rejeté par le CLOB.
+                    let min_req = 1.0_f64;
                     if purge_unsafe {
                         tracing::warn!(
                             side = if is_up { "up" } else { "down" },
