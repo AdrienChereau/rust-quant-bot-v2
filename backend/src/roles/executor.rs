@@ -1093,6 +1093,47 @@ async fn quote_loop(
                     } else {
                         (ask_dn, ask_dn_sz)
                     };
+                    // PURGE avant le tir (19:51, 13 juil.) : des ouvertures
+                    // PÉRIMÉES du même côté (bids 15 ticks sous un marché parti)
+                    // mangeaient le cap net → taille sous le minimum → le seul
+                    // trade de la fenêtre jamais tiré. Elles n'ont plus de raison
+                    // d'être : on les annule (récolte comptabilisée), le cap se
+                    // libère. Un cancel incertain reporte le tir au tick suivant.
+                    let mut purge_unsafe_acc = false;
+                    if !throttled {
+                        let mut i = 0;
+                        while i < lrest.len() {
+                            if lrest[i].is_up == is_up
+                                && lrest[i].intent != OrderIntent::Completion
+                            {
+                                let slot = lrest.remove(i);
+                                let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
+                                if let Some(f) = f {
+                                    apply_live_fills(
+                                        vec![f],
+                                        lv,
+                                        &mut paper,
+                                        &mut sc,
+                                        now_s,
+                                        now_ms_books as i64,
+                                        &cfg,
+                                        &mut last_fill_wall_ms,
+                                        &mut win_taker_fees,
+                                        &mut win_fills,
+                                        &mut win_deployed,
+                                        &mut win_rebate,
+                                        &mut win_imb_max,
+                                        &mut win_purposes,
+                                    );
+                                }
+                                if !safe {
+                                    purge_unsafe_acc = true;
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
                     let surplus = if is_up {
                         sc.imbalance()
                     } else {
@@ -1109,6 +1150,7 @@ async fn quote_loop(
                         .max(1.0)
                         .max((1.0_f64 / ask.max(0.01)).ceil());
                     if !throttled
+                        && !purge_unsafe_acc
                         && ask > 0.0
                         && ask <= cfg.sc_skew_fak_max
                         && m.time_remaining_sec() > cfg.sc_opening_stop_s
