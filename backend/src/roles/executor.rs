@@ -350,6 +350,8 @@ async fn quote_loop(
     // continu issu de Binance, qui incline la cotation. Le carnet PM ne pilote
     // plus rien : un carnet mince se spoofe, le sous-jacent ne se spoofe pas.
     let mut last_tilt_sign: i8 = 0; // log de transition du tilt fort
+    // Confirmation FAK : (côté du signal Tokyo lent, depuis quand).
+    let mut tokyo_side_since: (Option<Side>, i64) = (None, 0);
     // FAK d'accumulation : throttle (côté, epoch ms) — un tir par rafale Tokyo.
     #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut last_fak_side: Option<Side> = None;
@@ -537,6 +539,7 @@ async fn quote_loop(
                     strike = binance::price_at_window_open(m.window_ts).await.ok();
                     sc.reset_window(); // état blended remis à zéro pour la nouvelle fenêtre
                     last_tilt_sign = 0;
+                    tokyo_side_since = (None, 0);
                     #[cfg(feature = "live")]
                     {
                         last_fak_side = None;
@@ -846,16 +849,29 @@ async fn quote_loop(
             tilt_raw
         };
         // Tokyo PLEIN (drift + OFI alignés) : compteur de précision + FAK.
-        let tokyo_winner = match (
+        let tokyo_slow = match (
             endangered_side(drift_ps, cfg.sc_taker_drift),
             endangered_side(ofi, cfg.sc_ofi_pull),
         ) {
             (Some(a), Some(b)) if a == b => Some(a.opposite()),
             _ => None,
-        }
+        };
         // L'IMPULSION seule suffit : une explosion de 5 s ne laisse pas le
         // temps d'attendre l'accord drift+OFI (fenêtre-explosion utilisateur).
-        .or_else(|| endangered_side(impulse, cfg.sc_impulse).map(|s| s.opposite()));
+        let impulse_winner = endangered_side(impulse, cfg.sc_impulse).map(|s| s.opposite());
+        let tokyo_winner = tokyo_slow.or(impulse_winner);
+        // CONFIRMATION FAK (13 juil. 18:20 : assuré au creux d'un balancier sur
+        // un signal de 6 s → merge 1.06) : le signal LENT doit tenir
+        // sc_fak_confirm_s du même côté avant de payer l'ask. L'impulsion —
+        // l'explosion vraie — garde son droit de tir immédiat.
+        if tokyo_slow != tokyo_side_since.0 {
+            tokyo_side_since = (tokyo_slow, now_ms_books as i64);
+        }
+        let tokyo_confirmed = tokyo_slow.filter(|_| {
+            now_ms_books as i64 - tokyo_side_since.1
+                >= (cfg.sc_fak_confirm_s * 1000.0) as i64
+        });
+        let fak_trigger: Option<Side> = impulse_winner.or(tokyo_confirmed);
         if let Some(w) = tokyo_winner {
             dir_call = Some(w);
         }
@@ -1044,7 +1060,7 @@ async fn quote_loop(
             // retournement se gère en achetant l'autre côté (rééquilibrage),
             // borné par le cap d'imbalance et le plafond de paire.
             if cfg.sc_skew_fak && enabled {
-                if let Some(w) = tokyo_winner {
+                if let Some(w) = fak_trigger {
                     let throttled = last_fak_side == Some(w)
                         && now_ms_books as i64 - last_fak_ms < 30_000;
                     let is_up = w == Side::Up;

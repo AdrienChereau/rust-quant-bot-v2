@@ -811,11 +811,16 @@ impl LiveCtx {
                 );
                 let matched = filled_size.unwrap_or(0.0);
                 let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
+                // NOTIONNEL FAK (13 juil. 18:20) : un BUY FAK dépense le montant
+                // (size × limite) et rend PLUS de parts si le fill est meilleur
+                // (12 @ limite 0.67 remplis à 0.64 → 12,5625 parts). La réponse
+                // du POST est la vérité de CET ordre : elle relève le plafond du
+                // grand livre — sinon part fantôme → désync → pause.
                 if let Some(f) = Self::credit_with_meta(
                     &mut self.ledger,
                     &order_id,
                     is_up,
-                    size,
+                    size.max(matched),
                     matched,
                     px,
                     false,
@@ -1358,6 +1363,17 @@ mod tests {
         assert!(!post.maker);
         // l'event `order` rapporte le même size_matched absolu (6) → rien de plus
         assert!(LiveCtx::credit(&mut l, "ord-C", true, 6.0, 6.0, 0.56, true).is_none());
+    }
+
+    #[test]
+    fn credit_fak_notional_overfill_counted_fully() {
+        // BUY FAK : limite 0.67, rempli 12.5625 @ 0.64 (notionnel). Le POST
+        // relève le plafond → tout est compté ; les ré-émissions WS = delta 0.
+        let mut l = HashMap::new();
+        let f = LiveCtx::credit(&mut l, "oid", false, 12.5625, 12.5625, 0.64, false)
+            .expect("fill");
+        assert!((f.size - 12.5625).abs() < 1e-9, "tout le fill réel: {}", f.size);
+        assert!(LiveCtx::credit(&mut l, "oid", false, 12.0, 12.5625, 0.64, false).is_none());
     }
 
     #[test]
