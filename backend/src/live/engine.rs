@@ -765,19 +765,21 @@ impl LiveCtx {
     /// FAK d'assurance (complétion taker fin de fenêtre). Un FAK n'est jamais
     /// resting : son fill est dans la RÉPONSE du POST — comptabilisé ici même,
     /// sans dépendre du WS (un FAK invisible relançait l'assurance en boucle).
+    /// Retourne `true` si le FAK a été accepté (même partiellement) — `false`
+    /// sur erreur/« no match » : l'appelant peut re-tirer avec un ask FRAIS.
     pub async fn place_insurance_fak(
         &mut self,
         is_up: bool,
         price: f64,
         size: f64,
         intent: OrderIntent,
-    ) {
+    ) -> bool {
         if self.is_halted() {
             tracing::warn!(
                 intent = intent.as_str(),
                 "FAK refusé : exécuteur live arrêté"
             );
-            return;
+            return false;
         }
         let token = if is_up {
             &self.up_token
@@ -829,9 +831,13 @@ impl LiveCtx {
                 ) {
                     self.post_fills.push(f);
                 }
+                true
             }
-            Ok(_) => {} // DryRun ; PostOnlyRejected impossible (FAK, post_only=false)
-            Err(e) => tracing::warn!(error = %e, "assurance FAK refusée"),
+            Ok(_) => true, // DryRun ; PostOnlyRejected impossible (FAK, post_only=false)
+            Err(e) => {
+                tracing::warn!(error = %e, "assurance FAK refusée");
+                false
+            }
         }
     }
 

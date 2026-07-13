@@ -1005,10 +1005,15 @@ async fn quote_loop(
                     let taker_thr = cfg.sc_taker_drift.max(1e-9);
                     let sig_ramp =
                         ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
-                    // Confiance PM : un momentum du carnet nettement au-dessus du
-                    // seuil = conviction du marché → payer l'assurance plus cher
-                    // est +EV (même logique que la rampe signal du sauvetage).
-
+                    // TILT (impulsion comprise) = composante de confiance : la
+                    // chasse suit le marché au lieu de courir dessous quand le
+                    // signal penche contre notre surplus (fenêtre 18:50 : chase
+                    // plafonnée à 0,42 sous un ask qui filait).
+                    let tilt_chase = match b.side {
+                        Side::Up => tilt,
+                        Side::Down => -tilt,
+                    }
+                    .clamp(0.0, 1.0);
                     let base_pair = cfg.sc_completion_max_pair.min(1.0);
                     let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                         cfg.sc_rescue_max_pair
@@ -1016,7 +1021,7 @@ async fn quote_loop(
                         base_pair
                     };
                     let ramped_pair = base_pair
-                        + time_ramp.max(sig_ramp) * (rescue_ceiling - base_pair);
+                        + time_ramp.max(sig_ramp).max(tilt_chase) * (rescue_ceiling - base_pair);
                     let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
                     let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room))
@@ -1098,8 +1103,6 @@ async fn quote_loop(
                         && sz >= min_req
                         && ask * sz <= lv.cash
                     {
-                        last_fak_side = Some(w);
-                        last_fak_ms = now_ms_books as i64;
                         tracing::info!(
                             side = w.as_str(),
                             ask = format!("{ask:.3}"),
@@ -1115,8 +1118,18 @@ async fn quote_loop(
                         // ask + 3 ticks, borné par le plafond : on ne paie le
                         // tampon QUE si le carnet a bougé pendant le vol.
                         let limit = (ask + 3.0 * tick_sz).min(cfg.sc_skew_fak_max);
-                        lv.place_insurance_fak(is_up, limit, sz, OrderIntent::SkewAccumulation)
-                            .await;
+                        if lv
+                            .place_insurance_fak(is_up, limit, sz, OrderIntent::SkewAccumulation)
+                            .await
+                        {
+                            last_fak_side = Some(w);
+                            last_fak_ms = now_ms_books as i64;
+                        } else {
+                            // « no match » : re-tir au tick suivant avec l'ask
+                            // FRAIS (throttle réduit à ~500 ms, pas 30 s).
+                            last_fak_side = Some(w);
+                            last_fak_ms = now_ms_books as i64 - 29_500;
+                        }
                     }
                 }
             }
@@ -1466,9 +1479,20 @@ async fn quote_loop(
                 drift_ps,
                 cfg.sc_taker_drift,
             );
+            // RÈGLE « JAMAIS UNIJAMBISTE » (13 juil., fenêtre 18:50 : 6 Down
+            // morts à −3,85 $ pendant que la confirmation 8 s bloquait le FAK) :
+            // un achat qui AUGMENTE l'exposition est un pari → confirmation ;
+            // un achat qui la RÉDUIT est une assurance → JAMAIS de délai. Le
+            // signal BRUT (tilt fort — impulsion comprise — ou Tokyo lent)
+            // contre notre surplus déclenche le rééquilibrage immédiat.
+            let signal_against_surplus = match deficit_side {
+                Side::Up => tilt >= 0.5,
+                Side::Down => tilt <= -0.5,
+            } || tokyo_slow == Some(deficit_side);
             if enabled
                 && sc.imbalance().abs() >= 5.0
-                && ((10..=20).contains(&remaining_l) || (taker_drift_urgent && remaining_l > 20))
+                && ((10..=20).contains(&remaining_l)
+                    || ((taker_drift_urgent || signal_against_surplus) && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
                 let (is_up, ask, ask_sz) = if sc.imbalance() > 0.0 {
@@ -1492,7 +1516,12 @@ async fn quote_loop(
                 let time_ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
                 let taker_thr = cfg.sc_taker_drift.max(1e-9);
                 let sig_ramp = ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
-                let conf = time_ramp.max(sig_ramp);
+                // Le TILT (impulsion comprise) contre notre surplus est une
+                // composante de confiance à part entière : à 0,57 le plafond
+                // monte à ~1,14 — la chasse/le FAK rattrapent le marché au lieu
+                // de courir dessous (fenêtre 18:50).
+                let tilt_ramp_ins = if is_up { tilt } else { -tilt }.clamp(0.0, 1.0);
+                let conf = time_ramp.max(sig_ramp).max(tilt_ramp_ins);
                 let base_pair = cfg.sc_completion_max_pair.min(1.0);
                 let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                     cfg.sc_rescue_max_pair
@@ -1551,7 +1580,6 @@ async fn quote_loop(
                             "sauvetage différé : cancel non confirmé du même côté (fill en vol probable)"
                         );
                     } else if sz + 1e-9 >= min_req && (ask + fee_per_share) * sz <= lv.cash {
-                        last_insurance_ms = now_ms_books as i64;
                         let cause = if taker_drift_urgent && remaining_l > 20 {
                             "drift fort"
                         } else {
@@ -1572,8 +1600,15 @@ async fn quote_loop(
                         // MARKETABLE : même tampon que l'accumulation, borné
                         // par la place du plafond de paire rampé.
                         let limit = (ask + 3.0 * tick_sz).min(pair_room_ins).max(ask);
-                        lv.place_insurance_fak(is_up, limit, sz, OrderIntent::Rescue)
-                            .await;
+                        if lv
+                            .place_insurance_fak(is_up, limit, sz, OrderIntent::Rescue)
+                            .await
+                        {
+                            last_insurance_ms = now_ms_books as i64;
+                        } else {
+                            // « no match » : re-tir ~1 s plus tard, ask frais.
+                            last_insurance_ms = now_ms_books as i64 - 2_000;
+                        }
                     }
                 }
             }
