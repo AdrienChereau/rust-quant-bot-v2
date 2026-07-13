@@ -1548,6 +1548,18 @@ async fn quote_loop(
                 };
                 let rescue_pair = base_pair + conf * (rescue_ceiling - base_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;
+                // BORNE EV (13 juil., « toujours compenser ») : compléter coûte
+                // (ask + c − 1) CERTAIN ; tenir nu coûte c × ask en ESPÉRANCE
+                // (le prix du favori EST sa probabilité). Compléter gagne ssi
+                // (1−ask)(1−c) > frais (~3¢) — presque toujours. Le plafond de
+                // paire fixe bloquait les compensations à coût élevé (c=0.54 :
+                // interdit dès ask 0.69, l'EV autorise 0.93). Borne dure 0.95.
+                let pair_room_ins = if cfg.sc_allow_loss_rescue {
+                    let ev_room = (1.0 - 0.03 / (1.0 - avg_excess_ins).max(0.05)).min(0.95);
+                    pair_room_ins.max(ev_room)
+                } else {
+                    pair_room_ins
+                };
                 let fee_per_share = 0.07 * ask * (1.0 - ask);
                 let all_in_ask = ask + fee_per_share;
                 if ask > 0.0 && ask <= 0.99 && all_in_ask <= pair_room_ins + 1e-9 {
