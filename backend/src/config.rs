@@ -116,6 +116,9 @@ pub struct Config {
     pub sc_trend_net_cap: f64,     // exposition nette MAX du pari (parts, défaut 12)
     pub sc_pm_mom: f64,            // momentum du carnet PM (Δmid sur look_s) qui arme le skew — attrape les glissements lents invisibles pour Binance (défaut 0.06)
     pub sc_pm_mom_look_s: i64,     // horizon du momentum PM (défaut 20 s)
+    pub sc_pm_persist_s: i64,      // le lean PM doit garder son SIGNE N s avant que le pm puisse armer/puller — un rebond de 20 s ne tient pas, un grind oui (défaut 12)
+    pub sc_skew_fak: bool,         // l'accumulation PAIE l'ask en FAK à l'armement (une fois par armement) — convertit les grinds fermes que le maker passif rate (défaut true)
+    pub sc_skew_fak_max: f64,      // prix max payé par le FAK d'accumulation (défaut 0.70)
     pub sc_skew_complete_below: f64, // le perdant sous ce prix → complétion autorisée (verrouille la paire grasse) (défaut 0.20)
     pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
     pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
@@ -254,8 +257,13 @@ impl Config {
             sc_streak_hard: env_or("SC_STREAK_HARD", 6),
             sc_bankroll_pct: env_or("SC_BANKROLL_PCT", 0.0),
             sc_symmetric: env_or("SC_SYMMETRIC", false),
-            sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00002),
-            sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.000025),
+            // RECALIBRATION 13 juil. : les fenêtres se décident sur des moves
+            // BTC de 30-60 $/min (drift 0,8-1,6e-5 à ~64k$) — les anciens seuils
+            // (2e-5 / 2,5e-5 ≈ 75-95 $/min) rendaient Tokyo MUET (drift affiché
+            // ±0.00001 pendant des flips 50→95). Bruit mesuré ~8e-6 ; la
+            // conjonction avec l'OFI (armement) protège du faux positif.
+            sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00001),
+            sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.000012),
             sc_rescue_max_pair: env_or("SC_RESCUE_MAX_PAIR", 1.23),
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
@@ -268,6 +276,9 @@ impl Config {
             sc_trend_net_cap: env_or("SC_TREND_NET_CAP", 12.0),
             sc_pm_mom: env_or("SC_PM_MOM", 0.06),
             sc_pm_mom_look_s: env_or("SC_PM_MOM_LOOK_S", 20.0) as i64,
+            sc_pm_persist_s: env_or("SC_PM_PERSIST_S", 12.0) as i64,
+            sc_skew_fak: env_or("SC_SKEW_FAK", true),
+            sc_skew_fak_max: env_or("SC_SKEW_FAK_MAX", 0.70),
             sc_skew_complete_below: env_or("SC_SKEW_COMPLETE_BELOW", 0.20),
             sc_cross_vol_lo: env_or("SC_CROSS_VOL_LO", 0.5),
             sc_cross_vol_span: env_or("SC_CROSS_VOL_SPAN", 0.4),

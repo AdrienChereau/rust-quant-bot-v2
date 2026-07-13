@@ -268,6 +268,20 @@ async fn quote_loop(
     let mut skew_armed: Option<Side> = None;
     let mut last_skew_logged: Option<Side> = None;
     let mut last_pm_pull: Option<Side> = None; // pull demi-seuil (log de transition)
+    // PERSISTANCE du lean PM (refonte 13 juil.) : le pm-momentum est un
+    // détecteur de MOUVEMENT, pas de tendance — il tirait sur chaque jambe de
+    // rebond (12 Up @0.46 revendus @0.23). Un lean ne compte que si son SIGNE
+    // tient sc_pm_persist_s : un rebond de 20 s ne tient pas, un grind oui.
+    let mut pm_lean_sign: i8 = 0;
+    let mut pm_lean_since_ms: i64 = 0;
+    // FAK d'accumulation : tiré UNE fois par armement (armé → pending).
+    #[allow(unused_mut, unused_assignments, unused_variables)]
+    let mut accum_fak_pending = false;
+    // Parts FAK en vol (taille, epoch ms) : le fill met ~300 ms à revenir par
+    // le WS — sans ce compteur, la quote maker posterait un 2e clip entier
+    // pendant le trou (24 pour un cap de 12).
+    #[allow(unused_mut, unused_assignments, unused_variables)]
+    let mut accum_fak_inflight: (f64, i64) = (0.0, 0);
     // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
     // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
     // au gagnant réel. dir_wins/dir_total = notre précision directionnelle live —
@@ -421,6 +435,10 @@ async fn quote_loop(
                     bet_side = None;
                     skew_cool_until = 0;
                     last_skew_logged = None;
+                    pm_lean_sign = 0;
+                    pm_lean_since_ms = 0;
+                    accum_fak_pending = false;
+                    accum_fak_inflight = (0.0, 0);
                     rest_up = None;
                     rest_dn = None;
                     win_rebate = 0.0;
@@ -726,9 +744,24 @@ async fn quote_loop(
         } else {
             0.0
         };
-        let pm_side = if pm_mom >= cfg.sc_pm_mom {
+        // Persistance du lean : signe du demi-seuil suivi en continu ; toute
+        // inversion (ou retour au neutre) remet le chrono à zéro.
+        let lean_sign: i8 = if pm_mom >= cfg.sc_pm_mom * 0.5 {
+            1
+        } else if pm_mom <= -cfg.sc_pm_mom * 0.5 {
+            -1
+        } else {
+            0
+        };
+        if lean_sign != pm_lean_sign {
+            pm_lean_sign = lean_sign;
+            pm_lean_since_ms = now_ms_books as i64;
+        }
+        let pm_persisted = lean_sign != 0
+            && now_ms_books as i64 - pm_lean_since_ms >= cfg.sc_pm_persist_s * 1000;
+        let pm_side = if pm_mom >= cfg.sc_pm_mom && pm_persisted {
             Some(Side::Up)
-        } else if pm_mom <= -cfg.sc_pm_mom {
+        } else if pm_mom <= -cfg.sc_pm_mom && pm_persisted {
             Some(Side::Down)
         } else {
             None
@@ -766,12 +799,12 @@ async fn quote_loop(
                 } else {
                     // signal éteint → désarmement + cooldown (sans écraser un
                     // cooldown plus long posé par la sortie éclair)
-                    skew_cool_until = skew_cool_until.max(now_s + 30);
+                    skew_cool_until = skew_cool_until.max(now_s + 15);
                     None
                 }
             }
             Some(_) => {
-                skew_cool_until = skew_cool_until.max(now_s + 30);
+                skew_cool_until = skew_cool_until.max(now_s + 15);
                 None
             }
             None if cfg.sc_skew && !paused && !sleeping && now_s >= skew_cool_until => {
@@ -808,6 +841,9 @@ async fn quote_loop(
             } else if last_skew_logged.is_some() {
                 tracing::info!("SKEW désarmé — retour symétrique");
             }
+            // FAK d'accumulation : chaque armement autorise UN tir ; le
+            // désarmement annule le tir en attente.
+            accum_fak_pending = skew_winner.is_some();
             last_skew_logged = skew_winner;
         }
         // Pari en cours ? (surplus du gagnant ≤ net_cap) → on ne le complète pas
@@ -843,12 +879,15 @@ async fn quote_loop(
         // rouvrait les ouvertures des deux côtés — les 6 Down nus @0.36 sont
         // partis dans un de ces trous. Gradation : carnet qui penche (≥ ½ seuil)
         // → plus d'ouverture du côté mourant ; seuil plein → skew complet.
-        let pm_pull: Option<Side> = if pm_mom >= cfg.sc_pm_mom * 0.5 {
-            Some(Side::Down)
-        } else if pm_mom <= -cfg.sc_pm_mom * 0.5 {
-            Some(Side::Up)
-        } else {
+        // PERSISTANT (refonte 13 juil.) : sans persistance, le pull musellait le
+        // symétrique sur les fenêtres whipsaw (le lean alternait de camp toutes
+        // les 10-20 s → presque aucun fill d'ouverture de toute la fenêtre).
+        let pm_pull: Option<Side> = if !pm_persisted {
             None
+        } else if pm_lean_sign > 0 {
+            Some(Side::Down)
+        } else {
+            Some(Side::Up)
         };
         if let Some(d) = pm_pull {
             if last_pm_pull != Some(d) {
@@ -875,7 +914,9 @@ async fn quote_loop(
             // PM, lui, le voit (pm_mom jusqu'à +0.16) : quand il penche (≥ demi-
             // seuil) vers le côté qu'on doit acheter, la complétion CHASSE.
             let pm_for = if b.side == Side::Up { pm_mom } else { -pm_mom };
-            let pm_urgent = pm_for >= cfg.sc_pm_mom * 0.5;
+            let pm_urgent = pm_persisted
+                && ((b.side == Side::Up && pm_lean_sign > 0)
+                    || (b.side == Side::Down && pm_lean_sign < 0));
             if b.completion
                 && ((!urgency_blocked
                     && (crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
@@ -1002,6 +1043,59 @@ async fn quote_loop(
             // le pari devient actif dès qu'un surplus skew existe
             if bet_side.is_none() && hold_dir_bet {
                 bet_side = skew_winner;
+            }
+            // ═══ FAK D'ACCUMULATION (refonte 13 juil., « la folie utile ») ═══
+            // Le maker passif à bb+tick court derrière un grind et ne se fait
+            // remplir qu'une fois sur trois (fenêtre 1783902600 : Down 55→95,
+            // zéro accumulation remplie). À l'armement, signal PLEIN par
+            // définition → on PAIE l'ask une fois, borné : prix ≤ sc_skew_fak_max,
+            // taille ≤ cap net (restants compris), stop T−60. Le maker continue
+            // ensuite pour le complément éventuel du cap.
+            if accum_fak_pending && cfg.sc_skew_fak && enabled {
+                if let Some(w) = skew_winner {
+                    let is_up = w == Side::Up;
+                    let (ask, ask_sz) =
+                        if is_up { (ask_up, ask_up_sz) } else { (ask_dn, ask_dn_sz) };
+                    let surplus = if is_up { sc.imbalance() } else { -sc.imbalance() };
+                    let resting_open: f64 = lrest
+                        .iter()
+                        .filter(|s| s.is_up == is_up)
+                        .map(|s| (s.r.size - s.r.matched).max(0.0))
+                        .sum();
+                    let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
+                        accum_fak_inflight.0
+                    } else {
+                        0.0
+                    };
+                    let cap_room = (net_cap - surplus - resting_open - inflight).floor();
+                    let sz = (cfg.sc_base_clip * cfg.sc_skew_mult)
+                        .min(cap_room)
+                        .min(ask_sz.max(1.0))
+                        .floor();
+                    let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask.max(0.01)).ceil());
+                    if ask > 0.0
+                        && ask <= cfg.sc_skew_fak_max
+                        && m.time_remaining_sec() > cfg.sc_opening_stop_s
+                        && sz >= min_req
+                        && ask * sz <= lv.cash
+                    {
+                        accum_fak_pending = false;
+                        accum_fak_inflight = (sz, now_ms_books as i64);
+                        tracing::info!(
+                            side = w.as_str(),
+                            ask = format!("{ask:.3}"),
+                            size = format!("{sz:.0}"),
+                            pm_mom = format!("{pm_mom:+.3}"),
+                            drift = format!("{drift_ps:+.5}"),
+                            "ACCUMULATION taker — on paie l'ask à l'armement (signal plein)"
+                        );
+                        lv.place_insurance_fak(is_up, ask, sz).await;
+                    } else if ask > cfg.sc_skew_fak_max
+                        || m.time_remaining_sec() <= cfg.sc_opening_stop_s
+                    {
+                        accum_fak_pending = false; // conditions mortes : on n'attend pas
+                    }
+                }
             }
             // KILL/pause → tout annuler — mais JAMAIS sans récolter d'abord
             // (un cancel aveugle perd le fill arrivé entre-temps).
@@ -1149,7 +1243,12 @@ async fn quote_loop(
                             .filter(|s| s.is_up == is_up)
                             .map(|s| (s.r.size - s.r.matched).max(0.0))
                             .sum();
-                        let cap_room = (net_cap - surplus - resting_open).floor();
+                        let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
+                            accum_fak_inflight.0
+                        } else {
+                            0.0
+                        };
+                        let cap_room = (net_cap - surplus - resting_open - inflight).floor();
                         let bb_side = if is_up { bb_up } else { bb_dn };
                         if remaining_l_quote > cfg.sc_opening_stop_s
                             && cap_room >= min_shares
