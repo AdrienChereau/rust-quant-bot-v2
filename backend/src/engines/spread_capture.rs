@@ -484,11 +484,14 @@ impl SpreadCaptureEngine {
                     Side::Down => self.avg(Side::Up),
                 };
                 let mut cap = (pair_target - avg_excess).min(c.completion_max_price);
-                // PATIENCE (doctrine paire grasse) : tilt fort en faveur du côté
-                // excédentaire → le pari court — racheter le mourant au
-                // complément solderait le pari à paire ~1,00 pour rien. On ne le
-                // rachète que BRADÉ (le « replacer APRÈS la chute » utilisateur).
-                if tilt_for <= -0.5 {
+                // ROTATION PAR DÉFAUT (0xb mesuré : paires gagnantes 94,7¢ =
+                // complétion au complément EN CONTINU, ~4 merges/fenêtre, capital
+                // recyclé 2-3×). La PATIENCE paire-grasse (attendre le mourant
+                // bradé ≤ patient_below) refusait les paires 0,90-0,92 que la
+                // chute offre en chemin (13 juil. 20:0x) — elle ne protège plus
+                // que le PARI DÉLIBÉRÉ : tilt fort ET surplus > 1,5 clip (une
+                // accumulation FAK, pas une rotation ordinaire).
+                if tilt_for <= -0.5 && deficit > c.base_clip * 1.5 {
                     cap = cap.min(c.patient_below);
                 }
                 let price = ((bb + tick).min(cap) / tick).floor() * tick;
@@ -1057,18 +1060,31 @@ mod tests {
     }
 
     #[test]
-    fn tilt_makes_completion_patient() {
+    fn tilt_makes_completion_patient_only_for_deliberate_bet() {
         let mut e = eng();
         e.cfg.completion_max_price = 0.99;
-        e.on_fill(Side::Up, 0.60, 10.0, 0); // surplus Up (le pari)
-        // tilt +1 (Up favori) : on ne rachète le mourant Down que BRADÉ.
+        // PARI DÉLIBÉRÉ (surplus 16 > 1,5 × clip 10) + tilt fort → PATIENCE.
+        e.on_fill(Side::Up, 0.60, 16.0, 0);
         let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert!(comp.price <= e.cfg.patient_below + 1e-9, "patiente: {}", comp.price);
-        // tilt neutre : complément normal (~0.39).
+        // tilt neutre : complément (rotation) même sur gros surplus.
         let q2 = e.desired_bids_symmetric(0.55, 0.38, 200, 200, 0.01, 1.0, 0.0);
         let comp2 = q2.iter().find(|b| b.completion).expect("complétion");
         assert!(comp2.price > e.cfg.patient_below + 1e-9, "complément: {}", comp2.price);
+    }
+
+    #[test]
+    fn ordinary_surplus_rotates_at_complement_even_with_tilt() {
+        // ROTATION 0xb : un surplus ORDINAIRE (10 ≤ 1,5 × clip) s'apparie au
+        // complément même en plein trend — refuser les paires 0,90-0,92 de la
+        // chute tuait la rotation (13 juil. 20:0x).
+        let mut e = eng();
+        e.cfg.completion_max_price = 0.99;
+        e.on_fill(Side::Up, 0.60, 10.0, 0);
+        let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0);
+        let comp = q.iter().find(|b| b.completion).expect("complétion");
+        assert!(comp.price > e.cfg.patient_below + 1e-9, "rotation au complément: {}", comp.price);
     }
 
     #[test]
