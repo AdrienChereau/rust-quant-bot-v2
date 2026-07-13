@@ -33,14 +33,17 @@ pub struct Config {
     pub role: BotRole,
     pub dry_run: bool,
     pub live_armed: bool, // 2e verrou : sans lui les ordres sont signés mais JAMAIS postés
+    /// Durée maximale d'un cancel/audit non terminal avant arrêt des nouvelles
+    /// poses live. Le côté est gelé dès la première incertitude.
+    pub live_audit_max_age_s: i64,
 
     // Réseau / dashboard
     pub dashboard_port: u16,
     pub binance_ws_url: String,
-    pub signal_addr: SocketAddr,        // adresse locale d'écoute (exécuteur)
+    pub signal_addr: SocketAddr, // adresse locale d'écoute (exécuteur)
     pub signal_target: Option<SocketAddr>, // cible (radar → exécuteur)
     pub signal_target2: Option<SocketAddr>, // 2e cible optionnelle (radar → live)
-    pub use_udp_transport: bool,        // false = loopback in-process (dev local)
+    pub use_udp_transport: bool, // false = loopback in-process (dev local)
 
     // Radar (J2)
     pub obi_depth_levels: usize,
@@ -56,9 +59,9 @@ pub struct Config {
     pub obi_skew: f64,            // gain du skew OBI sur la fair de cotation
 
     // Pull anti-sélection-adverse : retirer le bid du côté qui décroche
-    pub pull_net_min: f64,   // seuil de position nette (parts) avant de pull
-    pub pull_slope: f64,     // baisse de mid/tick qui déclenche le pull
-    pub loser_thresh: f64,   // fair < ce seuil ⇒ côté perdant quasi-certain ⇒ pull
+    pub pull_net_min: f64, // seuil de position nette (parts) avant de pull
+    pub pull_slope: f64,   // baisse de mid/tick qui déclenche le pull
+    pub loser_thresh: f64, // fair < ce seuil ⇒ côté perdant quasi-certain ⇒ pull
 
     // Spread-capture taker (plan v5) — priors du guide, calibrés Phase A/C
     pub sc_c_raw: f64,
@@ -73,74 +76,78 @@ pub struct Config {
     pub sc_min_seconds: i64,
     pub sc_clip_interval_s: i64,
     pub sc_gate_margin: f64,
-    pub sc_min_window_age_s: i64,  // pas d'entrée avant N s d'âge de fenêtre
+    pub sc_min_window_age_s: i64, // pas d'entrée avant N s d'âge de fenêtre
     pub sc_completion_reserve: f64, // fraction du capital réservée à la complétion
-    pub sc_drift_horizon_s: f64,   // horizon max (s) d'extrapolation du drift dans la fair
+    pub sc_drift_horizon_s: f64,  // horizon max (s) d'extrapolation du drift dans la fair
     // v7 — rétro-ingénierie 0xb27b
-    pub sc_trend_filter: bool,        // directionnel seulement dans le sens de la tendance
-    pub sc_pullback_filter: bool,     // directionnel seulement sur micro-repli 5 s
-    pub sc_pullback_s: i64,           // horizon du micro-repli (s)
+    pub sc_trend_filter: bool, // directionnel seulement dans le sens de la tendance
+    pub sc_pullback_filter: bool, // directionnel seulement sur micro-repli 5 s
+    pub sc_pullback_s: i64,    // horizon du micro-repli (s)
     pub sc_completion_max_price: f64, // prix max d'une jambe de complétion
-    pub sc_completion_max_pair: f64,  // plafond DUR de paire (voies d'escalade : urgence/assurance)
-    pub sc_opening_stop_s: i64,       // plus d'OUVERTURES sous N s restantes (0xb27b coupe ~t=240 s)
-    pub sc_open_max_price: f64,       // jambe d'ouverture > ce prix = marché tranché → on n'ouvre pas (anti-taker)
+    pub sc_completion_max_pair: f64, // plafond DUR de paire (voies d'escalade : urgence/assurance)
+    pub sc_opening_stop_s: i64, // plus d'OUVERTURES sous N s restantes (0xb27b coupe ~t=240 s)
+    pub sc_open_max_price: f64, // jambe d'ouverture > ce prix = marché tranché → on n'ouvre pas (anti-taker)
     // v8 maker (copie complète, recalibrée sur 234 fenêtres)
-    pub sc_directional_max: f64,   // borne absolue du prix directionnel (0.90 — il charge jusqu'à 87c)
-    pub sc_directional_min: f64,   // bid directionnel INTERDIT si best_bid < ce seuil (la cible accumule le favori 66-72c, jamais le couteau)
-    pub sc_trend_confirm_s: i64,   // le drift doit garder son signe N s avant d'armer le directionnel (anti flip-flop)
-    pub sc_ofi_confirm: bool,      // veto OFI : pas de directionnel si le flux d'ordres Binance contredit le drift
-    pub sc_ofi_min: f64,           // seuil de contradiction (|OFI| ≥ min contre nous → veto ; en-dessous = bruit, on laisse)
-    pub sc_ofi_pull: f64,          // |OFI| ≥ seuil → PULL RAPIDE de l'ouverture menacée (OFI fenêtre 5s = leader ; le drift 25s réagit trop tard). [-1,1], défaut 0.4
-    pub sc_rebate_rate: f64,       // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
-    pub sc_streak_soft: u32,       // pertes consécutives → taille ×0.25
-    pub sc_streak_hard: u32,       // pertes consécutives → 1 fenêtre sur 3 à ×0.25
-    pub sc_bankroll_pct: f64,      // >0 : budget/fenêtre = pct × bankroll (recalculé au rollover) ; 0 = cap fixe
-    pub sc_symmetric: bool,        // MODE SYMÉTRIQUE : 2 bids simultanés (paire ≤ pair_target par construction), AUCUNE jambe directionnelle
+    pub sc_directional_max: f64, // borne absolue du prix directionnel (0.90 — il charge jusqu'à 87c)
+    pub sc_directional_min: f64, // bid directionnel INTERDIT si best_bid < ce seuil (la cible accumule le favori 66-72c, jamais le couteau)
+    pub sc_trend_confirm_s: i64, // le drift doit garder son signe N s avant d'armer le directionnel (anti flip-flop)
+    pub sc_ofi_confirm: bool, // veto OFI : pas de directionnel si le flux d'ordres Binance contredit le drift
+    pub sc_ofi_min: f64, // seuil de contradiction (|OFI| ≥ min contre nous → veto ; en-dessous = bruit, on laisse)
+    pub sc_ofi_pull: f64, // |OFI| ≥ seuil → PULL RAPIDE de l'ouverture menacée (OFI fenêtre 5s = leader ; le drift 25s réagit trop tard). [-1,1], défaut 0.4
+    pub sc_rebate_rate: f64, // rebate = rate × Σ 0.07·p(1−p)·taille (officiel : 20% part maker)
+    pub sc_streak_soft: u32, // pertes consécutives → taille ×0.25
+    pub sc_streak_hard: u32, // pertes consécutives → 1 fenêtre sur 3 à ×0.25
+    pub sc_bankroll_pct: f64, // >0 : budget/fenêtre = pct × bankroll (recalculé au rollover) ; 0 = cap fixe
+    pub sc_symmetric: bool, // MODE SYMÉTRIQUE : 2 bids simultanés (paire ≤ pair_target par construction), AUCUNE jambe directionnelle
     // Seuils du drift Tokyo — ÉCHELLE PAR-SECONDE (log-return/s). Le drift réel
     // vaut ~1e-5 pour un trend BTC de 60 $/min ; le bruit de l'EMA ~8e-6. Donc :
-    pub sc_urgency_drift: f64,     // ≥ ce drift/s → PULL de l'ouverture menacée + complétion maker agressive (ask−tick). Défaut 2e-5 (~74 $/min, ~2,4σ au-dessus du bruit)
-    pub sc_taker_drift: f64,       // ≥ ce drift/s → complétion TAKER immédiate (paie le marché pour ne pas mourir nu). Défaut 2.5e-5 (~93 $/min, juste au-dessus du seuil de pull)
-    pub sc_rescue_max_pair: f64,   // plafond de paire du SAUVETAGE taker à t=0 (fin de rampe). Défaut 1.23 (profil 0xb27b : complétions tardives confiantes)
-    pub sc_rescue_ramp_s: f64,     // durée (s) de la rampe AFFINE du plafond : base→rescue_max sur les N dernières s. Défaut 120
-    pub sc_dir_tilt: f64,          // BIAS DIRECTIONNEL léger : parts nettes du GAGNANT tolérées sans compléter quand drift+OFI confirment (petit pari sur Tokyo). 0 = désactivé (mesure seule). Défaut 6
+    pub sc_urgency_drift: f64, // ≥ ce drift/s → PULL de l'ouverture menacée + complétion maker agressive (ask−tick). Défaut 2e-5 (~74 $/min, ~2,4σ au-dessus du bruit)
+    pub sc_taker_drift: f64, // ≥ ce drift/s → complétion TAKER immédiate (paie le marché pour ne pas mourir nu). Défaut 2.5e-5 (~93 $/min, juste au-dessus du seuil de pull)
+    pub sc_rescue_max_pair: f64, // plafond de paire du SAUVETAGE taker à t=0 (fin de rampe). Défaut 1.23 (profil 0xb27b : complétions tardives confiantes)
+    /// Autorise explicitement un rescue qui verrouille une paire au-dessus de
+    /// 1 USDC. Désactivé par défaut : ce comportement est un choix de risque,
+    /// pas une conséquence implicite de la fin de fenêtre.
+    pub sc_allow_loss_rescue: bool,
+    pub sc_rescue_ramp_s: f64, // durée (s) de la rampe AFFINE du plafond : base→rescue_max sur les N dernières s. Défaut 120
+    pub sc_dir_tilt: f64, // BIAS DIRECTIONNEL léger : parts nettes du GAGNANT tolérées sans compléter quand drift+OFI confirment (petit pari sur Tokyo). 0 = désactivé (mesure seule). Défaut 6
     // Buffer anti-cross ADAPTATIF au σ sur les OUVERTURES (les complétions/FAK gardent le droit de croiser) : bid = ask − (1 + extra)·tick, extra = clamp(⌊(σ−lo)/span⌋, 0, max).
-    pub sc_cross_max_extra: f64,   // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
-    pub sc_ladder_levels: u32,     // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
+    pub sc_cross_max_extra: f64, // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
+    pub sc_ladder_levels: u32, // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
-    pub sc_dust_tol: f64,          // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
+    pub sc_dust_tol: f64, // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
     // ── MODE SKEW (MM incliné) : quand un signal désigne le gagnant probable,
     //    on se blinde du côté fort et on retire le côté faible ; retournement =
     //    SORTIE ÉCLAIR en FAK. Le symétrique reste le régime par défaut. ──
-    pub sc_skew: bool,             // interrupteur maître du mode skew (défaut true)
-    pub sc_skew_mult: f64,         // multiplicateur de taille du côté fort (défaut 2.0 → clips 6→12)
-    pub sc_trend_net_cap: f64,     // exposition nette MAX du pari (parts, défaut 12)
-    pub sc_pm_mom: f64,            // momentum du carnet PM (Δmid sur look_s) qui arme le skew — attrape les glissements lents invisibles pour Binance (défaut 0.06)
-    pub sc_pm_mom_look_s: i64,     // horizon du momentum PM (défaut 20 s)
-    pub sc_pm_persist_s: i64,      // le lean PM doit garder son SIGNE N s avant que le pm puisse armer/puller — un rebond de 20 s ne tient pas, un grind oui (défaut 12)
-    pub sc_skew_fak: bool,         // l'accumulation PAIE l'ask en FAK à l'armement (une fois par armement) — convertit les grinds fermes que le maker passif rate (défaut true)
-    pub sc_skew_fak_max: f64,      // prix max payé par le FAK d'accumulation (défaut 0.70)
+    pub sc_skew: bool,         // interrupteur maître du mode skew (défaut true)
+    pub sc_skew_mult: f64,     // multiplicateur de taille du côté fort (défaut 2.0 → clips 6→12)
+    pub sc_trend_net_cap: f64, // exposition nette MAX du pari (parts, défaut 12)
+    pub sc_pm_mom: f64, // momentum du carnet PM (Δmid sur look_s) qui arme le skew — attrape les glissements lents invisibles pour Binance (défaut 0.06)
+    pub sc_pm_mom_look_s: i64, // horizon du momentum PM (défaut 20 s)
+    pub sc_pm_persist_s: i64, // le lean PM doit garder son SIGNE N s avant que le pm puisse armer/puller — un rebond de 20 s ne tient pas, un grind oui (défaut 12)
+    pub sc_skew_fak: bool, // l'accumulation PAIE l'ask en FAK à l'armement (une fois par armement) — convertit les grinds fermes que le maker passif rate (défaut true)
+    pub sc_skew_fak_max: f64, // prix max payé par le FAK d'accumulation (défaut 0.70)
     pub sc_skew_complete_below: f64, // le perdant sous ce prix → complétion autorisée (verrouille la paire grasse) (défaut 0.20)
-    pub sc_cross_vol_lo: f64,      // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
-    pub sc_cross_vol_span: f64,    // σ par tick supplémentaire (défaut 0.4)
+    pub sc_cross_vol_lo: f64,        // σ en-dessous duquel aucun extra (marché calme, défaut 0.5)
+    pub sc_cross_vol_span: f64,      // σ par tick supplémentaire (défaut 0.4)
 
     // Heures UTC sans NOUVELLES entrées (nuit : jour +6,3% vs nuit −2,2% mesuré)
     pub sc_sleep_hours_utc: Vec<u32>,
     // Sélecteur de stratégie ("sc" = spread-capture taker · "gtc" = pair-GTC utilisateur)
     pub strategy: String,
     // Pair-GTC (bot parallèle port 8700)
-    pub pg_size: f64,               // X parts par ordre GTC
-    pub pg_band: f64,               // |mid_up − 0,5| ≤ band pour entrer
+    pub pg_size: f64,                // X parts par ordre GTC
+    pub pg_band: f64,                // |mid_up − 0,5| ≤ band pour entrer
     pub pg_entry_min_remaining: i64, // temps mini restant pour entrer (s)
-    pub pg_entry_deadline: i64,     // annule les GTC non fillés sous N s
-    pub pg_pair_target: f64,        // complète si avg + ask_opp + fee ≤ target
-    pub pg_require_rising: bool,    // règle : compléter seulement sur un REBOND de l'opposé
-    pub pg_rising_lookback_s: i64,  // lookback (s) pour juger « en train de remonter »
+    pub pg_entry_deadline: i64,      // annule les GTC non fillés sous N s
+    pub pg_pair_target: f64,         // complète si avg + ask_opp + fee ≤ target
+    pub pg_require_rising: bool,     // règle : compléter seulement sur un REBOND de l'opposé
+    pub pg_rising_lookback_s: i64,   // lookback (s) pour juger « en train de remonter »
 
     // Avellaneda-Stoikov + reward (J7)
     pub gamma: f64,
     pub kappa: f64,
-    pub our_size: f64,            // taille de nos ordres (tokens) — legacy/test
-    pub reward_pool_per_min: f64, // pool de reward estimé ($/min)
+    pub our_size: f64,               // taille de nos ordres (tokens) — legacy/test
+    pub reward_pool_per_min: f64,    // pool de reward estimé ($/min)
     pub base_half_spread_cents: f64, // R2 : demi-spread de base (remplace le terme A-S mal échelonné)
 
     // Bankroll / gates (R4)
@@ -174,7 +181,10 @@ pub struct Config {
 }
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Config {
@@ -187,17 +197,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| ([127, 0, 0, 1], signal_port).into());
 
-        let signal_target: Option<SocketAddr> = env::var("SIGNAL_TARGET")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let signal_target2: Option<SocketAddr> = env::var("SIGNAL_TARGET2")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let signal_target: Option<SocketAddr> =
+            env::var("SIGNAL_TARGET").ok().and_then(|s| s.parse().ok());
+        let signal_target2: Option<SocketAddr> =
+            env::var("SIGNAL_TARGET2").ok().and_then(|s| s.parse().ok());
 
         Self {
             role: BotRole::from_env(),
             dry_run: env_or("DRY_RUN", true),
             live_armed: env_or("LIVE_ARMED", false),
+            live_audit_max_age_s: env_or("LIVE_AUDIT_MAX_AGE_S", 120),
 
             dashboard_port,
             binance_ws_url: env::var("BINANCE_WS_URL").unwrap_or_else(|_| {
@@ -239,8 +248,12 @@ impl Config {
             sc_min_window_age_s: env_or("SC_MIN_WINDOW_AGE_S", 15),
             sc_completion_reserve: env_or("SC_COMPLETION_RESERVE", 0.5),
             sc_drift_horizon_s: env_or("SC_DRIFT_HORIZON_S", 60.0),
-            sc_trend_filter: std::env::var("SC_TREND_FILTER").map(|v| v != "false").unwrap_or(true),
-            sc_pullback_filter: std::env::var("SC_PULLBACK_FILTER").map(|v| v != "false").unwrap_or(true),
+            sc_trend_filter: std::env::var("SC_TREND_FILTER")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+            sc_pullback_filter: std::env::var("SC_PULLBACK_FILTER")
+                .map(|v| v != "false")
+                .unwrap_or(true),
             sc_pullback_s: env_or("SC_PULLBACK_S", 5),
             sc_completion_max_price: env_or("SC_COMPLETION_MAX_PRICE", 0.65),
             sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.02),
@@ -265,6 +278,7 @@ impl Config {
             sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00001),
             sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.000012),
             sc_rescue_max_pair: env_or("SC_RESCUE_MAX_PAIR", 1.23),
+            sc_allow_loss_rescue: env_or("SC_ALLOW_LOSS_RESCUE", false),
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
             sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),

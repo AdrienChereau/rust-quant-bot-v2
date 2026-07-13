@@ -13,7 +13,7 @@ use crate::bankroll::BankrollEngine;
 use crate::config::Config;
 use crate::connectors::binance;
 use crate::connectors::polymarket::{Market, PolyBook, PolymarketClient};
-use crate::dashboard::{Shared, SeriesPoint, WindowResult};
+use crate::dashboard::{SeriesPoint, Shared, WindowResult};
 use crate::engines::pair_gtc::{Action, PairGtcConfig, PairGtcEngine};
 use crate::inventory::PaperEngine;
 use crate::signal::SignalTransport;
@@ -27,7 +27,11 @@ fn best_ask_level(book: &PolyBook) -> Option<(f64, f64)> {
         .map(|l| (l.price, l.size))
 }
 
-pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared) -> anyhow::Result<()> {
+pub async fn run(
+    cfg: Config,
+    transport: Arc<dyn SignalTransport>,
+    dash: Shared,
+) -> anyhow::Result<()> {
     tracing::info!(
         role = "executor-gtc",
         dry_run = cfg.dry_run,
@@ -63,8 +67,12 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
 
     let client = PolymarketClient::new();
     let mut paper = PaperEngine::load_or_init(
-        cfg.start_cash, cfg.max_position, cfg.min_merge_threshold, cfg.safety_mult,
-        cfg.state_path.clone(), cfg.trades_path.clone(),
+        cfg.start_cash,
+        cfg.max_position,
+        cfg.min_merge_threshold,
+        cfg.safety_mult,
+        cfg.state_path.clone(),
+        cfg.trades_path.clone(),
     );
     let mut engine = PairGtcEngine::new(PairGtcConfig {
         size: cfg.pg_size,
@@ -92,7 +100,9 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
     loop {
         poll.tick().await;
 
-        let need_resolve = current.as_ref().map_or(true, |m| m.time_remaining_sec() <= 0);
+        let need_resolve = current
+            .as_ref()
+            .map_or(true, |m| m.time_remaining_sec() <= 0);
         if need_resolve {
             if let (Some(prev), Some(prev_strike)) = (current.as_ref(), strike) {
                 let close = binance::price_at_window_open(prev.window_ts + 300)
@@ -110,9 +120,18 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                         d.windows.push(WindowResult {
                             start: prev.window_ts,
                             res: if up_won { "Up".into() } else { "Down".into() },
-                            fills: 0, avg_up: 0.0, avg_dn: 0.0, pair_cost: 0.0,
-                            imb_max: 0.0, imb_final: 0.0, deployed: 0.0, merged: 0.0,
-                            rebate: 0.0, pnl: delta,
+                            fills: 0,
+                            avg_up: 0.0,
+                            avg_dn: 0.0,
+                            pair_cost: 0.0,
+                            imb_max: 0.0,
+                            imb_final: 0.0,
+                            deployed: 0.0,
+                            merged: 0.0,
+                            rebate: 0.0,
+                            pnl: delta,
+                            purposes: Default::default(),
+                            pnl_unattributed: delta,
                         });
                         let n = d.windows.len();
                         if n > 60 {
@@ -136,8 +155,15 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                     tracing::info!(slug = %m.slug, remaining_s = m.time_remaining_sec(), "=== [GTC] nouveau marché ===");
                     current = Some(m);
                 }
-                Ok(None) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
-                Err(e) => { tracing::error!(error=%e,"[GTC] découverte marché"); tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error=%e,"[GTC] découverte marché");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
             }
         }
         let Some(m) = &current else { continue };
@@ -161,15 +187,26 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
             (Ok(u), Ok(d)) => (u, d),
             _ => continue,
         };
-        let (Some(up_mid), Some(down_mid)) = (up_book.mid(), down_book.mid()) else { continue };
-        let (bb_up, ba_up) = (up_book.best_bid().unwrap_or(0.0), best_ask_level(&up_book).map(|x| x.0).unwrap_or(0.0));
-        let (bb_dn, ba_dn) = (down_book.best_bid().unwrap_or(0.0), best_ask_level(&down_book).map(|x| x.0).unwrap_or(0.0));
+        let (Some(up_mid), Some(down_mid)) = (up_book.mid(), down_book.mid()) else {
+            continue;
+        };
+        let (bb_up, ba_up) = (
+            up_book.best_bid().unwrap_or(0.0),
+            best_ask_level(&up_book).map(|x| x.0).unwrap_or(0.0),
+        );
+        let (bb_dn, ba_dn) = (
+            down_book.best_bid().unwrap_or(0.0),
+            best_ask_level(&down_book).map(|x| x.0).unwrap_or(0.0),
+        );
 
         // Rebond : mid en hausse d'au moins ½ tick sur le lookback (règle « montée »).
         let now_ms = chrono::Utc::now().timestamp_millis();
         mid_hist.push_back((now_ms, up_mid, down_mid));
         let cutoff = now_ms - cfg.pg_rising_lookback_s * 1000;
-        while mid_hist.front().map_or(false, |(t, _, _)| *t < cutoff - 2000) {
+        while mid_hist
+            .front()
+            .map_or(false, |(t, _, _)| *t < cutoff - 2000)
+        {
             mid_hist.pop_front();
         }
         let half_tick = m.tick_size / 2.0;
@@ -180,12 +217,26 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
             .unwrap_or((false, false));
 
         // Machine à états de la stratégie.
-        for act in engine.on_tick(up_mid, bb_up, ba_up, bb_dn, ba_dn, m.tick_size, m.time_remaining_sec(), rising_up, rising_dn) {
+        for act in engine.on_tick(
+            up_mid,
+            bb_up,
+            ba_up,
+            bb_dn,
+            ba_dn,
+            m.tick_size,
+            m.time_remaining_sec(),
+            rising_up,
+            rising_dn,
+        ) {
             match act {
                 Action::MakerFill { side, price, size } => {
                     if paper.try_buy(side.as_str(), price, size, "maker") {
-                        tracing::info!(side = side.as_str(), px = format!("{price:.3}"),
-                            size = format!("{size:.0}"), "[GTC] jambe fillée (cross)");
+                        tracing::info!(
+                            side = side.as_str(),
+                            px = format!("{price:.3}"),
+                            size = format!("{size:.0}"),
+                            "[GTC] jambe fillée (cross)"
+                        );
                     }
                 }
                 Action::CancelGtc { side } => {
@@ -193,8 +244,12 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                 }
                 Action::TakerBuy { side, price, size } => {
                     if paper.try_buy(side.as_str(), price, size, "taker") {
-                        tracing::info!(side = side.as_str(), px = format!("{price:.3}"),
-                            size = format!("{size:.0}"), "[GTC] paire complétée ✓");
+                        tracing::info!(
+                            side = side.as_str(),
+                            px = format!("{price:.3}"),
+                            size = format!("{size:.0}"),
+                            "[GTC] paire complétée ✓"
+                        );
                     }
                 }
             }

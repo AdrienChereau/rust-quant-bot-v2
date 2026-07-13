@@ -40,9 +40,9 @@ pub struct DashboardState {
     pub remaining_s: i64,
     pub sigma: f64,
     pub fair: f64,
-    pub drift: f64,     // drift log/s injecté dans p_up (correctif tendance)
-    pub obi_exec: f64,  // OBI carnet Binance côté exécuteur (skew de cotation)
-    pub ofi: f64,       // OFI normalisé [-1,1] (flux d'ordres Binance)
+    pub drift: f64,    // drift log/s injecté dans p_up (correctif tendance)
+    pub obi_exec: f64, // OBI carnet Binance côté exécuteur (skew de cotation)
+    pub ofi: f64,      // OFI normalisé [-1,1] (flux d'ordres Binance)
     pub up_mid: f64,
     pub up_bid: f64,
     pub up_ask: f64,
@@ -55,11 +55,19 @@ pub struct DashboardState {
     #[serde(default)]
     pub signal_age_ms: i64, // latence : âge du dernier signal Tokyo (fraîcheur des données)
     #[serde(default)]
-    pub open_orders: u32,   // nombre de bids restants au carnet (échelle : 0-4)
+    pub open_orders: u32, // nombre de bids restants au carnet (échelle : 0-4)
     #[serde(default)]
-    pub order_rtt_ms: u64,  // RTT réel de la dernière requête CLOB (POST d'ordre ou poll) — Dublin ↔ serveur Polymarket
+    pub order_rtt_ms: u64, // RTT réel de la dernière requête CLOB (POST d'ordre ou poll) — Dublin ↔ serveur Polymarket
     #[serde(default)]
-    pub skew_side: String,  // "" = symétrique · "up"/"down" = MM incliné côté fort (mode skew actif)
+    pub audit_orders: u32, // ordres dont le statut terminal reste à confirmer
+    #[serde(default)]
+    pub audit_oldest_ms: i64,
+    #[serde(default)]
+    pub live_halted: bool,
+    #[serde(default)]
+    pub live_halt_reason: String,
+    #[serde(default)]
+    pub skew_side: String, // "" = symétrique · "up"/"down" = MM incliné côté fort (mode skew actif)
     // Spread-capture v5
     pub pair_cost: f64, // coût de paire blended courant (0 si un côté vide)
     #[serde(default)]
@@ -72,14 +80,14 @@ pub struct DashboardState {
     pub dir_wins: u32, // fenêtres où la conviction directionnelle FORTE de Tokyo a visé juste
     #[serde(default)]
     pub dir_total: u32, // fenêtres avec conviction forte (précision = wins/total ; l'edge Tokyo se juge ici)
-    pub deployed: f64,  // $ déployés sur la fenêtre courante
-    pub window_start: i64, // unix s du début de la fenêtre courante (graphique)
-    pub rebate_window: f64, // rebate estimé de la fenêtre courante
-    pub rebate_total: f64,  // rebate estimé cumulé depuis le lancement
+    pub deployed: f64,        // $ déployés sur la fenêtre courante
+    pub window_start: i64,    // unix s du début de la fenêtre courante (graphique)
+    pub rebate_window: f64,   // rebate estimé de la fenêtre courante
+    pub rebate_total: f64,    // rebate estimé cumulé depuis le lancement
     pub live_collateral: f64, // USDC réel du wallet (mode live, sync ≤10 s + fills)
     pub live_wallet_pnl: f64, // collatéral − baseline : le SEUL PnL qui fait foi en live
-    pub size_factor: f64,   // disjoncteur de séries perdantes (1.0 / 0.25 / 0)
-    pub loss_streak: u32,   // pertes consécutives en cours
+    pub size_factor: f64,     // disjoncteur de séries perdantes (1.0 / 0.25 / 0)
+    pub loss_streak: u32,     // pertes consécutives en cours
     // Paramètres de stratégie réellement chargés (affichés dans le panneau « Stratégie »).
     pub params: StrategyParams,
     pub signals_received: u64,
@@ -149,6 +157,43 @@ pub struct WindowResult {
     pub merged: f64,
     pub rebate: f64, // rebate maker estimé (rate × Σ 0,07·p(1−p)·taille)
     pub pnl: f64,    // PnL trading réalisé de la fenêtre (hors rebate)
+    /// Attribution d'exécution par intention. Les PnL de règlement restent
+    /// explicitement non attribués tant que les lots FIFO historiques ne sont
+    /// pas disponibles (un chiffre inventé serait plus dangereux qu'un zéro).
+    #[serde(default)]
+    pub purposes: PurposeBreakdown,
+    #[serde(default)]
+    pub pnl_unattributed: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionPurposeStats {
+    pub fills: u32,
+    pub buy_notional: f64,
+    pub sell_notional: f64,
+    pub taker_fees: f64,
+    pub maker_rebate: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PurposeBreakdown {
+    pub symmetric_open: ExecutionPurposeStats,
+    pub completion: ExecutionPurposeStats,
+    pub skew_accumulation: ExecutionPurposeStats,
+    pub rescue: ExecutionPurposeStats,
+    pub flatten: ExecutionPurposeStats,
+}
+
+impl PurposeBreakdown {
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    pub fn for_order_intent(&mut self, intent: &str) -> &mut ExecutionPurposeStats {
+        match intent {
+            "completion" => &mut self.completion,
+            "skew_accumulation" => &mut self.skew_accumulation,
+            "rescue" => &mut self.rescue,
+            _ => &mut self.symmetric_open,
+        }
+    }
 }
 
 /// Paramètres de stratégie chargés au démarrage (source : .env / défauts).
@@ -211,7 +256,9 @@ pub fn shared(dry_run: bool, role: &str) -> Shared {
     // déploiement. Le paper, lui, démarre ON (aucun risque, données continues).
     let trading_enabled = dry_run;
     if !dry_run {
-        tracing::warn!("LIVE démarré interrupteur OFF — activer le trading via le bouton ON du dashboard");
+        tracing::warn!(
+            "LIVE démarré interrupteur OFF — activer le trading via le bouton ON du dashboard"
+        );
     }
     Arc::new(RwLock::new(DashboardState {
         dry_run,
@@ -249,7 +296,9 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let Ok(n) = sock.read(&mut buf).await else { return };
+            let Ok(n) = sock.read(&mut buf).await else {
+                return;
+            };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req
                 .split_whitespace()
@@ -263,11 +312,21 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 "/" | "/index.html" => {
                     // Le rôle choisit l'interface : Tokyo a la sienne.
                     let radar = state.read().await.role == "radar";
-                    ("text/html; charset=utf-8", if radar { RADAR_HTML.to_string() } else { INDEX_HTML.to_string() })
+                    (
+                        "text/html; charset=utf-8",
+                        if radar {
+                            RADAR_HTML.to_string()
+                        } else {
+                            INDEX_HTML.to_string()
+                        },
+                    )
                 }
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
                 "/app.js" => ("application/javascript; charset=utf-8", APP_JS.to_string()),
-                "/radar.js" => ("application/javascript; charset=utf-8", RADAR_JS.to_string()),
+                "/radar.js" => (
+                    "application/javascript; charset=utf-8",
+                    RADAR_JS.to_string(),
+                ),
                 "/start" | "/stop" => {
                     let on = path == "/start";
                     state.write().await.trading_enabled = on;
@@ -283,7 +342,10 @@ pub async fn serve(port: u16, state: Shared) -> anyhow::Result<()> {
                 }
                 "/logs" => {
                     let lines = crate::logbuf::tail(250);
-                    ("application/json", serde_json::to_string(&lines).unwrap_or_else(|_| "[]".into()))
+                    (
+                        "application/json",
+                        serde_json::to_string(&lines).unwrap_or_else(|_| "[]".into()),
+                    )
                 }
                 "/events" => {
                     let tp = { state.read().await.trades_path.clone() };

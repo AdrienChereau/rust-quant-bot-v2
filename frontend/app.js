@@ -232,7 +232,8 @@ async function tickEvents() {
     const det = t.kind === 'merge' ? `${f(t.size, 0)} paires → +${f(t.size, 0)}$`
       : t.kind === 'resolve' ? `${t.side} gagne · payout ${f(t.size, 0)}$`
       : `${t.side} ${f(t.size, 0)} @ ${cents(t.price)}`;
-    return `<div><span class="mut">${time}</span> <span style="color:${kc[t.kind] || '#fff'}">${t.kind}</span> ${det}</div>`;
+    const purpose = t.purpose ? ` <span class="mut">[${t.purpose}]</span>` : '';
+    return `<div><span class="mut">${time}</span> <span style="color:${kc[t.kind] || '#fff'}">${t.kind}</span> ${det}${purpose}</div>`;
   }).join(''));
 }
 

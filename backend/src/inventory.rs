@@ -54,6 +54,7 @@ struct TradeRecord<'a> {
     kind: &'a str,
     side: &'a str,
     liquidity_type: &'a str,
+    purpose: &'a str,
     price: f64,
     size: f64,
     cash_after: f64,
@@ -76,8 +77,12 @@ impl PaperEngine {
                 ..Default::default()
             });
         tracing::info!(
-            cash = state.cash_usdc, up = state.up_balance, down = state.down_balance,
-            fills = state.fills, merges = state.merges, "État paper chargé"
+            cash = state.cash_usdc,
+            up = state.up_balance,
+            down = state.down_balance,
+            fills = state.fills,
+            merges = state.merges,
+            "État paper chargé"
         );
         Self {
             state,
@@ -91,7 +96,11 @@ impl PaperEngine {
     }
 
     fn side_balance(&self, side: &str) -> f64 {
-        if side == "up" { self.state.up_balance } else { self.state.down_balance }
+        if side == "up" {
+            self.state.up_balance
+        } else {
+            self.state.down_balance
+        }
     }
 
     /// Applique un ACHAT de `size` tokens à `price` (R3 : taille et prix décidés en
@@ -113,8 +122,12 @@ impl PaperEngine {
             _ => self.state.down_balance += size,
         }
         self.state.fills += 1;
-        if liquidity_type == "maker" { self.state.maker_fills += 1 } else { self.state.taker_fills += 1 }
-        self.append_trade("buy", side, liquidity_type, price, size);
+        if liquidity_type == "maker" {
+            self.state.maker_fills += 1
+        } else {
+            self.state.taker_fills += 1
+        }
+        self.append_trade("buy", side, liquidity_type, "symmetric_open", price, size);
         true
     }
 
@@ -126,6 +139,20 @@ impl PaperEngine {
     /// enregistre la réalité, il ne la valide pas.)
     #[allow(dead_code)] // chemin live (cfg feature)
     pub fn apply_live_fill(&mut self, side: &str, price: f64, size: f64, liquidity_type: &str) {
+        self.apply_live_fill_with_purpose(side, price, size, liquidity_type, "symmetric_open");
+    }
+
+    /// Variante live annotée. Le purpose vient de l'intention immuable stockée
+    /// sur l'ordre CLOB, jamais d'une inférence a posteriori.
+    #[allow(dead_code)]
+    pub fn apply_live_fill_with_purpose(
+        &mut self,
+        side: &str,
+        price: f64,
+        size: f64,
+        liquidity_type: &str,
+        purpose: &str,
+    ) {
         if size <= 0.0 {
             return;
         }
@@ -137,14 +164,30 @@ impl PaperEngine {
             _ => self.state.down_balance += size,
         }
         self.state.fills += 1;
-        if liquidity_type == "maker" { self.state.maker_fills += 1 } else { self.state.taker_fills += 1 }
-        self.append_trade("buy", side, liquidity_type, price, size);
+        if liquidity_type == "maker" {
+            self.state.maker_fills += 1
+        } else {
+            self.state.taker_fills += 1
+        }
+        self.append_trade("buy", side, liquidity_type, purpose, price, size);
     }
 
     /// Applique une VENTE de `size` tokens à `price`. Pas de vente à découvert :
     /// on ne vend que ce qu'on détient.
     #[allow(dead_code)] // réservé au chemin live
     pub fn try_sell(&mut self, side: &str, price: f64, size: f64, liquidity_type: &str) -> bool {
+        self.try_sell_with_purpose(side, price, size, liquidity_type, "flatten")
+    }
+
+    #[allow(dead_code)]
+    pub fn try_sell_with_purpose(
+        &mut self,
+        side: &str,
+        price: f64,
+        size: f64,
+        liquidity_type: &str,
+        purpose: &str,
+    ) -> bool {
         let held = self.side_balance(side);
         let qty = size.min(held);
         if qty <= 0.0 {
@@ -157,8 +200,12 @@ impl PaperEngine {
         }
         self.state.fills += 1;
         self.state.sells += 1;
-        if liquidity_type == "maker" { self.state.maker_fills += 1 } else { self.state.taker_fills += 1 }
-        self.append_trade("sell", side, liquidity_type, price, qty);
+        if liquidity_type == "maker" {
+            self.state.maker_fills += 1
+        } else {
+            self.state.taker_fills += 1
+        }
+        self.append_trade("sell", side, liquidity_type, purpose, price, qty);
         true
     }
 
@@ -185,9 +232,10 @@ impl PaperEngine {
         self.state.down_balance -= mergeable;
         self.state.cash_usdc += mergeable; // 1 USDC par paire détruite
         self.state.merges += 1;
-        self.append_trade("merge", "ctf", "n/a", 1.0, mergeable);
+        self.append_trade("merge", "ctf", "n/a", "merge", 1.0, mergeable);
         tracing::info!(
-            merged = mergeable, cash = self.state.cash_usdc,
+            merged = mergeable,
+            cash = self.state.cash_usdc,
             "[CTF] Fusion — collatéral libéré"
         );
         mergeable
@@ -232,13 +280,23 @@ impl PaperEngine {
         // Coût de base déjà déduit du cash à l'achat → le payout est du cash brut.
         self.state.cash_usdc += payout;
         self.state.realized_pnl = self.state.cash_usdc - self.start_cash;
-        self.append_trade("resolve", if up_won { "up" } else { "down" }, "n/a", 1.0, payout);
+        self.append_trade(
+            "resolve",
+            if up_won { "up" } else { "down" },
+            "n/a",
+            "resolution",
+            1.0,
+            payout,
+        );
         self.state.up_balance = 0.0;
         self.state.down_balance = 0.0;
         self.state.markets_resolved += 1;
         tracing::info!(
-            up_won, payout, cash = self.state.cash_usdc,
-            realized_pnl = self.state.realized_pnl, "Marché résolu"
+            up_won,
+            payout,
+            cash = self.state.cash_usdc,
+            realized_pnl = self.state.realized_pnl,
+            "Marché résolu"
         );
     }
 
@@ -261,12 +319,21 @@ impl PaperEngine {
         }
     }
 
-    fn append_trade(&self, kind: &str, side: &str, liquidity_type: &str, price: f64, size: f64) {
+    fn append_trade(
+        &self,
+        kind: &str,
+        side: &str,
+        liquidity_type: &str,
+        purpose: &str,
+        price: f64,
+        size: f64,
+    ) {
         let rec = TradeRecord {
             ts: chrono::Utc::now().to_rfc3339(),
             kind,
             side,
             liquidity_type,
+            purpose,
             price,
             size,
             cash_after: self.state.cash_usdc,
@@ -319,8 +386,12 @@ mod tests {
     #[test]
     fn buy_blocked_at_max_position() {
         let mut e = PaperEngine::load_or_init(
-            1000.0, 60.0, 5.0, 3.0,
-            "/tmp/t_s.json".into(), "/tmp/t_t.jsonl".into(),
+            1000.0,
+            60.0,
+            5.0,
+            3.0,
+            "/tmp/t_s.json".into(),
+            "/tmp/t_t.jsonl".into(),
         );
         e.state.up_balance = 40.0;
         assert!(!e.try_buy("up", 0.10, 50.0, "maker")); // 40+50 > 60

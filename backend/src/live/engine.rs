@@ -15,10 +15,11 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
 use super::auth::LiveCredentials;
-use super::orders::{self, OrderArgs, PlaceResult};
+use super::orders::{self, CancelStatus, OrderArgs, PlaceResult};
 use super::relayer::{RelayerCtx, TxOutcome};
 
 /// Résultat du lancement d'un merge.
@@ -30,6 +31,28 @@ pub enum MergeStart {
 }
 use super::user_ws::{self, OrderUpdate};
 
+/// Intention économique de l'ordre. Elle est propagée jusqu'au journal des
+/// fills afin de distinguer les revenus du market making des assurances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderIntent {
+    SymmetricOpen,
+    Completion,
+    SkewAccumulation,
+    Rescue,
+}
+
+impl OrderIntent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SymmetricOpen => "symmetric_open",
+            Self::Completion => "completion",
+            Self::SkewAccumulation => "skew_accumulation",
+            Self::Rescue => "rescue",
+        }
+    }
+}
+
 /// Fill prêt pour la boucle stratégie.
 #[derive(Debug, Clone)]
 pub struct LiveFill {
@@ -37,6 +60,8 @@ pub struct LiveFill {
     pub price: f64,
     pub size: f64,
     pub maker: bool,
+    pub intent: OrderIntent,
+    pub condition_id: String,
 }
 
 /// Un slot de l'ÉCHELLE de quoting : un ordre restant + son adresse
@@ -47,6 +72,7 @@ pub struct LiveSlot {
     pub r: RestingOrder,
     pub is_up: bool,
     pub level: u8,
+    pub intent: OrderIntent,
 }
 
 /// Un de NOS ordres restants.
@@ -57,6 +83,8 @@ pub struct RestingOrder {
     pub size: f64,
     pub matched: f64,   // cumul fillé déjà comptabilisé (recopié du grand livre)
     pub placed_ms: i64, // epoch ms du POST — un ordre trop frais peut être absent du poll (lag d'indexation)
+    pub intent: OrderIntent,
+    pub condition_id: String,
 }
 
 /// UNE ligne du GRAND LIVRE par ordre (clé = order_id). C'est la SEULE source de
@@ -72,6 +100,136 @@ struct LedgerEntry {
     size: f64,    // taille d'origine de l'ordre (plafond dur du cumul)
     counted: f64, // cumul déjà ÉMIS en LiveFill (le size_matched absolu déjà pris en compte)
     price: f64,   // prix limite (valorise les fills maker)
+    intent: OrderIntent,
+    condition_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct OrderMeta {
+    is_up: bool,
+    maker: bool,
+    intent: OrderIntent,
+    condition_id: String,
+}
+
+/// Ordre dont le statut final reste incertain. Il reste volontairement dans
+/// l'exposition jusqu'à confirmation terminale afin de ne jamais repost par-dessus.
+#[derive(Debug, Clone)]
+struct AuditOrder {
+    r: RestingOrder,
+    is_up: bool,
+    tries: u32,
+    cancel_requested: bool,
+}
+
+/// Exposition acheteuse encore susceptible d'être exécutée. Les audits sont
+/// comptés à leur taille restante maximale : c'est conservateur par conception.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenExposure {
+    pub up: f64,
+    pub down: f64,
+    pub completion_up: f64,
+    pub completion_down: f64,
+    pub uncertain_up: f64,
+    pub uncertain_down: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderTerminalState {
+    Terminal,
+    Open,
+    Unknown,
+}
+
+fn order_terminal_state(value: &serde_json::Value) -> OrderTerminalState {
+    let status = value
+        .get("status")
+        .or_else(|| value.get("order_status"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if [
+        "CANCELED",
+        "CANCELLED",
+        "MATCHED",
+        "FILLED",
+        "EXPIRED",
+        "CLOSED",
+    ]
+    .iter()
+    .any(|needle| status.contains(needle))
+    {
+        OrderTerminalState::Terminal
+    } else if ["LIVE", "OPEN", "PENDING", "MATCHING"]
+        .iter()
+        .any(|needle| status.contains(needle))
+    {
+        OrderTerminalState::Open
+    } else {
+        OrderTerminalState::Unknown
+    }
+}
+
+impl OpenExposure {
+    pub fn side(self, is_up: bool) -> f64 {
+        if is_up {
+            self.up
+        } else {
+            self.down
+        }
+    }
+
+    pub fn completion_side(self, is_up: bool) -> f64 {
+        if is_up {
+            self.completion_up
+        } else {
+            self.completion_down
+        }
+    }
+
+    pub fn uncertain_side(self, is_up: bool) -> f64 {
+        if is_up {
+            self.uncertain_up
+        } else {
+            self.uncertain_down
+        }
+    }
+}
+
+fn aggregate_open_exposure(rest: &[LiveSlot], audit: &[AuditOrder]) -> OpenExposure {
+    let mut out = OpenExposure::default();
+    let mut add = |is_up: bool, intent: OrderIntent, qty: f64, uncertain: bool| {
+        let qty = qty.max(0.0);
+        if is_up {
+            out.up += qty;
+            if intent == OrderIntent::Completion {
+                out.completion_up += qty;
+            }
+            if uncertain {
+                out.uncertain_up += qty;
+            }
+        } else {
+            out.down += qty;
+            if intent == OrderIntent::Completion {
+                out.completion_down += qty;
+            }
+            if uncertain {
+                out.uncertain_down += qty;
+            }
+        }
+    };
+    for slot in rest {
+        add(slot.is_up, slot.intent, slot.r.size - slot.r.matched, false);
+    }
+    for audit in audit {
+        add(
+            audit.is_up,
+            audit.r.intent,
+            audit.r.size - audit.r.matched,
+            true,
+        );
+    }
+    out
 }
 
 pub struct LiveCtx {
@@ -83,8 +241,8 @@ pub struct LiveCtx {
     up_token: String,
     dn_token: String,
     condition_id: String,
-    // ordre_id → (is_up, maker) — secours d'attribution quand l'asset_id manque
-    order_side: HashMap<String, (bool, bool)>,
+    // ordre_id → métadonnées immuables, y compris intention et marché d'origine.
+    order_side: HashMap<String, OrderMeta>,
     /// GRAND LIVRE par ordre : la seule comptabilité de fills. Tous les canaux
     /// (POST, event `order`, poll, récolte) créditent via `credit()` avec un
     /// size_matched ABSOLU → aucun double comptage possible. Purgé au rollover.
@@ -117,12 +275,21 @@ pub struct LiveCtx {
     /// en échec au moment du cancel). Un fill ne doit JAMAIS être perdu : le poll
     /// réinterroge ces ordres jusqu'à obtenir la vérité (incident du 8 juil. :
     /// Up 5@56¢ fillé, lecture ratée, ordre oublié → fausse complétion à 62¢).
-    audit: Vec<(RestingOrder, bool, u32)>, // (ordre, is_up, tentatives)
+    audit: Vec<AuditOrder>,
+    audit_max_age_ms: i64,
+    /// Un invariant d'exécution irréconciliable arrête les nouvelles poses sans
+    /// masquer les positions existantes. Le dashboard reste utilisable pour
+    /// l'intervention manuelle.
+    pub halted_reason: Option<String>,
 }
 
 impl LiveCtx {
     /// Démarrage : auth SDK + sync allowance + WS user + heartbeats (dead-man).
-    pub async fn start(creds: LiveCredentials, armed: bool) -> anyhow::Result<Self> {
+    pub async fn start(
+        creds: LiveCredentials,
+        armed: bool,
+        audit_max_age_s: i64,
+    ) -> anyhow::Result<Self> {
         orders::startup(&creds).await?;
         let collateral = super::auth::get_collateral_balance(&creds).await?;
         tracing::info!(collateral, armed, "LIVE démarré — collatéral USDC réel");
@@ -172,6 +339,8 @@ impl LiveCtx {
             post_fills: Vec::new(),
             sell_ids: std::collections::HashSet::new(),
             audit: Vec::new(),
+            audit_max_age_ms: audit_max_age_s.max(1) * 1_000,
+            halted_reason: None,
         })
     }
 
@@ -188,6 +357,12 @@ impl LiveCtx {
         self.order_side.clear();
         self.ledger.clear(); // nouveau marché = nouveaux order_ids
         self.sell_ids.clear();
+        self.post_fills.clear();
+        self.audit.clear();
+        // Une confirmation d'ancien merge ne doit jamais créditer le miroir de
+        // la nouvelle condition. La position réelle sera resynchronisée.
+        self.merge_inflight = None;
+        self.positions_dirty = true;
         let _ = self.cond_tx.send(Some(condition_id.to_string()));
         // Métadonnées RAW du nouveau marché (tick exact par token).
         if let Err(e) = orders::preload_token_meta(&[up_token, dn_token]).await {
@@ -221,14 +396,58 @@ impl LiveCtx {
             && self.merge_inflight.is_none()
             && self.armed
             && now - self.last_merge_attempt_ms >= 10_000 // garde technique anti-spam
-        // (le VRAI cooldown stratégique — paire > 1$ — vit dans l'executor ;
-        //  ici : 10 s entre tentatives, pénalité +35 s sur échec relayer)
+                                                          // (le VRAI cooldown stratégique — paire > 1$ — vit dans l'executor ;
+                                                          //  ici : 10 s entre tentatives, pénalité +35 s sur échec relayer)
     }
 
     /// Force la resynchronisation du collatéral au prochain tick.
     pub fn force_cash_resync(&mut self) {
         self.last_cash_sync_ms = 0;
         self.positions_dirty = true;
+    }
+
+    /// Arrête les nouvelles poses après une violation d'invariant. Les ordres
+    /// existants sont ensuite annulés/réconciliés par la boucle normale.
+    pub fn halt(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.halted_reason.is_none() {
+            tracing::error!(reason = %reason, "LIVE HALTED — invariant d'exécution violé");
+            self.halted_reason = Some(reason);
+        }
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted_reason.is_some()
+    }
+
+    pub fn audit_count(&self) -> u32 {
+        self.audit.len() as u32
+    }
+
+    pub fn audit_oldest_age_ms(&self, now_ms: i64) -> i64 {
+        self.audit
+            .iter()
+            .map(|audit| now_ms.saturating_sub(audit.r.placed_ms))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Exposition de tous les achats encore vivants. Un ordre en audit reste
+    /// compté au reliquat complet jusqu'à preuve qu'il est terminal.
+    pub fn open_exposure(&self, rest: &[LiveSlot]) -> OpenExposure {
+        aggregate_open_exposure(rest, &self.audit)
+    }
+
+    fn audit_order(&mut self, r: RestingOrder, is_up: bool, cancel_requested: bool) {
+        if self.audit.iter().any(|a| a.r.order_id == r.order_id) {
+            return;
+        }
+        self.audit.push(AuditOrder {
+            r,
+            is_up,
+            tries: 0,
+            cancel_requested,
+        });
     }
 
     /// Positions RÉELLES (up, down) en parts, depuis le CLOB (vérité on-chain).
@@ -266,7 +485,11 @@ impl LiveCtx {
         match (up, dn) {
             (Ok(u), Ok(d)) => Some((u, d)),
             (u, d) => {
-                tracing::warn!(?u, ?d, "lecture positions on-chain (merge) échouée — merge sauté ce tick");
+                tracing::warn!(
+                    ?u,
+                    ?d,
+                    "lecture positions on-chain (merge) échouée — merge sauté ce tick"
+                );
                 None
             }
         }
@@ -279,7 +502,9 @@ impl LiveCtx {
     pub async fn start_merge(&mut self, pairs: f64) -> MergeStart {
         self.last_merge_attempt_ms = chrono::Utc::now().timestamp_millis();
         let cond = self.condition_id.clone();
-        let Some(r) = self.relayer.as_mut() else { return MergeStart::Err };
+        let Some(r) = self.relayer.as_mut() else {
+            return MergeStart::Err;
+        };
         match r.merge(&cond, pairs).await {
             Ok(rx) => {
                 self.merge_inflight = Some((pairs, rx));
@@ -347,27 +572,83 @@ impl LiveCtx {
         price: f64,
         size: f64,
         post_only: bool,
+        intent: OrderIntent,
     ) -> Option<RestingOrder> {
-        let token = if is_up { &self.up_token } else { &self.dn_token };
-        let args = OrderArgs { price, size, is_sell: false, gtc: true, post_only };
+        if self.is_halted() {
+            tracing::warn!(
+                intent = intent.as_str(),
+                "ordre refusé : exécuteur live arrêté"
+            );
+            return None;
+        }
+        let token = if is_up {
+            &self.up_token
+        } else {
+            &self.dn_token
+        };
+        let args = OrderArgs {
+            price,
+            size,
+            is_sell: false,
+            gtc: true,
+            post_only,
+        };
         match orders::place_order(self.armed, &self.creds, token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+            Ok(PlaceResult::Placed {
+                order_id,
+                filled_size,
+                avg_price,
+                post_ms,
+            }) => {
                 self.last_rtt_ms = post_ms;
-                self.order_side.insert(order_id.clone(), (is_up, true));
+                let condition_id = self.condition_id.clone();
+                self.order_side.insert(
+                    order_id.clone(),
+                    OrderMeta {
+                        is_up,
+                        maker: true,
+                        intent,
+                        condition_id: condition_id.clone(),
+                    },
+                );
                 // Enregistre l'ordre au grand livre (counted=0), puis crédite le
                 // fill immédiat éventuel (GTC marketable) au prix RÉEL — taker.
                 // Comme tout passe par `credit`, les events WS/poll ne
                 // recompteront jamais cette portion (idempotence par order_id).
                 let matched = filled_size.unwrap_or(0.0);
                 let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
-                if let Some(f) =
-                    Self::credit(&mut self.ledger, &order_id, is_up, size, matched, px, false)
-                {
-                    tracing::info!(matched = f.size, px, "GTC fillé au POST (marketable) — compté (taker)");
+                if let Some(f) = Self::credit_with_meta(
+                    &mut self.ledger,
+                    &order_id,
+                    is_up,
+                    size,
+                    matched,
+                    px,
+                    false,
+                    intent,
+                    &condition_id,
+                ) {
+                    tracing::info!(
+                        matched = f.size,
+                        px,
+                        "GTC fillé au POST (marketable) — compté (taker)"
+                    );
                     self.post_fills.push(f);
                 }
-                let counted = self.ledger.get(&order_id).map(|e| e.counted).unwrap_or(matched);
-                Some(RestingOrder { order_id, price, size, matched: counted, placed_ms: chrono::Utc::now().timestamp_millis() })
+                let counted = self
+                    .ledger
+                    .get(&order_id)
+                    .map(|e| e.counted)
+                    .unwrap_or(matched);
+                Some(RestingOrder {
+                    order_id,
+                    price,
+                    size,
+                    matched: counted,
+                    placed_ms: chrono::Utc::now().timestamp_millis(),
+                    intent,
+                    condition_id,
+                })
             }
             Ok(PlaceResult::PostOnlyRejected) | Ok(PlaceResult::DryRun) => None,
             Err(e) => {
@@ -375,7 +656,11 @@ impl LiveCtx {
                 if msg.contains("post-only") || msg.contains("POST_ONLY") {
                     // Le CLOB renvoie le rejet post-only en HTTP 400 (pas dans le
                     // corps 200) : comportement VOULU, pas une erreur.
-                    tracing::info!(is_up, price, "post-only rejeté (aurait croisé) — repose au tick suivant");
+                    tracing::info!(
+                        is_up,
+                        price,
+                        "post-only rejeté (aurait croisé) — repose au tick suivant"
+                    );
                 } else {
                     tracing::warn!(error = %msg, is_up, price, size, "place_bid refusé");
                 }
@@ -398,7 +683,11 @@ impl LiveCtx {
         if !self.armed || bid <= 0.0 {
             return None;
         }
-        let token = if is_up { self.up_token.clone() } else { self.dn_token.clone() };
+        let token = if is_up {
+            self.up_token.clone()
+        } else {
+            self.dn_token.clone()
+        };
         // Taille TRONQUÉE vers le bas (jamais vendre plus qu'on détient — leçon
         // mémoire : round_dp arrondirait 4.9958 → 5.00 → rejet balance).
         let sz = (size * 100.0).floor() / 100.0;
@@ -415,9 +704,20 @@ impl LiveCtx {
             tracing::warn!(error = %e, "allowance CONDITIONAL avant SELL échouée — flatten sauté ce tick");
             return None;
         }
-        let args = OrderArgs { price: px, size: sz, is_sell: true, gtc: false, post_only: false };
+        let args = OrderArgs {
+            price: px,
+            size: sz,
+            is_sell: true,
+            gtc: false,
+            post_only: false,
+        };
         match orders::place_order(self.armed, &self.creds, &token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+            Ok(PlaceResult::Placed {
+                order_id,
+                filled_size,
+                avg_price,
+                post_ms,
+            }) => {
                 self.last_rtt_ms = post_ms;
                 self.sell_ids.insert(order_id);
                 let sold = filled_size.unwrap_or(0.0);
@@ -440,18 +740,63 @@ impl LiveCtx {
     /// FAK d'assurance (complétion taker fin de fenêtre). Un FAK n'est jamais
     /// resting : son fill est dans la RÉPONSE du POST — comptabilisé ici même,
     /// sans dépendre du WS (un FAK invisible relançait l'assurance en boucle).
-    pub async fn place_insurance_fak(&mut self, is_up: bool, price: f64, size: f64) {
-        let token = if is_up { &self.up_token } else { &self.dn_token };
-        let args = OrderArgs { price, size, is_sell: false, gtc: false, post_only: false };
+    pub async fn place_insurance_fak(
+        &mut self,
+        is_up: bool,
+        price: f64,
+        size: f64,
+        intent: OrderIntent,
+    ) {
+        if self.is_halted() {
+            tracing::warn!(
+                intent = intent.as_str(),
+                "FAK refusé : exécuteur live arrêté"
+            );
+            return;
+        }
+        let token = if is_up {
+            &self.up_token
+        } else {
+            &self.dn_token
+        };
+        let args = OrderArgs {
+            price,
+            size,
+            is_sell: false,
+            gtc: false,
+            post_only: false,
+        };
         match orders::place_order(self.armed, &self.creds, token, args).await {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) => {
+            Ok(PlaceResult::Placed {
+                order_id,
+                filled_size,
+                avg_price,
+                post_ms,
+            }) => {
                 self.last_rtt_ms = post_ms;
-                self.order_side.insert(order_id.clone(), (is_up, false));
+                let condition_id = self.condition_id.clone();
+                self.order_side.insert(
+                    order_id.clone(),
+                    OrderMeta {
+                        is_up,
+                        maker: false,
+                        intent,
+                        condition_id: condition_id.clone(),
+                    },
+                );
                 let matched = filled_size.unwrap_or(0.0);
                 let px = avg_price.filter(|p| *p > 0.0).unwrap_or(price);
-                if let Some(f) =
-                    Self::credit(&mut self.ledger, &order_id, is_up, size, matched, px, false)
-                {
+                if let Some(f) = Self::credit_with_meta(
+                    &mut self.ledger,
+                    &order_id,
+                    is_up,
+                    size,
+                    matched,
+                    px,
+                    false,
+                    intent,
+                    &condition_id,
+                ) {
                     self.post_fills.push(f);
                 }
             }
@@ -460,35 +805,43 @@ impl LiveCtx {
         }
     }
 
-    /// TROU CRITIQUE corrigé (7 juil. : −21$ invisibles) : avant d'annuler un
-    /// ordre (reprice/retrait/rollover), on RÉCOLTE son size_matched — tout
-    /// fill partiel survenu pendant sa vie est comptabilisé, plus jamais perdu.
-    /// Renvoie (fill récolté éventuel, `safe_to_replace`). `safe_to_replace` =
-    /// false quand le cancel N'EST PAS confirmé et qu'aucun fill n'a été lu :
-    /// l'ordre a probablement été fillé PENDANT le vol du cancel (course du
-    /// 10 juil. 02:02 : complétion 0.41 remplacée par 0.35, les DEUX exécutées
-    /// → sur-complétion ×2). Dans ce cas : pas de remplacement ce tick, l'ordre
-    /// part en AUDIT et le poll tranchera.
+    /// Récolte avant annulation, puis ne libère l'exposition que lorsqu'un état
+    /// terminal est confirmé. Un fill partiel n'autorise jamais à remplacer le
+    /// reliquat : il peut encore être exécuté après le DELETE.
     pub async fn harvest_and_cancel(
         &mut self,
         r: &RestingOrder,
         is_up: bool,
     ) -> (Option<LiveFill>, bool) {
         let mut fill = None;
-        let mut read_ok = false;
         if self.armed {
             match super::auth::l2_request(
-                &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
-            ).await {
+                &self.creds,
+                "GET",
+                &format!("/data/order/{}", r.order_id),
+                None,
+                "",
+            )
+            .await
+            {
                 Ok(text) => {
-                    read_ok = true;
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     let v = v.get("data").cloned().unwrap_or(v);
-                    let matched: f64 = v.get("size_matched")
-                        .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
+                    let matched: f64 = v
+                        .get("size_matched")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
-                    if let Some(f) = Self::credit(
-                        &mut self.ledger, &r.order_id, is_up, r.size, matched, r.price, true,
+                    if let Some(f) = Self::credit_with_meta(
+                        &mut self.ledger,
+                        &r.order_id,
+                        is_up,
+                        r.size,
+                        matched,
+                        r.price,
+                        true,
+                        r.intent,
+                        &r.condition_id,
                     ) {
                         tracing::info!(order_id = %r.order_id, delta = f.size, "fill récolté à l'annulation");
                         fill = Some(f);
@@ -497,21 +850,21 @@ impl LiveCtx {
                 Err(e) => {
                     tracing::warn!(error = %e, order_id = %r.order_id,
                         "récolte pré-annulation échouée → ordre mis en AUDIT (le poll retentera)");
-                    self.audit.push((r.clone(), is_up, 0));
                 }
             }
-            let canceled = orders::cancel_order(&self.creds, &r.order_id)
-                .await
-                .unwrap_or(false);
-            if !canceled && fill.is_none() {
-                // Cancel non confirmé + rien lu : fill en vol probable. AUDIT
-                // (sauf si déjà audité par l'échec de lecture ci-dessus).
-                if read_ok {
-                    self.audit.push((r.clone(), is_up, 0));
+            match orders::cancel_order(&self.creds, &r.order_id).await {
+                Ok(CancelStatus::Cancelled) => return (fill, true),
+                Ok(
+                    CancelStatus::AlreadyClosed | CancelStatus::StillOpen | CancelStatus::Unknown,
+                )
+                | Err(_) => {
+                    self.audit_order(r.clone(), is_up, true);
+                    tracing::warn!(
+                        order_id = %r.order_id.chars().take(12).collect::<String>(),
+                        "cancel non terminal — côté gelé jusqu'à confirmation finale"
+                    );
+                    return (fill, false);
                 }
-                tracing::info!(order_id = %r.order_id.chars().take(12).collect::<String>(),
-                    "cancel non confirmé — remplacement différé (fill en vol probable)");
-                return (fill, false);
             }
         }
         (fill, true)
@@ -528,6 +881,7 @@ impl LiveCtx {
     /// le même montant (event ré-émis, autre canal) → delta 0. Plafonné à la
     /// taille d'origine de l'ordre. C'est ce qui rend le double comptage
     /// STRUCTURELLEMENT impossible (bug des −24 Down du 8 juil.).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn credit(
         ledger: &mut HashMap<String, LedgerEntry>,
         id: &str,
@@ -537,14 +891,45 @@ impl LiveCtx {
         price: f64,
         maker: bool,
     ) -> Option<LiveFill> {
+        Self::credit_with_meta(
+            ledger,
+            id,
+            is_up,
+            size_hint,
+            abs_matched,
+            price,
+            maker,
+            OrderIntent::SymmetricOpen,
+            "",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn credit_with_meta(
+        ledger: &mut HashMap<String, LedgerEntry>,
+        id: &str,
+        is_up: bool,
+        size_hint: f64,
+        abs_matched: f64,
+        price: f64,
+        maker: bool,
+        intent: OrderIntent,
+        condition_id: &str,
+    ) -> Option<LiveFill> {
         let e = ledger.entry(id.to_string()).or_insert(LedgerEntry {
             is_up,
             // Taille connue de l'ordre = plafond dur. Un size_matched aberrant
             // (> taille) ne doit JAMAIS gonfler le plafond ; ce n'est qu'en
             // l'absence de taille connue (hint 0) qu'on se rabat sur l'absolu.
-            size: if size_hint > 0.0 { size_hint } else { abs_matched },
+            size: if size_hint > 0.0 {
+                size_hint
+            } else {
+                abs_matched
+            },
             counted: 0.0,
             price,
+            intent,
+            condition_id: condition_id.to_string(),
         });
         // Une taille connue plus grande (hint fiable arrivé après) fait grandir
         // le plafond ; jamais un simple size_matched.
@@ -561,6 +946,8 @@ impl LiveCtx {
                 price: if e.price > 0.0 { e.price } else { price },
                 size: delta,
                 maker,
+                intent: e.intent,
+                condition_id: e.condition_id.clone(),
             })
         } else {
             None
@@ -586,18 +973,31 @@ impl LiveCtx {
             if self.sell_ids.contains(&u.order_id) {
                 continue;
             }
-            if !self.order_side.contains_key(&u.order_id) {
+            let Some(meta) = self.order_side.get(&u.order_id).cloned() else {
                 tracing::info!(order_id = %u.order_id.chars().take(12).collect::<String>(),
                     "event order EXTERNE (manuel/vente ?) — ignoré par la compta bot");
+                continue;
+            };
+            if meta.condition_id != self.condition_id {
+                tracing::warn!(order_id = %u.order_id, event_market = %meta.condition_id,
+                    active_market = %self.condition_id, "fill tardif d'un ancien marché ignoré");
                 continue;
             }
             let is_up = if !u.asset_id.is_empty() {
                 u.asset_id == self.up_token
             } else {
-                self.order_side.get(&u.order_id).map(|(up, _)| *up).unwrap_or(false)
+                meta.is_up
             };
-            if let Some(f) = Self::credit(
-                &mut self.ledger, &u.order_id, is_up, u.size, u.size_matched, u.price, true,
+            if let Some(f) = Self::credit_with_meta(
+                &mut self.ledger,
+                &u.order_id,
+                is_up,
+                u.size,
+                u.size_matched,
+                u.price,
+                meta.maker,
+                meta.intent,
+                &meta.condition_id,
             ) {
                 tracing::info!(order_id = %u.order_id, delta = f.size,
                     "fill (event order — size_matched absolu, temps réel)");
@@ -627,35 +1027,66 @@ impl LiveCtx {
         // AUDIT d'abord : les ordres à lecture ratée sont réinterrogés jusqu'à
         // vérité connue (un ordre clos reste consultable sur /data/order).
         let mut audit = std::mem::take(&mut self.audit);
-        for (r, is_up, tries) in &mut audit {
+        for entry in &mut audit {
+            if now_ms.saturating_sub(entry.r.placed_ms) > self.audit_max_age_ms {
+                self.halt(format!(
+                    "audit/cancel non terminal depuis plus de {} ms",
+                    self.audit_max_age_ms
+                ));
+            }
             match super::auth::l2_request(
-                &self.creds, "GET", &format!("/data/order/{}", r.order_id), None, "",
-            ).await {
+                &self.creds,
+                "GET",
+                &format!("/data/order/{}", entry.r.order_id),
+                None,
+                "",
+            )
+            .await
+            {
                 Ok(text) => {
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     let v = v.get("data").cloned().unwrap_or(v);
-                    let matched: f64 = v.get("size_matched")
-                        .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
+                    let matched: f64 = v
+                        .get("size_matched")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
-                    if let Some(f) = Self::credit(
-                        &mut self.ledger, &r.order_id, *is_up, r.size, matched, r.price, true,
+                    if let Some(f) = Self::credit_with_meta(
+                        &mut self.ledger,
+                        &entry.r.order_id,
+                        entry.is_up,
+                        entry.r.size,
+                        matched,
+                        entry.r.price,
+                        true,
+                        entry.r.intent,
+                        &entry.r.condition_id,
                     ) {
-                        tracing::info!(order_id = %r.order_id, delta = f.size, "fill récupéré par AUDIT");
+                        tracing::info!(order_id = %entry.r.order_id, delta = f.size, "fill récupéré par AUDIT");
                         out.push(f);
                     }
-                    *tries = u32::MAX; // tranché → sortie de l'audit
+                    match order_terminal_state(&v) {
+                        OrderTerminalState::Terminal => entry.tries = u32::MAX,
+                        OrderTerminalState::Open if entry.cancel_requested => {
+                            match orders::cancel_order(&self.creds, &entry.r.order_id).await {
+                                Ok(CancelStatus::Cancelled) => entry.tries = u32::MAX,
+                                _ => entry.tries += 1,
+                            }
+                        }
+                        OrderTerminalState::Open | OrderTerminalState::Unknown => entry.tries += 1,
+                    }
                 }
                 Err(e) => {
-                    *tries += 1;
-                    if *tries >= 40 {
-                        tracing::error!(order_id = %r.order_id, error = %e,
-                            "AUDIT abandonné après 40 échecs — filet = resync positions on-chain (60 s)");
-                        *tries = u32::MAX;
+                    entry.tries += 1;
+                    if entry.tries >= 40 {
+                        tracing::error!(order_id = %entry.r.order_id, error = %e,
+                            "AUDIT non résolu après 40 échecs — exécution live arrêtée");
+                        self.halt("audit/cancel non terminal après 40 tentatives");
                     }
                 }
             }
         }
-        audit.retain(|(_, _, t)| *t != u32::MAX);
+        audit.retain(|entry| entry.tries != u32::MAX);
         self.audit = audit;
         let t0 = std::time::Instant::now();
         let open = match orders::open_orders(&self.creds, &self.condition_id).await {
@@ -668,19 +1099,37 @@ impl LiveCtx {
                 return out;
             }
         };
-        let mut tracked_ids: Vec<String> = self.audit.iter().map(|(o, _, _)| o.order_id.clone()).collect();
+        let mut tracked_ids: Vec<String> =
+            self.audit.iter().map(|a| a.r.order_id.clone()).collect();
         tracked_ids.extend(rest.iter().map(|s| s.r.order_id.clone()));
-        let mut new_audit: Vec<(RestingOrder, bool, u32)> = Vec::new();
+        let mut new_audit: Vec<AuditOrder> = Vec::new();
         let mut i = 0;
         while i < rest.len() {
-            let (order_id, size, price, matched0, placed_ms, is_up) = {
+            let (order_id, size, price, matched0, placed_ms, is_up, intent, condition_id) = {
                 let s = &rest[i];
-                (s.r.order_id.clone(), s.r.size, s.r.price, s.r.matched, s.r.placed_ms, s.is_up)
+                (
+                    s.r.order_id.clone(),
+                    s.r.size,
+                    s.r.price,
+                    s.r.matched,
+                    s.r.placed_ms,
+                    s.is_up,
+                    s.intent,
+                    s.r.condition_id.clone(),
+                )
             };
             match open.iter().find(|o| o.id == order_id) {
                 Some(o) => {
-                    if let Some(f) = Self::credit(
-                        &mut self.ledger, &order_id, is_up, size, o.matched(), price, true,
+                    if let Some(f) = Self::credit_with_meta(
+                        &mut self.ledger,
+                        &order_id,
+                        is_up,
+                        size,
+                        o.matched(),
+                        price,
+                        true,
+                        intent,
+                        &condition_id,
                     ) {
                         tracing::info!(order_id = %order_id, delta = f.size, "fill rattrapé par le poll");
                         out.push(f);
@@ -701,28 +1150,71 @@ impl LiveCtx {
                     // Absent du carnet = fillé en entier ou annulé : on lit son
                     // size_matched final et on crédite le reliquat éventuel.
                     match super::auth::l2_request(
-                        &self.creds, "GET", &format!("/data/order/{}", order_id), None, "",
-                    ).await {
+                        &self.creds,
+                        "GET",
+                        &format!("/data/order/{}", order_id),
+                        None,
+                        "",
+                    )
+                    .await
+                    {
                         Ok(text) => {
-                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                            let v: serde_json::Value =
+                                serde_json::from_str(&text).unwrap_or_default();
                             let v = v.get("data").cloned().unwrap_or(v);
-                            let matched: f64 = v.get("size_matched")
-                                .and_then(|s| s.as_str()).and_then(|s| s.parse().ok())
+                            let matched: f64 = v
+                                .get("size_matched")
+                                .and_then(|s| s.as_str())
+                                .and_then(|s| s.parse().ok())
                                 .unwrap_or(0.0);
-                            if let Some(f) = Self::credit(
-                                &mut self.ledger, &order_id, is_up, size, matched, price, true,
+                            if let Some(f) = Self::credit_with_meta(
+                                &mut self.ledger,
+                                &order_id,
+                                is_up,
+                                size,
+                                matched,
+                                price,
+                                true,
+                                intent,
+                                &condition_id,
                             ) {
                                 tracing::info!(order_id = %order_id, delta = f.size, "fill final rattrapé (ordre clos)");
                                 out.push(f);
                             }
+                            if order_terminal_state(&v) != OrderTerminalState::Terminal {
+                                new_audit.push(AuditOrder {
+                                    r: RestingOrder {
+                                        order_id: order_id.clone(),
+                                        price,
+                                        size,
+                                        matched: matched0,
+                                        placed_ms,
+                                        intent,
+                                        condition_id,
+                                    },
+                                    is_up,
+                                    tries: 0,
+                                    cancel_requested: false,
+                                });
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, order_id = %order_id,
-                                "GET /data/order échoué (ordre clos) → AUDIT");
-                            new_audit.push((RestingOrder {
-                                order_id: order_id.clone(), price, size,
-                                matched: matched0, placed_ms,
-                            }, is_up, 0));
+                                "GET /data/order échoué (ordre absent du poll) → AUDIT");
+                            new_audit.push(AuditOrder {
+                                r: RestingOrder {
+                                    order_id: order_id.clone(),
+                                    price,
+                                    size,
+                                    matched: matched0,
+                                    placed_ms,
+                                    intent,
+                                    condition_id,
+                                },
+                                is_up,
+                                tries: 0,
+                                cancel_requested: false,
+                            });
                         }
                     }
                     rest.remove(i); // l'ordre n'existe plus → re-quote au tick suivant
@@ -737,19 +1229,57 @@ impl LiveCtx {
             if tracked_ids.iter().any(|t| t == &o.id) {
                 continue;
             }
-            let is_up = self
-                .order_side
-                .get(&o.id)
-                .map(|(u, _)| *u)
-                .unwrap_or(o.asset_id == self.up_token);
+            let meta = self.order_side.get(&o.id).cloned().unwrap_or(OrderMeta {
+                is_up: o.asset_id == self.up_token,
+                maker: true,
+                intent: OrderIntent::SymmetricOpen,
+                condition_id: self.condition_id.clone(),
+            });
+            let is_up = meta.is_up;
+            if meta.intent == OrderIntent::Completion
+                && rest.iter().any(|slot| {
+                    slot.is_up == is_up
+                        && slot.intent == OrderIntent::Completion
+                        && slot.r.order_id != o.id
+                })
+            {
+                self.halt(format!(
+                    "double complétion détectée côté {}",
+                    if is_up { "Up" } else { "Down" }
+                ));
+            }
             tracing::error!(order_id = %o.id, is_up,
-                "ordre OUVERT au carnet INCONNU du suivi — annulé + crédité");
+                "ordre OUVERT au carnet INCONNU du suivi — récolté puis cancel demandé");
             let px = o.price.parse().unwrap_or(0.0);
             let sz = o.original_size.parse().unwrap_or(0.0);
-            if let Some(f) = Self::credit(&mut self.ledger, &o.id, is_up, sz, o.matched(), px, true) {
+            if let Some(f) = Self::credit_with_meta(
+                &mut self.ledger,
+                &o.id,
+                is_up,
+                sz,
+                o.matched(),
+                px,
+                meta.maker,
+                meta.intent,
+                &meta.condition_id,
+            ) {
                 out.push(f);
             }
-            let _ = orders::cancel_order(&self.creds, &o.id).await;
+            let r = RestingOrder {
+                order_id: o.id.clone(),
+                price: px,
+                size: sz,
+                matched: o.matched(),
+                placed_ms: now_ms,
+                intent: meta.intent,
+                condition_id: meta.condition_id,
+            };
+            match orders::cancel_order(&self.creds, &o.id).await {
+                Ok(CancelStatus::Cancelled) => {
+                    tracing::info!(order_id = %o.id, "ordre inconnu annulé confirmé");
+                }
+                _ => self.audit_order(r, is_up, true),
+            }
         }
         out.retain(|f| f.size > 1e-9);
         out
@@ -773,7 +1303,10 @@ mod tests {
                 total += f.size;
             }
         }
-        assert!((total - 6.0).abs() < 1e-9, "6 parts comptées 1×, pas 24 : {total}");
+        assert!(
+            (total - 6.0).abs() < 1e-9,
+            "6 parts comptées 1×, pas 24 : {total}"
+        );
     }
 
     #[test]
@@ -806,5 +1339,71 @@ mod tests {
         // un size_matched aberrant (> taille) est plafonné à la taille de l'ordre
         let f = LiveCtx::credit(&mut l, "ord-D", true, 6.0, 99.0, 0.10, true).unwrap();
         assert!((f.size - 6.0).abs() < 1e-9, "plafonné à 6 : {}", f.size);
+    }
+
+    #[test]
+    fn credit_preserves_order_intent_across_channels() {
+        let mut l: HashMap<String, LedgerEntry> = HashMap::new();
+        let first = LiveCtx::credit_with_meta(
+            &mut l,
+            "completion-1",
+            false,
+            6.0,
+            3.0,
+            0.42,
+            true,
+            OrderIntent::Completion,
+            "market-a",
+        )
+        .unwrap();
+        assert_eq!(first.intent, OrderIntent::Completion);
+        assert_eq!(first.condition_id, "market-a");
+        let second = LiveCtx::credit_with_meta(
+            &mut l,
+            "completion-1",
+            false,
+            6.0,
+            6.0,
+            0.42,
+            true,
+            OrderIntent::SymmetricOpen,
+            "market-b",
+        )
+        .unwrap();
+        assert_eq!(second.intent, OrderIntent::Completion);
+        assert_eq!(second.condition_id, "market-a");
+    }
+
+    #[test]
+    fn audit_exposure_blocks_replacement_at_remaining_size() {
+        let r = RestingOrder {
+            order_id: "audit-1".into(),
+            price: 0.27,
+            size: 6.0,
+            matched: 1.8,
+            placed_ms: 0,
+            intent: OrderIntent::Completion,
+            condition_id: "market-a".into(),
+        };
+        let audit = vec![AuditOrder {
+            r,
+            is_up: false,
+            tries: 0,
+            cancel_requested: true,
+        }];
+        let exposure = aggregate_open_exposure(&[], &audit);
+        assert!((exposure.down - 4.2).abs() < 1e-9);
+        assert!((exposure.completion_down - 4.2).abs() < 1e-9);
+        assert!((exposure.uncertain_down - 4.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn terminal_status_requires_an_explicit_terminal_value() {
+        let open = serde_json::json!({ "status": "LIVE" });
+        let closed = serde_json::json!({ "status": "CANCELED" });
+        let unknown = serde_json::json!({ "size_matched": "6" });
+        assert_eq!(order_terminal_state(&open), OrderTerminalState::Open);
+        assert_eq!(order_terminal_state(&closed), OrderTerminalState::Terminal);
+        assert_eq!(order_terminal_state(&unknown), OrderTerminalState::Unknown);
     }
 }

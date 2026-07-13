@@ -12,16 +12,16 @@ use crate::bankroll::BankrollEngine;
 use crate::config::Config;
 use crate::connectors::binance;
 use crate::connectors::pm_ws;
-#[cfg(feature = "live")]
-use crate::live::engine::{LiveCtx, LiveSlot};
 use crate::connectors::polymarket::{Market, PolyBook, PolymarketClient};
-use crate::dashboard::{Shared, SeriesPoint, WindowResult};
+use crate::dashboard::{PurposeBreakdown, SeriesPoint, Shared, WindowResult};
 use crate::engines::spread_capture::{Side, SpreadCaptureConfig, SpreadCaptureEngine};
 use crate::engines::{
     drift::DriftEngine, ofi::OfiEngine, pricing, radar::RadarEngine, volatility::VolatilityEngine,
 };
 use crate::execution::KillState;
 use crate::inventory::PaperEngine;
+#[cfg(feature = "live")]
+use crate::live::engine::{LiveCtx, LiveFill, LiveSlot, OrderIntent};
 use crate::signal::SignalTransport;
 use crate::types::{BookUpdate, Signal, WireTick};
 
@@ -34,7 +34,84 @@ fn best_ask_level(book: &PolyBook) -> Option<(f64, f64)> {
         .map(|l| (l.price, l.size))
 }
 
-pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared) -> anyhow::Result<()> {
+/// Applique immédiatement un fill déjà dédupliqué par `LiveCtx`. Cette fonction
+/// est l'unique passage du fill CLOB vers le moteur et le miroir : aucun calcul
+/// de quote ne doit s'exécuter avec ces deltas encore en attente.
+#[cfg(feature = "live")]
+#[allow(clippy::too_many_arguments)]
+fn apply_live_fills(
+    fills: Vec<LiveFill>,
+    live: &mut LiveCtx,
+    paper: &mut PaperEngine,
+    sc: &mut SpreadCaptureEngine,
+    now_s: i64,
+    now_ms: i64,
+    cfg: &Config,
+    last_fill_wall_ms: &mut i64,
+    win_taker_fees: &mut f64,
+    win_fills: &mut u32,
+    win_deployed: &mut f64,
+    win_rebate: &mut f64,
+    win_imb_max: &mut f64,
+    purposes: &mut PurposeBreakdown,
+) {
+    for fill in fills.into_iter().filter(|f| f.size > 1e-9) {
+        live.note_fill_cash(fill.price, fill.size);
+        if !fill.maker {
+            let fee = 0.07 * fill.price * (1.0 - fill.price) * fill.size;
+            live.cash -= fee;
+            *win_taker_fees += fee;
+            purposes.for_order_intent(fill.intent.as_str()).taker_fees += fee;
+            tracing::warn!(
+                px = format!("{:.3}", fill.price),
+                size = format!("{:.1}", fill.size),
+                fee = format!("{fee:.3}"),
+                intent = fill.intent.as_str(),
+                "fill TAKER — taxe payée"
+            );
+        }
+        let side = if fill.is_up { Side::Up } else { Side::Down };
+        let liquidity = if fill.maker { "maker" } else { "taker" };
+        paper.apply_live_fill_with_purpose(
+            side.as_str(),
+            fill.price,
+            fill.size,
+            liquidity,
+            fill.intent.as_str(),
+        );
+        sc.on_fill(side, fill.price, fill.size, now_s);
+        *last_fill_wall_ms = now_ms;
+        *win_fills += 1;
+        *win_deployed += fill.price * fill.size;
+        let purpose = purposes.for_order_intent(fill.intent.as_str());
+        purpose.fills += 1;
+        purpose.buy_notional += fill.price * fill.size;
+        if fill.maker {
+            let rebate = cfg.sc_rebate_rate * 0.07 * fill.price * (1.0 - fill.price) * fill.size;
+            *win_rebate += rebate;
+            purpose.maker_rebate += rebate;
+        }
+        if sc.imbalance().abs() > win_imb_max.abs() {
+            *win_imb_max = sc.imbalance();
+        }
+        tracing::info!(
+            side = side.as_str(),
+            px = format!("{:.3}", fill.price),
+            size = format!("{:.1}", fill.size),
+            liquidity,
+            intent = fill.intent.as_str(),
+            condition = %fill.condition_id.chars().take(12).collect::<String>(),
+            imb = format!("{:.2}", sc.imbalance()),
+            "[LIVE] fill réel appliqué avant décision"
+        );
+    }
+}
+
+pub async fn run(
+    cfg: Config,
+    transport: Arc<dyn SignalTransport>,
+    dash: Shared,
+) -> anyhow::Result<()> {
     tracing::info!(
         role = "executor",
         dry_run = cfg.dry_run,
@@ -48,8 +125,7 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
     // Écoute des signaux radar : KILL → pause ; Tick → source de données Tokyo
     // (spot/σ/drift/OFI/OBI calculés là-bas). Garde seq : les datagrammes UDP
     // réordonnés/dupliqués sont jetés (garde-fou n°2 du plan).
-    let (remote_tx, remote_rx) =
-        watch::channel::<Option<(WireTick, i64)>>(None);
+    let (remote_tx, remote_rx) = watch::channel::<Option<(WireTick, i64)>>(None);
     {
         let dash = dash.clone();
         let kill = kill.clone();
@@ -74,11 +150,14 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                             continue; // réordonné/dupliqué → poubelle
                         }
                         if t.seq < last_seq {
-                            tracing::warn!(old = last_seq, new = t.seq, "seq radar réinitialisé (redémarrage Tokyo) — flux réaccepté");
+                            tracing::warn!(
+                                old = last_seq,
+                                new = t.seq,
+                                "seq radar réinitialisé (redémarrage Tokyo) — flux réaccepté"
+                            );
                         }
                         last_seq = t.seq;
-                        let _ = remote_tx
-                            .send(Some((t, chrono::Utc::now().timestamp_millis())));
+                        let _ = remote_tx.send(Some((t, chrono::Utc::now().timestamp_millis())));
                     }
                     Ok(Signal::Heartbeat) => {}
                     Err(e) => {
@@ -138,7 +217,7 @@ async fn quote_loop(
     let mut live: Option<LiveCtx> = if !cfg.dry_run {
         let creds = crate::live::auth::LiveCredentials::from_env()
             .ok_or_else(|| anyhow::anyhow!("DRY_RUN=false mais credentials POLY_* incomplets"))?;
-        Some(LiveCtx::start(creds, cfg.live_armed).await?)
+        Some(LiveCtx::start(creds, cfg.live_armed, cfg.live_audit_max_age_s).await?)
     } else {
         None
     };
@@ -154,9 +233,9 @@ async fn quote_loop(
     let mut last_insurance_ms: i64 = 0;
     #[cfg(feature = "live")]
     let mut last_place_ms: [[i64; 4]; 2] = [[0; 4]; 2]; // anti-churn par (côté, niveau)
-    // Cooldown STRATÉGIQUE (spec volume/rebates) : après un merge à paire > 1$,
-    // pas d'ESCALADE (urgence) pendant 45 s — mais ouvertures et complétions au
-    // complément continuent : elles ABAISSENT le blended (moyenne à la baisse).
+                                                        // Cooldown STRATÉGIQUE (spec volume/rebates) : après un merge à paire > 1$,
+                                                        // pas d'ESCALADE (urgence) pendant 45 s — mais ouvertures et complétions au
+                                                        // complément continuent : elles ABAISSENT le blended (moyenne à la baisse).
     #[cfg(feature = "live")]
     let mut urgency_block_until: i64 = 0;
     // Epoch ms du dernier fill appliqué : un fill CLOB met quelques secondes à
@@ -171,15 +250,14 @@ async fn quote_loop(
     // du 8 juil. : 51,7¢ affiché = 50¢ exécuté + 0,105$ de frais sur 6 parts).
     let mut win_taker_fees = 0.0f64;
     let mut last_nosig_log: i64 = 0; // throttle du warn « signal absent »
-    // Throttle du log « complétion agressive » : la cible est recalculée à
-    // chaque boucle depuis le prix de base → sans mémoire, la même ligne
-    // partait CHAQUE seconde (12 juil. 17:19 : 20+ lignes identiques).
+                                     // Throttle du log « complétion agressive » : la cible est recalculée à
+                                     // chaque boucle depuis le prix de base → sans mémoire, la même ligne
+                                     // partait CHAQUE seconde (12 juil. 17:19 : 20+ lignes identiques).
     let mut last_aggr_px: [f64; 2] = [0.0; 2];
     // Carnets Polymarket en WS (v9) : la boucle passe à 4 Hz sur données live ;
     // le REST ne sert plus que de secours si le flux WS est périmé (>5 s).
-    let pm_state: pm_ws::PmWsShared = std::sync::Arc::new(std::sync::RwLock::new(
-        pm_ws::PmWsState::default(),
-    ));
+    let pm_state: pm_ws::PmWsShared =
+        std::sync::Arc::new(std::sync::RwLock::new(pm_ws::PmWsState::default()));
     let pm_tokens = pm_ws::spawn(pm_state.clone());
     let mut last_slow_tick_s: i64 = 0; // throttle 1 Hz (log + série + REST secours)
     let bankroll = {
@@ -212,15 +290,19 @@ async fn quote_loop(
         dust_tol: cfg.sc_dust_tol,
     });
     let mut paper = PaperEngine::load_or_init(
-        cfg.start_cash, cfg.max_position, cfg.min_merge_threshold, cfg.safety_mult,
-        cfg.state_path.clone(), cfg.trades_path.clone(),
+        cfg.start_cash,
+        cfg.max_position,
+        cfg.min_merge_threshold,
+        cfg.safety_mult,
+        cfg.state_path.clone(),
+        cfg.trades_path.clone(),
     );
 
     // Persistance de l'historique des fenêtres (le dashboard est en mémoire sinon :
     // chaque redémarrage perdrait la table analytique). JSONL append-only, rechargé
     // au boot — le PnL/cash reste dans paper_state, ceci ne stocke que l'affichage.
-    let windows_path = std::env::var("WINDOWS_PATH")
-        .unwrap_or_else(|_| "paper_windows_v8.jsonl".into());
+    let windows_path =
+        std::env::var("WINDOWS_PATH").unwrap_or_else(|_| "paper_windows_v8.jsonl".into());
     {
         let mut loaded: Vec<WindowResult> = Vec::new();
         if let Ok(txt) = std::fs::read_to_string(&windows_path) {
@@ -251,7 +333,11 @@ async fn quote_loop(
     // depuis le feed Binance de l'exécuteur ; en split, ces valeurs viendront du WireSignal.
     let mut drift_eng = DriftEngine::new(cfg.drift_halflife_secs);
     let mut ofi_eng = OfiEngine::new(5000);
-    let radar_obi = RadarEngine::new(cfg.obi_depth_levels, cfg.obi_threshold, cfg.velocity_threshold);
+    let radar_obi = RadarEngine::new(
+        cfg.obi_depth_levels,
+        cfg.obi_threshold,
+        cfg.velocity_threshold,
+    );
     let mut last_realized = paper.state.realized_pnl; // pour le delta par fenêtre
 
     // MODE SKEW : momentum du carnet PM (ring 30 s), côté parié, cooldown
@@ -261,17 +347,17 @@ async fn quote_loop(
     let mut skew_cool_until: i64 = 0;
     #[allow(unused_assignments, unused_mut, unused_variables)]
     let mut bet_side: Option<Side> = None; // inventaire skew détenu (sortie éclair si retournement)
-    // Côté armé PERSISTANT (hystérésis) : armé au seuil plein, désarmé seulement
-    // quand le signal retombe sous la MOITIÉ du seuil (incident 12 juil. 16:51 :
-    // pm_mom oscillant pile à ±0.06 → arm/désarm toutes les 2-5 s → 2 sorties
-    // éclair dans la même fenêtre).
+                                           // Côté armé PERSISTANT (hystérésis) : armé au seuil plein, désarmé seulement
+                                           // quand le signal retombe sous la MOITIÉ du seuil (incident 12 juil. 16:51 :
+                                           // pm_mom oscillant pile à ±0.06 → arm/désarm toutes les 2-5 s → 2 sorties
+                                           // éclair dans la même fenêtre).
     let mut skew_armed: Option<Side> = None;
     let mut last_skew_logged: Option<Side> = None;
     let mut last_pm_pull: Option<Side> = None; // pull demi-seuil (log de transition)
-    // PERSISTANCE du lean PM (refonte 13 juil.) : le pm-momentum est un
-    // détecteur de MOUVEMENT, pas de tendance — il tirait sur chaque jambe de
-    // rebond (12 Up @0.46 revendus @0.23). Un lean ne compte que si son SIGNE
-    // tient sc_pm_persist_s : un rebond de 20 s ne tient pas, un grind oui.
+                                               // PERSISTANCE du lean PM (refonte 13 juil.) : le pm-momentum est un
+                                               // détecteur de MOUVEMENT, pas de tendance — il tirait sur chaque jambe de
+                                               // rebond (12 Up @0.46 revendus @0.23). Un lean ne compte que si son SIGNE
+                                               // tient sc_pm_persist_s : un rebond de 20 s ne tient pas, un grind oui.
     let mut pm_lean_sign: i8 = 0;
     let mut pm_lean_since_ms: i64 = 0;
     // FAK d'accumulation : tiré UNE fois par armement (armé → pending).
@@ -300,6 +386,7 @@ async fn quote_loop(
     let mut win_deployed = 0.0f64; // $ TOTAL achetés (cumulatif — sc.deployed() devient net des merges)
     let mut win_fills: u32 = 0;
     let mut win_imb_max = 0.0f64;
+    let mut win_purposes = PurposeBreakdown::default();
     let mut rebate_total = 0.0f64;
     let mut loss_streak: u32 = 0;
     let mut size_factor = 1.0f64;
@@ -311,7 +398,9 @@ async fn quote_loop(
     loop {
         poll.tick().await;
 
-        let need_resolve = current.as_ref().map_or(true, |m| m.time_remaining_sec() <= 0);
+        let need_resolve = current
+            .as_ref()
+            .map_or(true, |m| m.time_remaining_sec() <= 0);
         if need_resolve {
             // Résoudre le marché précédent (Up gagne si close ≥ open de la fenêtre).
             // Close = open de la fenêtre suivante (kline) ; à défaut, dernier spot observé.
@@ -325,7 +414,10 @@ async fn quote_loop(
                 let mut close = None;
                 for _ in 0..15 {
                     match binance::price_at_window_open(prev.window_ts + 300).await {
-                        Ok(c) => { close = Some(c); break; }
+                        Ok(c) => {
+                            close = Some(c);
+                            break;
+                        }
                         Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
                     }
                 }
@@ -342,11 +434,25 @@ async fn quote_loop(
                             // Récolter les fills des ordres encore restants AVANT de
                             // les annuler — ils appartiennent à la fenêtre qui se clôt.
                             for slot in std::mem::take(&mut lrest) {
-                                if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
-                                    let side = if f.is_up { Side::Up } else { Side::Down };
-                                    paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
-                                    sc.on_fill(side, f.price, f.size, now_s_roll);
-                                    lv.note_fill_cash(f.price, f.size);
+                                if let (Some(f), _) =
+                                    lv.harvest_and_cancel(&slot.r, slot.is_up).await
+                                {
+                                    apply_live_fills(
+                                        vec![f],
+                                        lv,
+                                        &mut paper,
+                                        &mut sc,
+                                        now_s_roll,
+                                        chrono::Utc::now().timestamp_millis(),
+                                        &cfg,
+                                        &mut last_fill_wall_ms,
+                                        &mut win_taker_fees,
+                                        &mut win_fills,
+                                        &mut win_deployed,
+                                        &mut win_rebate,
+                                        &mut win_imb_max,
+                                        &mut win_purposes,
+                                    );
                                 }
                             }
                             // REDEEM on-chain des résidus (gagnants + poussière) de la
@@ -368,6 +474,8 @@ async fn quote_loop(
                             merged: win_merged,
                             rebate: win_rebate,
                             pnl: 0.0, // rempli après resolve
+                            purposes: win_purposes.clone(),
+                            pnl_unattributed: 0.0,
                         };
                         paper.resolve(up_won);
                         paper.persist();
@@ -380,8 +488,10 @@ async fn quote_loop(
                                 dir_wins += 1;
                             }
                             tracing::info!(
-                                call = w.as_str(), gagnant = if up_won { "up" } else { "down" },
-                                correct, precision = format!("{dir_wins}/{dir_total}"),
+                                call = w.as_str(),
+                                gagnant = if up_won { "up" } else { "down" },
+                                correct,
+                                precision = format!("{dir_wins}/{dir_total}"),
                                 "précision directionnelle Tokyo"
                             );
                         }
@@ -394,7 +504,11 @@ async fn quote_loop(
                         // Le ×0.25 est abandonné : il divisait par 4 les gains de sortie de
                         // série sans exister chez la cible.
                         if rec.deployed > 0.5 {
-                            if delta <= 0.0 { loss_streak += 1 } else { loss_streak = 0 }
+                            if delta <= 0.0 {
+                                loss_streak += 1
+                            } else {
+                                loss_streak = 0
+                            }
                         }
                         size_factor = if loss_streak >= cfg.sc_streak_soft && size_factor > 0.0 {
                             0.0 // pause d'une fenêtre
@@ -402,12 +516,21 @@ async fn quote_loop(
                             1.0 // retour taille pleine
                         };
                         rebate_total += win_rebate;
-                        let final_rec = WindowResult { pnl: delta, ..rec };
+                        let final_rec = WindowResult {
+                            pnl: delta,
+                            // Le PnL de résolution est conservé explicitement
+                            // ici tant que les lots FIFO ne permettent pas une
+                            // ventilation économiquement exacte par intention.
+                            pnl_unattributed: delta,
+                            ..rec
+                        };
                         // Persiste la fenêtre (append-only) avant de l'ajouter à l'affichage.
                         if let Ok(line) = serde_json::to_string(&final_rec) {
                             use std::io::Write;
                             if let Ok(mut fh) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&windows_path)
+                                .create(true)
+                                .append(true)
+                                .open(&windows_path)
                             {
                                 let _ = writeln!(fh, "{line}");
                             }
@@ -426,10 +549,10 @@ async fn quote_loop(
                 Ok(Some(m)) => {
                     strike = binance::price_at_window_open(m.window_ts).await.ok();
                     sc.reset_window(); // état blended remis à zéro pour la nouvelle fenêtre
-                    // SKEW : état remis à zéro — l'historique PM de l'ANCIEN marché
-                    // comparé au mid du nouveau fabrique un momentum fantôme
-                    // (incident 12 juil. 16:50:01 : pm_mom=-0.49 au rollover →
-                    // 36 Down achetés sur du vide → sortie éclair -2,16 $).
+                                       // SKEW : état remis à zéro — l'historique PM de l'ANCIEN marché
+                                       // comparé au mid du nouveau fabrique un momentum fantôme
+                                       // (incident 12 juil. 16:50:01 : pm_mom=-0.49 au rollover →
+                                       // 36 Down achetés sur du vide → sortie éclair -2,16 $).
                     pm_hist.clear();
                     skew_armed = None;
                     bet_side = None;
@@ -449,6 +572,7 @@ async fn quote_loop(
                     win_taker_fees = 0.0;
                     win_fills = 0;
                     win_imb_max = 0.0;
+                    win_purposes = PurposeBreakdown::default();
                     tracing::info!(
                         slug = %m.slug, remaining_s = m.time_remaining_sec(),
                         strike = ?strike, size_factor, loss_streak, "=== Nouveau marché BTC 5min ==="
@@ -456,7 +580,8 @@ async fn quote_loop(
                     let _ = pm_tokens.send(vec![m.up_token_id.clone(), m.down_token_id.clone()]);
                     #[cfg(feature = "live")]
                     if let Some(lv) = live.as_mut() {
-                        lv.on_new_market(&m.condition_id, &m.up_token_id, &m.down_token_id).await;
+                        lv.on_new_market(&m.condition_id, &m.up_token_id, &m.down_token_id)
+                            .await;
                         lrest.clear();
                     }
                     // Budget de fenêtre en % de bankroll (SC_BANKROLL_PCT>0) —
@@ -465,9 +590,15 @@ async fn quote_loop(
                     if cfg.sc_bankroll_pct > 0.0 {
                         let bankroll = {
                             #[cfg(feature = "live")]
-                            { live.as_ref().map(|lv| lv.cash).unwrap_or(paper.state.cash_usdc) }
+                            {
+                                live.as_ref()
+                                    .map(|lv| lv.cash)
+                                    .unwrap_or(paper.state.cash_usdc)
+                            }
                             #[cfg(not(feature = "live"))]
-                            { paper.state.cash_usdc }
+                            {
+                                paper.state.cash_usdc
+                            }
                         };
                         sc.cfg.max_capital_per_market = (bankroll * cfg.sc_bankroll_pct).max(1.0);
                         tracing::info!(
@@ -478,8 +609,15 @@ async fn quote_loop(
                     }
                     current = Some(m);
                 }
-                Ok(None) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
-                Err(e) => { tracing::error!(error=%e,"résolution marché"); tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error=%e,"résolution marché");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
             }
         }
 
@@ -536,10 +674,22 @@ async fn quote_loop(
                     // size_matched d'abord ; en échec, l'ordre part en AUDIT.
                     for slot in std::mem::take(&mut lrest) {
                         if let (Some(f), _) = lv.harvest_and_cancel(&slot.r, slot.is_up).await {
-                            let side = if f.is_up { Side::Up } else { Side::Down };
-                            paper.apply_live_fill(side.as_str(), f.price, f.size, "maker");
-                            sc.on_fill(side, f.price, f.size, chrono::Utc::now().timestamp());
-                            lv.note_fill_cash(f.price, f.size);
+                            apply_live_fills(
+                                vec![f],
+                                lv,
+                                &mut paper,
+                                &mut sc,
+                                chrono::Utc::now().timestamp(),
+                                chrono::Utc::now().timestamp_millis(),
+                                &cfg,
+                                &mut last_fill_wall_ms,
+                                &mut win_taker_fees,
+                                &mut win_fills,
+                                &mut win_deployed,
+                                &mut win_rebate,
+                                &mut win_imb_max,
+                                &mut win_purposes,
+                            );
                         }
                     }
                     lv.cancel_all().await;
@@ -551,13 +701,18 @@ async fn quote_loop(
         } else {
             let bu = spot_rx.borrow().clone();
             let Some(bu) = bu else { continue };
-            let Some(tick) = bu.price_tick() else { continue };
+            let Some(tick) = bu.price_tick() else {
+                continue;
+            };
             let tick_age_ms = chrono::Utc::now().timestamp_millis() - bu.ts_ms as i64;
             if tick_age_ms > 10_000 {
                 rest_up = None;
                 rest_dn = None;
                 last_spot = None; // ne JAMAIS résoudre avec un spot mort
-                tracing::warn!(age_s = tick_age_ms / 1000, "spot Binance PÉRIMÉ — quotes retirées");
+                tracing::warn!(
+                    age_s = tick_age_ms / 1000,
+                    "spot Binance PÉRIMÉ — quotes retirées"
+                );
                 continue;
             }
             let spot = tick.micro_price;
@@ -568,7 +723,14 @@ async fn quote_loop(
             if let (Some(bb), Some(ba)) = (bu.book.best_bid(), bu.book.best_ask()) {
                 ofi_eng.update(tick.ts_ms, bb, bid_sz, ba, ask_sz);
             }
-            (spot, *sigma_rx.borrow(), drift_eng.per_sec(), obi, ofi_eng.value_norm(), tick_age_ms)
+            (
+                spot,
+                *sigma_rx.borrow(),
+                drift_eng.per_sec(),
+                obi,
+                ofi_eng.value_norm(),
+                tick_age_ms,
+            )
         };
         last_spot = Some(spot);
 
@@ -605,7 +767,9 @@ async fn quote_loop(
                 }
             }
         };
-        let (Some(up_mid), Some(down_mid)) = (up_book.mid(), down_book.mid()) else { continue };
+        let (Some(up_mid), Some(down_mid)) = (up_book.mid(), down_book.mid()) else {
+            continue;
+        };
 
         // Inventaire NET (R1) + equity/bankroll (R4).
         let net = paper.state.up_balance - paper.state.down_balance;
@@ -620,9 +784,11 @@ async fn quote_loop(
         // Bids RESTANTS des deux rôles (directionnel côté tendance + complétion côté
         // déficitaire), remplis par règle de CROSS. Rebate estimé par fill maker.
         let paused = kill.is_paused(); // observabilité
-        // Interrupteur manuel (bouton dashboard) : OFF = aucune nouvelle quote,
-        // aucune assurance ; en live les ordres restants sont annulés ci-dessous.
+                                       // Interrupteur manuel (bouton dashboard) : OFF = aucune nouvelle quote,
+                                       // aucune assurance ; en live les ordres restants sont annulés ci-dessous.
         let enabled = { dash.read().await.trading_enabled };
+        #[cfg(feature = "live")]
+        let enabled = enabled && !live.as_ref().is_some_and(LiveCtx::is_halted);
         let now_s = chrono::Utc::now().timestamp();
         use chrono::Timelike;
         let sleeping = cfg.sc_sleep_hours_utc.contains(&chrono::Utc::now().hour());
@@ -651,13 +817,45 @@ async fn quote_loop(
             t => t,
         };
 
+        // La vérité CLOB est appliquée AVANT de calculer `desired`. Sinon une
+        // complétion peut être décidée avec le déficit d'avant le fill WS/poll.
+        #[cfg(feature = "live")]
+        if let Some(lv) = live.as_mut() {
+            let mut pre_fills = lv.drain_ws(&mut lrest);
+            pre_fills.extend(lv.reconcile(&mut lrest, now_ms_books as i64).await);
+            apply_live_fills(
+                pre_fills,
+                lv,
+                &mut paper,
+                &mut sc,
+                now_s,
+                now_ms_books as i64,
+                &cfg,
+                &mut last_fill_wall_ms,
+                &mut win_taker_fees,
+                &mut win_fills,
+                &mut win_deployed,
+                &mut win_rebate,
+                &mut win_imb_max,
+                &mut win_purposes,
+            );
+        }
+
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
         let desired = if sleeping || !enabled {
             Vec::new()
         } else {
             sc.desired_bids(
-                bb_up, bb_dn, fair_up, m.time_remaining_sec(), now_s, trend_up,
-                m.tick_size, cfg.sc_directional_max, cfg.sc_directional_min, size_factor,
+                bb_up,
+                bb_dn,
+                fair_up,
+                m.time_remaining_sec(),
+                now_s,
+                trend_up,
+                m.tick_size,
+                cfg.sc_directional_max,
+                cfg.sc_directional_min,
+                size_factor,
                 cfg.sc_symmetric,
             )
         };
@@ -711,7 +909,10 @@ async fn quote_loop(
         // Deux capteurs : Tokyo (drift+OFI alignés — les moves rapides) OU
         // momentum du carnet PM (les glissements lents que Binance ne voit pas).
         pm_hist.push_back((now_ms_books as i64, up_mid));
-        while pm_hist.front().is_some_and(|(t, _)| now_ms_books as i64 - t > 30_000) {
+        while pm_hist
+            .front()
+            .is_some_and(|(t, _)| now_ms_books as i64 - t > 30_000)
+        {
             pm_hist.pop_front();
         }
         let look_ms = cfg.sc_pm_mom_look_s * 1000;
@@ -738,8 +939,7 @@ async fn quote_loop(
         // vide — TOUT signal pm est du bruit (armement, pull, urgence, exit).
         // On le met à zéro : il ne reste que la complétion patiente, la chaîne
         // de fin de fenêtre et le flatten. Tue aussi le spam « PULL PM ».
-        let pm_mom = if bb_up > cfg.sc_skew_complete_below && bb_dn > cfg.sc_skew_complete_below
-        {
+        let pm_mom = if bb_up > cfg.sc_skew_complete_below && bb_dn > cfg.sc_skew_complete_below {
             pm_mom
         } else {
             0.0
@@ -757,8 +957,8 @@ async fn quote_loop(
             pm_lean_sign = lean_sign;
             pm_lean_since_ms = now_ms_books as i64;
         }
-        let pm_persisted = lean_sign != 0
-            && now_ms_books as i64 - pm_lean_since_ms >= cfg.sc_pm_persist_s * 1000;
+        let pm_persisted =
+            lean_sign != 0 && now_ms_books as i64 - pm_lean_since_ms >= cfg.sc_pm_persist_s * 1000;
         let pm_side = if pm_mom >= cfg.sc_pm_mom && pm_persisted {
             Some(Side::Up)
         } else if pm_mom <= -cfg.sc_pm_mom && pm_persisted {
@@ -832,7 +1032,11 @@ async fn quote_loop(
                 let px_w = if w == Side::Up { up_mid } else { down_mid };
                 tracing::info!(
                     side = w.as_str(),
-                    source = if tokyo_winner.is_some() { "tokyo" } else { "pm-momentum" },
+                    source = if tokyo_winner.is_some() {
+                        "tokyo"
+                    } else {
+                        "pm-momentum"
+                    },
                     px_gagnant = format!("{px_w:.2}"),
                     pm_mom = format!("{pm_mom:+.3}"),
                     drift = format!("{drift_ps:+.5}"),
@@ -858,7 +1062,11 @@ async fn quote_loop(
         let net_cap = cfg.sc_trend_net_cap.max(cfg.sc_dir_tilt).max(1.0);
         let held_side = bet_side.or(skew_winner);
         let hold_dir_bet = held_side.is_some_and(|w| {
-            let surplus = if w == Side::Up { sc.imbalance() } else { -sc.imbalance() };
+            let surplus = if w == Side::Up {
+                sc.imbalance()
+            } else {
+                -sc.imbalance()
+            };
             surplus > 1e-9 && surplus <= net_cap + 1e-9
         });
         if hold_dir_bet {
@@ -891,8 +1099,11 @@ async fn quote_loop(
         };
         if let Some(d) = pm_pull {
             if last_pm_pull != Some(d) {
-                tracing::info!(cote_retire = d.as_str(), pm_mom = format!("{pm_mom:+.3}"),
-                    "PULL PM — le carnet penche : plus d'ouverture du côté mourant");
+                tracing::info!(
+                    cote_retire = d.as_str(),
+                    pm_mom = format!("{pm_mom:+.3}"),
+                    "PULL PM — le carnet penche : plus d'ouverture du côté mourant"
+                );
             }
             desired.retain(|b| b.completion || b.side != d);
         }
@@ -919,8 +1130,11 @@ async fn quote_loop(
                     || (b.side == Side::Down && pm_lean_sign < 0));
             if b.completion
                 && ((!urgency_blocked
-                    && (crate::engines::spread_capture::completion_urgent(b.side, drift_ps, cfg.sc_urgency_drift)
-                        || pm_urgent))
+                    && (crate::engines::spread_capture::completion_urgent(
+                        b.side,
+                        drift_ps,
+                        cfg.sc_urgency_drift,
+                    ) || pm_urgent))
                     || endgame)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
@@ -931,7 +1145,10 @@ async fn quote_loop(
                     // 0,90+ ; à T−20 le taker était déjà hors plafond → 6 Down
                     // morts au flatten. La fenêtre T−45→T−20 doit pouvoir suivre
                     // l'ask (toujours maker, zéro frais) jusqu'au plafond rampé.
-                    let avg_excess = sc.avg(match b.side { Side::Up => Side::Down, Side::Down => Side::Up });
+                    let avg_excess = sc.avg(match b.side {
+                        Side::Up => Side::Down,
+                        Side::Down => Side::Up,
+                    });
                     let ramp_s = cfg.sc_rescue_ramp_s.max(1.0);
                     let time_ramp =
                         ((ramp_s - m.time_remaining_sec() as f64) / ramp_s).clamp(0.0, 1.0);
@@ -943,13 +1160,20 @@ async fn quote_loop(
                     // est +EV (même logique que la rampe signal du sauvetage).
                     let pm_ramp =
                         ((pm_for - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
-                    let ramped_pair = cfg.sc_completion_max_pair
-                        + time_ramp.max(sig_ramp).max(pm_ramp)
-                            * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
+                    let base_pair = cfg.sc_completion_max_pair.min(1.0);
+                    let rescue_ceiling = if cfg.sc_allow_loss_rescue {
+                        cfg.sc_rescue_max_pair
+                    } else {
+                        base_pair
+                    };
+                    let ramped_pair = base_pair
+                        + time_ramp.max(sig_ramp).max(pm_ramp) * (rescue_ceiling - base_pair);
                     let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
-                    let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room)) / tick_sz)
-                        .floor() * tick_sz;
+                    let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room))
+                        / tick_sz)
+                        .floor()
+                        * tick_sz;
                     if capped > b.price + 1e-9 {
                         // Distinguer les deux déclencheurs : le drift=+0.0000 des
                         // logs du 8 juil. venait de la fin de fenêtre, PAS de Tokyo.
@@ -959,7 +1183,9 @@ async fn quote_loop(
                             let cause = if endgame {
                                 "fin de fenêtre"
                             } else if crate::engines::spread_capture::completion_urgent(
-                                b.side, drift_ps, cfg.sc_urgency_drift,
+                                b.side,
+                                drift_ps,
+                                cfg.sc_urgency_drift,
                             ) {
                                 "drift Tokyo"
                             } else {
@@ -979,21 +1205,20 @@ async fn quote_loop(
         #[cfg(feature = "live")]
         if let Some(lv) = live.as_mut() {
             let mut harvested: Vec<crate::live::engine::LiveFill> = Vec::new();
-            // ═══ VÉRITÉ CLOB D'ABORD (principe : décider sur le CLOB, jamais
-            // sur le miroir/dashboard) : on synchronise nos ordres restants avec
-            // le carnet RÉEL (poll /data/orders + balayage des ordres fantômes)
-            // AVANT toute décision de pose. Résultat : les slots lrest reflètent
-            // la réalité Polymarket → on ne pose jamais atop un ordre en attente
-            // qu'on n'aurait pas vu, ni ne reprice un ordre déjà fillé.
-            let mut fills = lv.drain_ws(&mut lrest);
-            fills.extend(lv.reconcile(&mut lrest, now_ms_books as i64).await);
+            // Les fills WS/poll ont déjà été drainés et appliqués avant
+            // `desired_bids` ci-dessus. Seuls les fills récoltés PENDANT cette
+            // phase de cancel/reprice seront appliqués après les placements.
+            let mut fills: Vec<LiveFill> = Vec::new();
             // ═══ SORTIE ÉCLAIR : le signal s'est RETOURNÉ contre l'inventaire
             // skew → on vend TOUT DE SUITE en FAK (perdre un peu maintenant
             // plutôt que beaucoup à la résolution), puis cooldown 60 s
             // anti-whipsaw et retour au MM symétrique.
             if let Some(held) = bet_side {
-                let surplus =
-                    if held == Side::Up { sc.imbalance() } else { -sc.imbalance() };
+                let surplus = if held == Side::Up {
+                    sc.imbalance()
+                } else {
+                    -sc.imbalance()
+                };
                 let flipped = skew_winner == Some(held.opposite())
                     || (held == Side::Up && pm_mom <= -cfg.sc_pm_mom)
                     || (held == Side::Down && pm_mom >= cfg.sc_pm_mom);
@@ -1014,7 +1239,15 @@ async fn quote_loop(
                             let fee = 0.07 * avg * (1.0 - avg) * sold;
                             lv.cash -= fee;
                             win_taker_fees += fee;
-                            paper.try_sell(held.as_str(), avg, sold, "taker");
+                            win_purposes.skew_accumulation.sell_notional += avg * sold;
+                            win_purposes.skew_accumulation.taker_fees += fee;
+                            paper.try_sell_with_purpose(
+                                held.as_str(),
+                                avg,
+                                sold,
+                                "taker",
+                                "skew_accumulation",
+                            );
                             let avg_cost = sc.avg(held);
                             match held {
                                 Side::Up => {
@@ -1054,14 +1287,17 @@ async fn quote_loop(
             if accum_fak_pending && cfg.sc_skew_fak && enabled {
                 if let Some(w) = skew_winner {
                     let is_up = w == Side::Up;
-                    let (ask, ask_sz) =
-                        if is_up { (ask_up, ask_up_sz) } else { (ask_dn, ask_dn_sz) };
-                    let surplus = if is_up { sc.imbalance() } else { -sc.imbalance() };
-                    let resting_open: f64 = lrest
-                        .iter()
-                        .filter(|s| s.is_up == is_up)
-                        .map(|s| (s.r.size - s.r.matched).max(0.0))
-                        .sum();
+                    let (ask, ask_sz) = if is_up {
+                        (ask_up, ask_up_sz)
+                    } else {
+                        (ask_dn, ask_dn_sz)
+                    };
+                    let surplus = if is_up {
+                        sc.imbalance()
+                    } else {
+                        -sc.imbalance()
+                    };
+                    let resting_open = lv.open_exposure(&lrest).side(is_up);
                     let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
                         accum_fak_inflight.0
                     } else {
@@ -1072,7 +1308,10 @@ async fn quote_loop(
                         .min(cap_room)
                         .min(ask_sz.max(1.0))
                         .floor();
-                    let min_req = m.min_order_size.max(1.0).max((1.0_f64 / ask.max(0.01)).ceil());
+                    let min_req = m
+                        .min_order_size
+                        .max(1.0)
+                        .max((1.0_f64 / ask.max(0.01)).ceil());
                     if ask > 0.0
                         && ask <= cfg.sc_skew_fak_max
                         && m.time_remaining_sec() > cfg.sc_opening_stop_s
@@ -1089,7 +1328,8 @@ async fn quote_loop(
                             drift = format!("{drift_ps:+.5}"),
                             "ACCUMULATION taker — on paie l'ask à l'armement (signal plein)"
                         );
-                        lv.place_insurance_fak(is_up, ask, sz).await;
+                        lv.place_insurance_fak(is_up, ask, sz, OrderIntent::SkewAccumulation)
+                            .await;
                     } else if ask > cfg.sc_skew_fak_max
                         || m.time_remaining_sec() <= cfg.sc_opening_stop_s
                     {
@@ -1127,7 +1367,9 @@ async fn quote_loop(
                 let open_buf = (1.0 + open_extra) * tick_sz;
                 let open_common: Option<f64> = {
                     let ou = desired.iter().find(|b| b.side == Side::Up && !b.completion);
-                    let od = desired.iter().find(|b| b.side == Side::Down && !b.completion);
+                    let od = desired
+                        .iter()
+                        .find(|b| b.side == Side::Down && !b.completion);
                     match (ou, od) {
                         (Some(u), Some(d)) => {
                             let req_u = min_shares.max((1.0_f64 / u.price.max(0.01)).ceil());
@@ -1176,12 +1418,15 @@ async fn quote_loop(
                 //    → 12 Down pour un besoin de 6, 6 orphelins morts à 0) ;
                 //  · un cancel non confirmé GÈLE son côté pour ce tick — l'ordre
                 //    est peut-être encore vivant, poster par-dessus = doublon.
-                let mut open_side: [f64; 2] = [0.0; 2];
-                for s in lrest.iter() {
-                    open_side[if s.is_up { 0 } else { 1 }] +=
-                        (s.r.size - s.r.matched).max(0.0);
-                }
-                let mut side_frozen: [bool; 2] = [false, false];
+                let exposure = lv.open_exposure(&lrest);
+                let mut open_side: [f64; 2] = [exposure.side(true), exposure.side(false)];
+                // Un audit signifie qu'on ne sait pas encore si le reliquat est
+                // au carnet. Toute nouvelle pose du côté serait un doublon
+                // potentiel, en particulier une complétion.
+                let mut side_frozen: [bool; 2] = [
+                    exposure.uncertain_side(true) > 1e-9,
+                    exposure.uncertain_side(false) > 1e-9,
+                ];
                 for (side, ask) in [(Side::Up, ask_up), (Side::Down, ask_dn)] {
                     let want = desired.iter().find(|b| b.side == side);
                     let is_comp = want.map(|b| b.completion).unwrap_or(false);
@@ -1233,16 +1478,16 @@ async fn quote_loop(
                     let mut is_comp = is_comp;
                     let mut skew_acc = false;
                     if skew_winner == Some(side) && !is_comp {
-                        let surplus = if is_up { sc.imbalance() } else { -sc.imbalance() };
+                        let surplus = if is_up {
+                            sc.imbalance()
+                        } else {
+                            -sc.imbalance()
+                        };
                         // Le cap compte AUSSI ce qui est déjà posé au carnet côté
                         // gagnant : sans ça, 2 niveaux × 12 + un repost = 36 parts
                         // remplies en 3 s pour un cap de 12 (incident 12 juil.
                         // 16:50:09, imb=-36).
-                        let resting_open: f64 = lrest
-                            .iter()
-                            .filter(|s| s.is_up == is_up)
-                            .map(|s| (s.r.size - s.r.matched).max(0.0))
-                            .sum();
+                        let resting_open = lv.open_exposure(&lrest).side(is_up);
                         let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
                             accum_fak_inflight.0
                         } else {
@@ -1255,7 +1500,11 @@ async fn quote_loop(
                             && bb_side > 0.0
                             && bb_side <= cfg.sc_open_max_price
                         {
-                            let cap = if ask > 0.0 { ask - open_buf } else { bb_side + tick_sz };
+                            let cap = if ask > 0.0 {
+                                ask - open_buf
+                            } else {
+                                bb_side + tick_sz
+                            };
                             let px = (((bb_side + tick_sz).min(cap)) / tick_sz).floor() * tick_sz;
                             let sz = (cfg.sc_base_clip * cfg.sc_skew_mult).min(cap_room).floor();
                             let min_req = min_shares.max((1.0_f64 / px.max(0.01)).ceil());
@@ -1297,17 +1546,21 @@ async fn quote_loop(
                             }
                             _ => None,
                         };
-                        let slot_pos = lrest.iter().position(|s| s.is_up == is_up && s.level == lvl);
+                        let slot_pos = lrest
+                            .iter()
+                            .position(|s| s.is_up == is_up && s.level == lvl);
                         match (target, slot_pos) {
                             (Some((px, sz)), cur) => {
                                 // ANTI-CHURN (7 juil.) : reprice seulement si l'écart
                                 // dépasse 2 ticks ET ≥4 s depuis le dernier placement
                                 // de ce (côté, niveau).
-                                let cooled =
-                                    now_ms_books as i64 - last_place_ms[side_ix][lvl as usize] >= 4_000;
+                                let cooled = now_ms_books as i64
+                                    - last_place_ms[side_ix][lvl as usize]
+                                    >= 4_000;
                                 let reprice = match cur {
                                     Some(i) => {
-                                        (px - lrest[i].r.price).abs() > 2.0 * tick_sz + 1e-9 && cooled
+                                        (px - lrest[i].r.price).abs() > 2.0 * tick_sz + 1e-9
+                                            && cooled
                                     }
                                     None => cooled,
                                 };
@@ -1341,7 +1594,9 @@ async fn quote_loop(
                                     // tick ; complétion → exclusivité totale (rien
                                     // d'autre ne doit rester ouvert de ce côté).
                                     if side_frozen[side_ix]
-                                        || (is_comp && open_side[side_ix] > 0.01)
+                                        || (is_comp
+                                            && (open_side[side_ix] > 0.01
+                                                || exposure.completion_side(is_up) > 0.01))
                                     {
                                         tracing::warn!(side = ?side,
                                             open = format!("{:.1}", open_side[side_ix]),
@@ -1351,7 +1606,11 @@ async fn quote_loop(
                                     }
                                     // RE-CLAMP au dernier moment : ask le plus frais
                                     // juste avant le POST.
-                                    let tok = if is_up { &m.up_token_id } else { &m.down_token_id };
+                                    let tok = if is_up {
+                                        &m.up_token_id
+                                    } else {
+                                        &m.down_token_id
+                                    };
                                     let fa = fresh_ask(tok, ask);
                                     let px = if fa > buf {
                                         px.min(((fa - buf) / tick_sz).floor() * tick_sz)
@@ -1361,9 +1620,23 @@ async fn quote_loop(
                                     if px >= 0.01 {
                                         // OUVERTURES en POST-ONLY : croiser = rejet
                                         // propre du CLOB (zéro taxe accidentelle).
-                                        if let Some(r) = lv.place_bid(is_up, px, sz, !is_comp).await {
+                                        let intent = if is_comp {
+                                            OrderIntent::Completion
+                                        } else if skew_acc {
+                                            OrderIntent::SkewAccumulation
+                                        } else {
+                                            OrderIntent::SymmetricOpen
+                                        };
+                                        if let Some(r) =
+                                            lv.place_bid(is_up, px, sz, !is_comp, intent).await
+                                        {
                                             open_side[side_ix] += (r.size - r.matched).max(0.0);
-                                            lrest.push(LiveSlot { r, is_up, level: lvl });
+                                            lrest.push(LiveSlot {
+                                                r,
+                                                is_up,
+                                                level: lvl,
+                                                intent,
+                                            });
                                         }
                                         last_place_ms[side_ix][lvl as usize] = now_ms_books as i64;
                                     }
@@ -1376,8 +1649,7 @@ async fn quote_loop(
                                     harvested.push(f);
                                 }
                                 if safe {
-                                    open_side[side_ix] -=
-                                        (slot.r.size - slot.r.matched).max(0.0);
+                                    open_side[side_ix] -= (slot.r.size - slot.r.matched).max(0.0);
                                 } else {
                                     side_frozen[side_ix] = true;
                                 }
@@ -1390,46 +1662,22 @@ async fn quote_loop(
             // Fills : ceux du CLOB drainés en tête de bloc (avant la pose) +
             // ceux récoltés pendant la pose (reprice/cancel de CE tick).
             fills.append(&mut harvested);
-            for f in fills {
-                last_fill_wall_ms = now_ms_books as i64;
-                lv.note_fill_cash(f.price, f.size); // cash réel décrémenté sans attendre le CLOB
-                if !f.maker {
-                    // Taxe taker : décomptée du cash réel tout de suite (le sync
-                    // CLOB la confirmera) + visible au dashboard. Chaque taker
-                    // est une anomalie à expliquer (cross ou FAK d'assurance).
-                    let fee = 0.07 * f.price * (1.0 - f.price) * f.size;
-                    lv.cash -= fee;
-                    win_taker_fees += fee;
-                    tracing::warn!(
-                        px = format!("{:.3}", f.price),
-                        size = format!("{:.1}", f.size),
-                        fee = format!("{:.3}", fee),
-                        "fill TAKER — taxe payée (cross d'ouverture ou FAK)"
-                    );
-                }
-                let side = if f.is_up { Side::Up } else { Side::Down };
-                let ltype = if f.maker { "maker" } else { "taker" };
-                // INCONDITIONNEL : un fill réel est un FAIT — la comptabilité
-                // l'enregistre toujours (bug des 36 vs 18 Up du 8 juil.).
-                paper.apply_live_fill(side.as_str(), f.price, f.size, ltype);
-                sc.on_fill(side, f.price, f.size, now_s);
-                win_fills += 1;
-                win_deployed += f.price * f.size;
-                if f.maker {
-                    win_rebate += cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
-                }
-                if sc.imbalance().abs() > win_imb_max.abs() {
-                    win_imb_max = sc.imbalance();
-                }
-                tracing::info!(
-                    side = side.as_str(),
-                    px = format!("{:.3}", f.price),
-                    size = format!("{:.1}", f.size),
-                    ltype,
-                    imb = format!("{:.0}", sc.imbalance()),
-                    "[LIVE] fill réel"
-                );
-            }
+            apply_live_fills(
+                fills,
+                lv,
+                &mut paper,
+                &mut sc,
+                now_s,
+                now_ms_books as i64,
+                &cfg,
+                &mut last_fill_wall_ms,
+                &mut win_taker_fees,
+                &mut win_fills,
+                &mut win_deployed,
+                &mut win_rebate,
+                &mut win_imb_max,
+                &mut win_purposes,
+            );
             // Assurance taker (jamais une fenêtre à un seul côté) — FAK réel,
             // au plus 1 tentative / 3 s (le fill revient par le WS).
             let remaining_l = m.time_remaining_sec();
@@ -1441,9 +1689,15 @@ async fn quote_loop(
             //    MAINTENANT au marché plutôt que de laisser la jambe partir nue
             //    (« compenser la perte » demandé le 9 juil.). Borné au plafond de
             //    paire : au-delà, résidu accepté (perte bornée).
-            let deficit_side = if sc.imbalance() > 0.0 { Side::Down } else { Side::Up };
+            let deficit_side = if sc.imbalance() > 0.0 {
+                Side::Down
+            } else {
+                Side::Up
+            };
             let taker_drift_urgent = crate::engines::spread_capture::completion_urgent(
-                deficit_side, drift_ps, cfg.sc_taker_drift,
+                deficit_side,
+                drift_ps,
+                cfg.sc_taker_drift,
             );
             if enabled
                 && !hold_dir_bet // pari directionnel en cours → on le laisse courir, pas de complétion
@@ -1478,10 +1732,17 @@ async fn quote_loop(
                 let pm_ramp_ins =
                     ((pm_for_ins - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
                 let conf = time_ramp.max(sig_ramp).max(pm_ramp_ins);
-                let rescue_pair = cfg.sc_completion_max_pair
-                    + conf * (cfg.sc_rescue_max_pair - cfg.sc_completion_max_pair);
+                let base_pair = cfg.sc_completion_max_pair.min(1.0);
+                let rescue_ceiling = if cfg.sc_allow_loss_rescue {
+                    cfg.sc_rescue_max_pair
+                } else {
+                    base_pair
+                };
+                let rescue_pair = base_pair + conf * (rescue_ceiling - base_pair);
                 let pair_room_ins = rescue_pair - avg_excess_ins;
-                if ask > 0.0 && ask <= 0.99 && ask <= pair_room_ins + 1e-9 {
+                let fee_per_share = 0.07 * ask * (1.0 - ask);
+                let all_in_ask = ask + fee_per_share;
+                if ask > 0.0 && ask <= 0.99 && all_in_ask <= pair_room_ins + 1e-9 {
                     // PURGE avant le FAK : tout ordre maker encore ouvert du même
                     // côté (la complétion agressive, typiquement) doit être annulé
                     // AVANT de payer le marché — sinon FAK + maker peuvent se
@@ -1494,24 +1755,21 @@ async fn quote_loop(
                             let slot = lrest.remove(i);
                             let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
                             if let Some(f) = f {
-                                // Fill récolté à la purge : la boucle de compta des
-                                // fills a DÉJÀ tourné ce tick → on comptabilise ici
-                                // (mêmes écritures), le déficit se recalcule dessous.
-                                last_fill_wall_ms = now_ms_books as i64;
-                                lv.note_fill_cash(f.price, f.size);
-                                let fside = if f.is_up { Side::Up } else { Side::Down };
-                                paper.apply_live_fill(fside.as_str(), f.price, f.size, "maker");
-                                sc.on_fill(fside, f.price, f.size, now_s);
-                                win_fills += 1;
-                                win_deployed += f.price * f.size;
-                                win_rebate +=
-                                    cfg.sc_rebate_rate * 0.07 * f.price * (1.0 - f.price) * f.size;
-                                tracing::info!(
-                                    side = fside.as_str(),
-                                    px = format!("{:.3}", f.price),
-                                    size = format!("{:.1}", f.size),
-                                    imb = format!("{:.0}", sc.imbalance()),
-                                    "[LIVE] fill réel (purge pré-sauvetage)"
+                                apply_live_fills(
+                                    vec![f],
+                                    lv,
+                                    &mut paper,
+                                    &mut sc,
+                                    now_s,
+                                    now_ms_books as i64,
+                                    &cfg,
+                                    &mut last_fill_wall_ms,
+                                    &mut win_taker_fees,
+                                    &mut win_fills,
+                                    &mut win_deployed,
+                                    &mut win_rebate,
+                                    &mut win_imb_max,
+                                    &mut win_purposes,
                                 );
                             }
                             if !safe {
@@ -1531,18 +1789,27 @@ async fn quote_loop(
                             side = if is_up { "up" } else { "down" },
                             "sauvetage différé : cancel non confirmé du même côté (fill en vol probable)"
                         );
-                    } else if sz + 1e-9 >= min_req && ask * sz <= lv.cash {
+                    } else if sz + 1e-9 >= min_req && (ask + fee_per_share) * sz <= lv.cash {
                         last_insurance_ms = now_ms_books as i64;
-                        let cause = if taker_drift_urgent && remaining_l > 20 { "drift fort" } else { "fin de fenêtre" };
-                        let pair_now = ask + avg_excess_ins;
+                        let cause = if taker_drift_urgent && remaining_l > 20 {
+                            "drift fort"
+                        } else {
+                            "fin de fenêtre"
+                        };
+                        let pair_now = all_in_ask + avg_excess_ins;
                         tracing::info!(
-                            side = if is_up { "up" } else { "down" }, ask = format!("{ask:.3}"),
-                            size = format!("{sz:.1}"), rem = remaining_l,
-                            drift = format!("{drift_ps:+.5}"), cause,
-                            pair = format!("{pair_now:.3}"), cap = format!("{rescue_pair:.3}"),
+                            side = if is_up { "up" } else { "down" },
+                            ask = format!("{ask:.3}"),
+                            size = format!("{sz:.1}"),
+                            rem = remaining_l,
+                            drift = format!("{drift_ps:+.5}"),
+                            cause,
+                            pair = format!("{pair_now:.3}"),
+                            cap = format!("{rescue_pair:.3}"),
                             "SAUVETAGE taker (paie le marché pour compléter la paire)"
                         );
-                        lv.place_insurance_fak(is_up, ask, sz).await;
+                        lv.place_insurance_fak(is_up, ask, sz, OrderIntent::Rescue)
+                            .await;
                     }
                 }
             }
@@ -1572,7 +1839,11 @@ async fn quote_loop(
             {
                 let excess_up = sc.imbalance() > 0.0;
                 let side = if excess_up { Side::Up } else { Side::Down };
-                let held = if excess_up { paper.state.up_balance } else { paper.state.down_balance };
+                let held = if excess_up {
+                    paper.state.up_balance
+                } else {
+                    paper.state.down_balance
+                };
                 let sz = sc.imbalance().abs().min(held);
                 let bid = if excess_up { bb_up } else { bb_dn };
                 if sz > 0.0 && bid > 0.0 {
@@ -1582,6 +1853,8 @@ async fn quote_loop(
                         let fee = 0.07 * avg * (1.0 - avg) * sold;
                         lv.cash -= fee;
                         win_taker_fees += fee;
+                        win_purposes.flatten.sell_notional += avg * sold;
+                        win_purposes.flatten.taker_fees += fee;
                         paper.try_sell(side.as_str(), avg, sold, "taker");
                         let avg_cost = sc.avg(side);
                         match side {
@@ -1594,11 +1867,19 @@ async fn quote_loop(
                                 sc.cost_dn = (sc.cost_dn - avg_cost * sold).max(0.0);
                             }
                         }
-                        let cause = if dust_case { "poussière (incomplétable)" } else { "fin de fenêtre" };
+                        let cause = if dust_case {
+                            "poussière (incomplétable)"
+                        } else {
+                            "fin de fenêtre"
+                        };
                         tracing::info!(
-                            side = side.as_str(), sold = format!("{sold:.2}"),
-                            px = format!("{avg:.3}"), recupere = format!("{:.2}", avg * sold),
-                            fee = format!("{fee:.3}"), rem = remaining_l, cause,
+                            side = side.as_str(),
+                            sold = format!("{sold:.2}"),
+                            px = format!("{avg:.3}"),
+                            recupere = format!("{:.2}", avg * sold),
+                            fee = format!("{fee:.3}"),
+                            rem = remaining_l,
+                            cause,
                             "FLATTEN résidu — vendu au marché (au lieu de mourir nu)"
                         );
                     }
@@ -1614,8 +1895,10 @@ async fn quote_loop(
                     win_merge_n += 1;
                     if blended > 1.0 + 1e-9 {
                         urgency_block_until = now_s + 45;
-                        tracing::info!(blended = format!("{blended:.3}"),
-                            "merge à paire > 1$ — escalade gelée 45 s (le quoting ≤1$ continue)");
+                        tracing::info!(
+                            blended = format!("{blended:.3}"),
+                            "merge à paire > 1$ — escalade gelée 45 s (le quoting ≤1$ continue)"
+                        );
                     }
                 }
                 // Crédit EXACT : uniquement les paires de LA transaction (le
@@ -1632,7 +1915,11 @@ async fn quote_loop(
                 lv.force_cash_resync(); // …et le CLOB tranche au prochain sync
                 sc.on_merge(p);
                 win_merged += p;
-                tracing::info!(pairs_tx = pairs_done, credited = p, "merge on-chain appliqué (crédit exact)");
+                tracing::info!(
+                    pairs_tx = pairs_done,
+                    credited = p,
+                    "merge on-chain appliqué (crédit exact)"
+                );
             }
             // MERGE = pompe à volume, mais action ON-CHAIN IRRÉVERSIBLE : on ne
             // la déclenche JAMAIS sur le miroir. On lit les positions RÉELLES du
@@ -1675,9 +1962,15 @@ async fn quote_loop(
             } else if let Some((ru, rd)) = lv.real_positions(now_ms_books as i64).await {
                 let (mu, md) = (paper.state.up_balance, paper.state.down_balance);
                 if (ru - mu).abs() > 0.5 || (rd - md).abs() > 0.5 {
+                    lv.halt(format!(
+                        "divergence inventaire confirmée (réel {ru:.2}/{rd:.2}, miroir {mu:.2}/{md:.2})"
+                    ));
                     tracing::warn!(
-                        reel_up = ru, reel_dn = rd, miroir_up = mu, miroir_dn = md,
-                        "positions désynchronisées — miroir ALIGNÉ sur la réalité"
+                        reel_up = ru,
+                        reel_dn = rd,
+                        miroir_up = mu,
+                        miroir_dn = md,
+                        "positions désynchronisées — miroir aligné puis nouvelles poses arrêtées"
                     );
                     paper.state.up_balance = ru;
                     paper.state.down_balance = rd;
@@ -1685,8 +1978,16 @@ async fn quote_loop(
                     // et les COÛTS sont mis à l'échelle : ajuster les parts sans
                     // les coûts gonfle l'avg (10 juil. 02:01 : 18→12 Down sans
                     // scaling → blended fantôme 1.248 → escalade gelée à tort).
-                    let scale_u = if sc.shares_up > 1e-9 { ru / sc.shares_up } else { 0.0 };
-                    let scale_d = if sc.shares_dn > 1e-9 { rd / sc.shares_dn } else { 0.0 };
+                    let scale_u = if sc.shares_up > 1e-9 {
+                        ru / sc.shares_up
+                    } else {
+                        0.0
+                    };
+                    let scale_d = if sc.shares_dn > 1e-9 {
+                        rd / sc.shares_dn
+                    } else {
+                        0.0
+                    };
                     sc.cost_up = (sc.cost_up * scale_u.min(1.0)).max(0.0);
                     sc.cost_dn = (sc.cost_dn * scale_d.min(1.0)).max(0.0);
                     sc.shares_up = ru;
@@ -1704,14 +2005,22 @@ async fn quote_loop(
                 d.live_collateral = lv.cash;
                 d.live_wallet_pnl = lv.cash - lv.baseline;
                 d.order_rtt_ms = lv.last_rtt_ms;
+                d.audit_orders = lv.audit_count();
+                d.audit_oldest_ms = lv.audit_oldest_age_ms(now_ms_books as i64);
+                d.live_halted = lv.is_halted();
+                d.live_halt_reason = lv.halted_reason.clone().unwrap_or_default();
             }
             // Miroir des bids pour le dashboard.
             // Affichage : le MEILLEUR bid (niveau le plus haut) par côté + le
             // compte réel d'ordres ouverts (échelle comprise).
-            rest_up = lrest.iter().filter(|s| s.is_up)
+            rest_up = lrest
+                .iter()
+                .filter(|s| s.is_up)
                 .max_by(|a, b| a.r.price.total_cmp(&b.r.price))
                 .map(|s| (s.r.price, s.r.size));
-            rest_dn = lrest.iter().filter(|s| !s.is_up)
+            rest_dn = lrest
+                .iter()
+                .filter(|s| !s.is_up)
                 .max_by(|a, b| a.r.price.total_cmp(&b.r.price))
                 .map(|s| (s.r.price, s.r.size));
             live_open_ct = Some(lrest.len() as u32);
@@ -1719,48 +2028,47 @@ async fn quote_loop(
 
         let live_mode = !cfg.dry_run;
         if !live_mode {
-        for (side_rest, side) in [(&mut rest_up, Side::Up), (&mut rest_dn, Side::Down)] {
-            let want = desired.iter().find(|b| b.side == side);
-            match (want, side_rest.as_ref()) {
-                (Some(b), Some((p, _))) if (b.price - p).abs() > tick_sz / 2.0 + 1e-9 => {
-                    *side_rest = Some((b.price, b.size)); // cancel + repost (reprice)
+            for (side_rest, side) in [(&mut rest_up, Side::Up), (&mut rest_dn, Side::Down)] {
+                let want = desired.iter().find(|b| b.side == side);
+                match (want, side_rest.as_ref()) {
+                    (Some(b), Some((p, _))) if (b.price - p).abs() > tick_sz / 2.0 + 1e-9 => {
+                        *side_rest = Some((b.price, b.size)); // cancel + repost (reprice)
+                    }
+                    (Some(b), None) => *side_rest = Some((b.price, b.size)),
+                    (None, Some(_)) => *side_rest = None, // plus de quote désirée → cancel
+                    _ => {} // on garde l'ordre en place (préserve la file en live)
                 }
-                (Some(b), None) => *side_rest = Some((b.price, b.size)),
-                (None, Some(_)) => *side_rest = None, // plus de quote désirée → cancel
-                _ => {} // on garde l'ordre en place (préserve la file en live)
             }
-        }
 
-        // 2) Fills par CROSS : le best ask traverse notre bid → fill certain.
-        for (side_rest, side, ask, ask_sz) in [
-            (&mut rest_up, Side::Up, ask_up, ask_up_sz),
-            (&mut rest_dn, Side::Down, ask_dn, ask_dn_sz),
-        ] {
-            if let Some((price, size)) = *side_rest {
-                if ask > 0.0 && ask <= price + 1e-9 {
-                    let fill = size.min(ask_sz.max(1.0)).floor();
-                    if fill >= 1.0 && paper.try_buy(side.as_str(), price, fill, "maker") {
-                        sc.on_fill(side, price, fill, now_s);
-                        win_fills += 1;
-                        win_deployed += price * fill;
-                        // Rebate estimé : part des frais taker payés par la contrepartie.
-                        win_rebate += cfg.sc_rebate_rate * 0.07 * price * (1.0 - price) * fill;
-                        if sc.imbalance().abs() > win_imb_max.abs() {
-                            win_imb_max = sc.imbalance();
+            // 2) Fills par CROSS : le best ask traverse notre bid → fill certain.
+            for (side_rest, side, ask, ask_sz) in [
+                (&mut rest_up, Side::Up, ask_up, ask_up_sz),
+                (&mut rest_dn, Side::Down, ask_dn, ask_dn_sz),
+            ] {
+                if let Some((price, size)) = *side_rest {
+                    if ask > 0.0 && ask <= price + 1e-9 {
+                        let fill = size.min(ask_sz.max(1.0)).floor();
+                        if fill >= 1.0 && paper.try_buy(side.as_str(), price, fill, "maker") {
+                            sc.on_fill(side, price, fill, now_s);
+                            win_fills += 1;
+                            win_deployed += price * fill;
+                            // Rebate estimé : part des frais taker payés par la contrepartie.
+                            win_rebate += cfg.sc_rebate_rate * 0.07 * price * (1.0 - price) * fill;
+                            if sc.imbalance().abs() > win_imb_max.abs() {
+                                win_imb_max = sc.imbalance();
+                            }
+                            tracing::info!(
+                                side = side.as_str(),
+                                px = format!("{:.3}", price),
+                                size = format!("{:.0}", fill),
+                                imb = format!("{:.0}", sc.imbalance()),
+                                "[V8] fill maker (cross)"
+                            );
+                            *side_rest = None; // re-quote au tick suivant (après cooldown)
                         }
-                        tracing::info!(
-                            side = side.as_str(),
-                            px = format!("{:.3}", price),
-                            size = format!("{:.0}", fill),
-                            imb = format!("{:.0}", sc.imbalance()),
-                            "[V8] fill maker (cross)"
-                        );
-                        *side_rest = None; // re-quote au tick suivant (après cooldown)
                     }
                 }
             }
-        }
-
         } // fin du chemin PAPER (simulation cross-fill)
 
         // 2b) COMPLÉTION TAKER de dernier recours : une fenêtre ne doit JAMAIS finir
@@ -1834,8 +2142,8 @@ async fn quote_loop(
             d.down_ask = ask_dn;
             d.in_band = rest_up.is_some() || rest_dn.is_some();
             d.signal_age_ms = sig_age_ms;
-            d.open_orders = live_open_ct
-                .unwrap_or(rest_up.is_some() as u32 + rest_dn.is_some() as u32);
+            d.open_orders =
+                live_open_ct.unwrap_or(rest_up.is_some() as u32 + rest_dn.is_some() as u32);
             if d.last_block_reason.starts_with("SIGNAL TOKYO") {
                 d.last_block_reason.clear();
             }
@@ -1844,8 +2152,14 @@ async fn quote_loop(
             d.size_factor = size_factor;
             d.loss_streak = loss_streak;
             d.pair_cost = sc.pair_cost().unwrap_or(0.0);
-            d.merge_pair_avg = if win_merge_n > 0 { win_merge_cost_sum / win_merge_n as f64 } else { 0.0 };
-            d.skew_side = skew_winner.map(|w| w.as_str().to_string()).unwrap_or_default();
+            d.merge_pair_avg = if win_merge_n > 0 {
+                win_merge_cost_sum / win_merge_n as f64
+            } else {
+                0.0
+            };
+            d.skew_side = skew_winner
+                .map(|w| w.as_str().to_string())
+                .unwrap_or_default();
             d.taker_fees_window = win_taker_fees;
             d.dir_wins = dir_wins;
             d.dir_total = dir_total;
@@ -1893,57 +2207,87 @@ async fn quote_loop(
             d.sells = paper.state.sells;
             d.maker_fills = paper.state.maker_fills;
             d.taker_fills = paper.state.taker_fills;
-            d.last_block_reason =
-                if sleeping { "sommeil (heures creuses UTC)".into() } else { String::new() };
+            d.last_block_reason = if d.live_halted {
+                format!("ARRÊT LIVE : {}", d.live_halt_reason)
+            } else if d.audit_orders > 0 {
+                format!(
+                    "audit/cancel en attente : {} ordre(s), âge max {} ms",
+                    d.audit_orders, d.audit_oldest_ms
+                )
+            } else if sleeping {
+                "sommeil (heures creuses UTC)".into()
+            } else {
+                String::new()
+            };
             // Carnet Up : 6 meilleurs niveaux de chaque côté pour visualisation.
             let mut bids = up_book.bids.clone();
             bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
             let mut asks = up_book.asks.clone();
             asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
-            d.book_bids = bids.iter().take(6)
-                .map(|l| crate::dashboard::BookLevel { price: l.price, size: l.size }).collect();
-            d.book_asks = asks.iter().take(6)
-                .map(|l| crate::dashboard::BookLevel { price: l.price, size: l.size }).collect();
+            d.book_bids = bids
+                .iter()
+                .take(6)
+                .map(|l| crate::dashboard::BookLevel {
+                    price: l.price,
+                    size: l.size,
+                })
+                .collect();
+            d.book_asks = asks
+                .iter()
+                .take(6)
+                .map(|l| crate::dashboard::BookLevel {
+                    price: l.price,
+                    size: l.size,
+                })
+                .collect();
 
             // Série temporelle (ring ~10 min à 1/s) pour le graphique de fenêtre.
             if slow_tick {
-            d.series.push(SeriesPoint {
-                t: chrono::Utc::now().timestamp_millis(),
-                up_mid,
-                down_mid,
-                spot,
-                up_bid: buy_cap_up, // notre bid maker restant Up
-                up_ask: ask_up,
-                equity,
-                realized: paper.state.realized_pnl,
-                imb: sc.imbalance(),
-            });
-            let n = d.series.len();
-            if n > 600 {
-                d.series.drain(0..n - 600);
-            }
+                d.series.push(SeriesPoint {
+                    t: chrono::Utc::now().timestamp_millis(),
+                    up_mid,
+                    down_mid,
+                    spot,
+                    up_bid: buy_cap_up, // notre bid maker restant Up
+                    up_ask: ask_up,
+                    equity,
+                    realized: paper.state.realized_pnl,
+                    imb: sc.imbalance(),
+                });
+                let n = d.series.len();
+                if n > 600 {
+                    d.series.drain(0..n - 600);
+                }
             }
         }
 
         if slow_tick {
-        tracing::debug!(
-            rem_s = m.time_remaining_sec(),
-            fair = format!("{:.3}", fair_up),
-            drift = format!("{:+.4}", drift_log),
-            obi = format!("{:+.2}", obi),
-            ofi = format!("{:+.2}", ofi),
-            ask_up = format!("{:.3}", ask_up),
-            ask_dn = format!("{:.3}", ask_dn),
-            pair = format!("{:.2}", sc.pair_cost().unwrap_or(0.0)),
-            imb = format!("{:.0}", sc.imbalance()),
-            deployed = format!("{:.2}", sc.deployed()),
-            equity = format!("{:.2}", equity),
-            net = format!("{:.0}", net),
-            wpnl = format!("{:.2}", window_pnl),
-            fills = paper.state.fills,
-            state = if !enabled { "OFF(manuel)" } else if sleeping { "sleep" } else if paused { "kill(obs)" } else { "scan" },
-            "sc"
-        );
+            tracing::debug!(
+                rem_s = m.time_remaining_sec(),
+                fair = format!("{:.3}", fair_up),
+                drift = format!("{:+.4}", drift_log),
+                obi = format!("{:+.2}", obi),
+                ofi = format!("{:+.2}", ofi),
+                ask_up = format!("{:.3}", ask_up),
+                ask_dn = format!("{:.3}", ask_dn),
+                pair = format!("{:.2}", sc.pair_cost().unwrap_or(0.0)),
+                imb = format!("{:.0}", sc.imbalance()),
+                deployed = format!("{:.2}", sc.deployed()),
+                equity = format!("{:.2}", equity),
+                net = format!("{:.0}", net),
+                wpnl = format!("{:.2}", window_pnl),
+                fills = paper.state.fills,
+                state = if !enabled {
+                    "OFF(manuel)"
+                } else if sleeping {
+                    "sleep"
+                } else if paused {
+                    "kill(obs)"
+                } else {
+                    "scan"
+                },
+                "sc"
+            );
         }
         last_slow_tick_s = (now_ms_books / 1000) as i64;
 
@@ -1953,4 +2297,3 @@ async fn quote_loop(
         }
     }
 }
-

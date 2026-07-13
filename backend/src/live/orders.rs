@@ -46,13 +46,23 @@ pub enum PlaceResult {
     },
 }
 
+/// Résultat du DELETE /order. Une absence de l'id dans `canceled` n'est jamais
+/// interprétée comme une annulation : l'appelant doit relire l'ordre et garder
+/// l'exposition gelée tant que son état terminal n'est pas connu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStatus {
+    Cancelled,
+    AlreadyClosed,
+    StillOpen,
+    Unknown,
+}
+
 // ─── Caches (init au boot par `startup`) ───
 static CACHED_LOCAL_SIGNER: std::sync::OnceLock<
     LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
 > = std::sync::OnceLock::new();
-static CACHED_AUTH_CLIENT: std::sync::OnceLock<
-    tokio::sync::Mutex<Client<Authenticated<Normal>>>,
-> = std::sync::OnceLock::new();
+static CACHED_AUTH_CLIENT: std::sync::OnceLock<tokio::sync::Mutex<Client<Authenticated<Normal>>>> =
+    std::sync::OnceLock::new();
 
 /// Métadonnées RAW Polymarket par token (tick exact, neg_risk) — préchargées au
 /// rollover : les arrondis se font sur LES décimales du marché, pas une constante.
@@ -68,7 +78,10 @@ pub async fn preload_token_meta(token_ids: &[&str]) -> anyhow::Result<()> {
     let mut map = std::collections::HashMap::new();
     for &tid in token_ids {
         let token = U256::from_str(tid).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
-        let tick = client.tick_size(token).await.map_err(|e| anyhow::anyhow!("tick_size: {e}"))?;
+        let tick = client
+            .tick_size(token)
+            .await
+            .map_err(|e| anyhow::anyhow!("tick_size: {e}"))?;
         let dp = tick.minimum_tick_size.as_decimal().scale();
         map.insert(tid.to_string(), dp);
     }
@@ -120,7 +133,11 @@ pub async fn place_order(
     let price = decimal_from_f64(args.price, price_dp_for(token_id), "price")?; // décimales RAW du tick PM
     let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
     let side = if args.is_sell { Side::Sell } else { Side::Buy };
-    let order_type = if args.gtc { OrderType::GTC } else { OrderType::FAK };
+    let order_type = if args.gtc {
+        OrderType::GTC
+    } else {
+        OrderType::FAK
+    };
     let order_type_log = if args.gtc { "GTC" } else { "FAK" };
 
     let lock = CACHED_AUTH_CLIENT
@@ -144,7 +161,9 @@ pub async fn place_order(
         .await
         .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
     if !matches!(&signed.signature, OrderSignature::Wrapped(_)) {
-        anyhow::bail!("signature POLY_1271 inattendue (attendu ERC-7739 Wrapped) — vérifier le SDK");
+        anyhow::bail!(
+            "signature POLY_1271 inattendue (attendu ERC-7739 Wrapped) — vérifier le SDK"
+        );
     }
     tracing::info!(
         token = %token_id.chars().take(10).collect::<String>(),
@@ -170,7 +189,10 @@ pub async fn place_order(
         let msg = resp.error_msg.unwrap_or_default();
         if msg.contains("POST_ONLY") {
             // Comportement VOULU du post-only : croiser = rejet, pas de taxe.
-            tracing::info!(post_ms, "post-only rejeté (aurait croisé le spread) — repose au tick suivant");
+            tracing::info!(
+                post_ms,
+                "post-only rejeté (aurait croisé le spread) — repose au tick suivant"
+            );
             return Ok(PlaceResult::PostOnlyRejected);
         }
         anyhow::bail!("ordre refusé par le CLOB: {msg}");
@@ -182,33 +204,62 @@ pub async fn place_order(
     let (filled_size, avg_price) = match (making, taking) {
         (Some(m), Some(t)) => {
             let (shares, usdc) = if args.is_sell { (m, t) } else { (t, m) };
-            if shares > 0.0 { (Some(shares), Some(usdc / shares)) } else { (Some(0.0), None) }
+            if shares > 0.0 {
+                (Some(shares), Some(usdc / shares))
+            } else {
+                (Some(0.0), None)
+            }
         }
         _ => (None, None),
     };
     tracing::info!(post_ms, order_id = %resp.order_id, ?filled_size, ?avg_price, "✅ ordre LIVE accepté");
-    Ok(PlaceResult::Placed { order_id: resp.order_id, filled_size, avg_price, post_ms })
+    Ok(PlaceResult::Placed {
+        order_id: resp.order_id,
+        filled_size,
+        avg_price,
+        post_ms,
+    })
 }
 
-/// Annule un ordre. Idempotent côté appelant : un ordre déjà fillé/annulé revient
-/// dans `not_canceled` — on loggue et on continue (la réconciliation tranche).
-pub async fn cancel_order(creds: &LiveCredentials, order_id: &str) -> anyhow::Result<bool> {
+/// Demande l'annulation d'un ordre. Seul le tableau `canceled` confirme une
+/// annulation; les autres réponses restent conservatrices et doivent être
+/// confirmées par une lecture finale de l'ordre.
+pub async fn cancel_order(creds: &LiveCredentials, order_id: &str) -> anyhow::Result<CancelStatus> {
     let body = serde_json::json!({ "orderID": order_id }).to_string();
     let text = l2_request(creds, "DELETE", "/order", None, &body).await?;
     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    let ok = v
+    let canceled = v
         .get("canceled")
         .and_then(|c| c.as_array())
         .map(|a| a.iter().any(|x| x.as_str() == Some(order_id)))
         .unwrap_or(false);
-    if !ok {
-        tracing::debug!(order_id, resp = %text, "cancel non appliqué (déjà fillé/annulé ?)");
+    if canceled {
+        return Ok(CancelStatus::Cancelled);
     }
-    Ok(ok)
+    let explicitly_closed = v
+        .get("not_canceled")
+        .and_then(|n| n.as_object())
+        .is_some_and(|m| m.contains_key(order_id));
+    let status = if explicitly_closed {
+        CancelStatus::AlreadyClosed
+    } else if v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("open") || s.eq_ignore_ascii_case("live"))
+    {
+        CancelStatus::StillOpen
+    } else {
+        CancelStatus::Unknown
+    };
+    tracing::debug!(order_id, ?status, resp = %text, "cancel non terminal — confirmation requise");
+    Ok(status)
 }
 
 /// Annule tous nos ordres d'un marché (rollover, KILL, staleness signal).
-pub async fn cancel_market_orders(creds: &LiveCredentials, condition_id: &str) -> anyhow::Result<()> {
+pub async fn cancel_market_orders(
+    creds: &LiveCredentials,
+    condition_id: &str,
+) -> anyhow::Result<()> {
     let body = serde_json::json!({ "market": condition_id }).to_string();
     let text = l2_request(creds, "DELETE", "/cancel-market-orders", None, &body).await?;
     tracing::info!(market = %condition_id.chars().take(12).collect::<String>(), resp = %text, "cancel-market-orders");
@@ -241,7 +292,10 @@ impl OpenOrder {
 /// Nos ordres ouverts sur un marché — l'AUTORITÉ de réconciliation (le WS user
 /// peut rater des fills ; ce poll tranche : size_matched ↑ = fill, ordre absent
 /// = fillé ou annulé).
-pub async fn open_orders(creds: &LiveCredentials, condition_id: &str) -> anyhow::Result<Vec<OpenOrder>> {
+pub async fn open_orders(
+    creds: &LiveCredentials,
+    condition_id: &str,
+) -> anyhow::Result<Vec<OpenOrder>> {
     let q = format!("market={condition_id}");
     let text = l2_request(creds, "GET", "/data/orders", Some(&q), "").await?;
     // Deux formats observés : tableau nu, ou enveloppe paginée {"data":[...],"next_cursor":...}.
@@ -298,8 +352,14 @@ async fn authenticated_client<S: Signer>(
     creds: &LiveCredentials,
     signer: &S,
 ) -> anyhow::Result<Client<Authenticated<Normal>>> {
-    let funder: Address = creds.funder.parse().map_err(|e| anyhow::anyhow!("funder: {e}"))?;
-    let api_key = creds.api_key.parse().map_err(|e| anyhow::anyhow!("POLY_API_KEY: {e}"))?;
+    let funder: Address = creds
+        .funder
+        .parse()
+        .map_err(|e| anyhow::anyhow!("funder: {e}"))?;
+    let api_key = creds
+        .api_key
+        .parse()
+        .map_err(|e| anyhow::anyhow!("POLY_API_KEY: {e}"))?;
     let sdk_creds = Credentials::new(api_key, creds.api_secret.clone(), creds.passphrase.clone());
     Client::new(CLOB_BASE, Config::default())?
         .authentication_builder(signer)
