@@ -1631,8 +1631,19 @@ async fn quote_loop(
                 && fill_quiet_ms >= 5_000
                 && remaining_l > 9;
             let endgame_case = (3..=9).contains(&remaining_l) && imb_abs > 0.4;
+            // COUPE ANTICIPÉE DU PERDANT (règle 0xb : imbalance→0 AVANT la fin,
+            // seuls les résidus GAGNANTS vont à la résolution). À T−9 le carnet
+            // du mourant est déjà vide (18:54:50 : flatten refusé à 3¢, 5,97
+            // Down morts à zéro) — on vend le résidu PERDANT dès T−15, pendant
+            // qu'il reste des bids à 10-20¢. Le résidu gagnant, lui, court
+            // jusqu'au payout (comportement 0xb : il redeem, ne brade jamais).
+            let losing_residual = {
+                let bb_side = if sc.imbalance() > 0.0 { bb_up } else { bb_dn };
+                bb_side > 0.0 && bb_side < 0.50
+            };
+            let early_cut = (10..=15).contains(&remaining_l) && imb_abs > 0.4 && losing_residual;
             if enabled
-                && (dust_case || endgame_case)
+                && (dust_case || endgame_case || early_cut)
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
                 let excess_up = sc.imbalance() > 0.0;
