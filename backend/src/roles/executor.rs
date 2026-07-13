@@ -775,15 +775,21 @@ async fn quote_loop(
                 None
             }
             None if cfg.sc_skew && !paused && !sleeping && now_s >= skew_cool_until => {
-                // PLANCHER (incident 23:47, 12 juil.) : un « gagnant » sous
-                // sc_directional_min n'est pas un gagnant, c'est un rebond de
-                // token mort (Up 0.04→0.14 sur carnet vide → 12 achetés @0.13,
-                // revendus @0.01). Le whale accumule le FAVORI (0.40-0.75),
-                // jamais le couteau.
-                tokyo_winner.or(pm_side).filter(|w| {
+                // PLANCHER PAR SOURCE (doctrine utilisateur, 13 juil.) :
+                //  · pm-momentum : gagnant ≥ sc_directional_min (0.40) — le
+                //    carnet PM se fait piéger par les rebonds de token mort
+                //    (incident 23:47 : Up 0.04→0.14 → 12 achetés @0.13,
+                //    revendus @0.01). Le favori, jamais le couteau.
+                //  · Tokyo (drift + OFI pleins) : droit d'armer SOUS 0.40 —
+                //    le SEUL achat de perdant autorisé (« Tokyo crie qu'il
+                //    va exploser »).
+                let gate = |w: &Side, floor: f64| {
                     let bb_w = if *w == Side::Up { bb_up } else { bb_dn };
-                    bb_w >= cfg.sc_directional_min && bb_w <= cfg.sc_open_max_price
-                })
+                    bb_w >= floor && bb_w <= cfg.sc_open_max_price
+                };
+                tokyo_winner
+                    .filter(|w| gate(w, 0.01))
+                    .or_else(|| pm_side.filter(|w| gate(w, cfg.sc_directional_min)))
             }
             None => None,
         };
