@@ -1085,7 +1085,14 @@ async fn quote_loop(
                             drift = format!("{drift_ps:+.5}"),
                             "ACCUMULATION taker — Tokyo plein, on paie l'ask"
                         );
-                        lv.place_insurance_fak(is_up, ask, sz, OrderIntent::SkewAccumulation)
+                        // MARKETABLE (13 juil. 15:35/15:37) : l'ask affiché a
+                        // 150-500 ms d'âge quand l'ordre atterrit — dans un
+                        // marché qui bouge (précisément quand le FAK tire), il
+                        // a déjà fui → « no orders found to match ». On vise
+                        // ask + 3 ticks, borné par le plafond : on ne paie le
+                        // tampon QUE si le carnet a bougé pendant le vol.
+                        let limit = (ask + 3.0 * tick_sz).min(cfg.sc_skew_fak_max);
+                        lv.place_insurance_fak(is_up, limit, sz, OrderIntent::SkewAccumulation)
                             .await;
                     }
                 }
@@ -1539,7 +1546,10 @@ async fn quote_loop(
                             cap = format!("{rescue_pair:.3}"),
                             "SAUVETAGE taker (paie le marché pour compléter la paire)"
                         );
-                        lv.place_insurance_fak(is_up, ask, sz, OrderIntent::Rescue)
+                        // MARKETABLE : même tampon que l'accumulation, borné
+                        // par la place du plafond de paire rampé.
+                        let limit = (ask + 3.0 * tick_sz).min(pair_room_ins).max(ask);
+                        lv.place_insurance_fak(is_up, limit, sz, OrderIntent::Rescue)
                             .await;
                     }
                 }
