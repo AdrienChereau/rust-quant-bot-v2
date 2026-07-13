@@ -781,6 +781,15 @@ impl LiveCtx {
             );
             return false;
         }
+        // MONTANTS CLOB (13 juil. 20:21-23) : un BUY FAK dépense size × prix,
+        // et le CLOB exige ce montant à 2 DÉCIMALES — 9,98 × 0,75 = 7,485 →
+        // « invalid amounts », 20 sauvetages refusés PENDANT l'explosion Up.
+        // Taille ENTIÈRE × prix (2 déc.) = montant toujours valide. La
+        // fraction restante devient de la poussière, le flatten la nettoie.
+        let size = size.floor();
+        if size < 1.0 {
+            return false;
+        }
         let token = if is_up {
             &self.up_token
         } else {
