@@ -288,6 +288,8 @@ async fn quote_loop(
         opening_stop_s: cfg.sc_opening_stop_s,
         open_max_price: cfg.sc_open_max_price,
         dust_tol: cfg.sc_dust_tol,
+        tilt_mult: cfg.sc_skew_mult,
+        patient_below: cfg.sc_skew_complete_below,
     });
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash,
@@ -340,34 +342,16 @@ async fn quote_loop(
     );
     let mut last_realized = paper.state.realized_pnl; // pour le delta par fenêtre
 
-    // MODE SKEW : momentum du carnet PM (ring 30 s), côté parié, cooldown
-    // post-retournement (anti-whipsaw), dernier état loggé.
-    let mut pm_hist: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::new();
-    #[allow(unused_mut)] // muté par la sortie éclair (chemin live uniquement)
-    let mut skew_cool_until: i64 = 0;
-    #[allow(unused_assignments, unused_mut, unused_variables)]
-    let mut bet_side: Option<Side> = None; // inventaire skew détenu (sortie éclair si retournement)
-                                           // Côté armé PERSISTANT (hystérésis) : armé au seuil plein, désarmé seulement
-                                           // quand le signal retombe sous la MOITIÉ du seuil (incident 12 juil. 16:51 :
-                                           // pm_mom oscillant pile à ±0.06 → arm/désarm toutes les 2-5 s → 2 sorties
-                                           // éclair dans la même fenêtre).
-    let mut skew_armed: Option<Side> = None;
-    let mut last_skew_logged: Option<Side> = None;
-    let mut last_pm_pull: Option<Side> = None; // pull demi-seuil (log de transition)
-                                               // PERSISTANCE du lean PM (refonte 13 juil.) : le pm-momentum est un
-                                               // détecteur de MOUVEMENT, pas de tendance — il tirait sur chaque jambe de
-                                               // rebond (12 Up @0.46 revendus @0.23). Un lean ne compte que si son SIGNE
-                                               // tient sc_pm_persist_s : un rebond de 20 s ne tient pas, un grind oui.
-    let mut pm_lean_sign: i8 = 0;
-    let mut pm_lean_since_ms: i64 = 0;
-    // FAK d'accumulation : tiré UNE fois par armement (armé → pending).
+    // GRAND MODÈLE 0xb (13 juil.) : le pari directionnel n'est plus un MODE à
+    // états (armé/désarmé, hystérésis, cooldowns, pm-momentum) — c'est un TILT
+    // continu issu de Binance, qui incline la cotation. Le carnet PM ne pilote
+    // plus rien : un carnet mince se spoofe, le sous-jacent ne se spoofe pas.
+    let mut last_tilt_sign: i8 = 0; // log de transition du tilt fort
+    // FAK d'accumulation : throttle (côté, epoch ms) — un tir par rafale Tokyo.
     #[allow(unused_mut, unused_assignments, unused_variables)]
-    let mut accum_fak_pending = false;
-    // Parts FAK en vol (taille, epoch ms) : le fill met ~300 ms à revenir par
-    // le WS — sans ce compteur, la quote maker posterait un 2e clip entier
-    // pendant le trou (24 pour un cap de 12).
+    let mut last_fak_side: Option<Side> = None;
     #[allow(unused_mut, unused_assignments, unused_variables)]
-    let mut accum_fak_inflight: (f64, i64) = (0.0, 0);
+    let mut last_fak_ms: i64 = 0;
     // MESURE DE L'EDGE TOKYO : `dir_call` = dernière conviction directionnelle
     // FORTE (drift+OFI d'accord) de la fenêtre ; à la résolution on la compare
     // au gagnant réel. dir_wins/dir_total = notre précision directionnelle live —
@@ -549,19 +533,12 @@ async fn quote_loop(
                 Ok(Some(m)) => {
                     strike = binance::price_at_window_open(m.window_ts).await.ok();
                     sc.reset_window(); // état blended remis à zéro pour la nouvelle fenêtre
-                                       // SKEW : état remis à zéro — l'historique PM de l'ANCIEN marché
-                                       // comparé au mid du nouveau fabrique un momentum fantôme
-                                       // (incident 12 juil. 16:50:01 : pm_mom=-0.49 au rollover →
-                                       // 36 Down achetés sur du vide → sortie éclair -2,16 $).
-                    pm_hist.clear();
-                    skew_armed = None;
-                    bet_side = None;
-                    skew_cool_until = 0;
-                    last_skew_logged = None;
-                    pm_lean_sign = 0;
-                    pm_lean_since_ms = 0;
-                    accum_fak_pending = false;
-                    accum_fak_inflight = (0.0, 0);
+                    last_tilt_sign = 0;
+                    #[cfg(feature = "live")]
+                    {
+                        last_fak_side = None;
+                        last_fak_ms = 0;
+                    }
                     rest_up = None;
                     rest_dn = None;
                     win_rebate = 0.0;
@@ -841,6 +818,54 @@ async fn quote_loop(
             );
         }
 
+        // ═══ TILT BINANCE (grand modèle 0xb, 13 juil.) ═══
+        // Paramètre CONTINU ∈ [−1,1] : plein à 2× le seuil taker de drift, veto
+        // si l'OFI contredit franchement. Il incline la cotation continue
+        // (contact/retrait, tailles asymétriques, patience de complétion) dans
+        // desired_bids_symmetric — aucun état, aucun cooldown, aucun flip-flop.
+        use crate::engines::spread_capture::endangered_side;
+        let tilt_raw = (drift_ps / (2.0 * cfg.sc_taker_drift.max(1e-9))).clamp(-1.0, 1.0);
+        let tilt = if cfg.sc_ofi_confirm
+            && ofi.abs() >= cfg.sc_ofi_min
+            && ofi.signum() * drift_ps.signum() < 0.0
+        {
+            0.0 // OFI contre le drift : bruit, pas de tendance
+        } else {
+            tilt_raw
+        };
+        // Tokyo PLEIN (drift + OFI alignés) : compteur de précision + FAK.
+        let tokyo_winner = match (
+            endangered_side(drift_ps, cfg.sc_taker_drift),
+            endangered_side(ofi, cfg.sc_ofi_pull),
+        ) {
+            (Some(a), Some(b)) if a == b => Some(a.opposite()),
+            _ => None,
+        };
+        if let Some(w) = tokyo_winner {
+            dir_call = Some(w);
+        }
+        let tilt_sign: i8 = if tilt >= 0.5 {
+            1
+        } else if tilt <= -0.5 {
+            -1
+        } else {
+            0
+        };
+        if tilt_sign != last_tilt_sign {
+            if tilt_sign != 0 {
+                tracing::info!(
+                    cote = if tilt_sign > 0 { "up" } else { "down" },
+                    tilt = format!("{tilt:+.2}"),
+                    drift = format!("{drift_ps:+.5}"),
+                    ofi = format!("{ofi:+.2}"),
+                    "TILT fort — cotation inclinée côté favori"
+                );
+            } else {
+                tracing::info!("TILT neutre — cotation symétrique");
+            }
+            last_tilt_sign = tilt_sign;
+        }
+
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
         let desired = if sleeping || !enabled {
             Vec::new()
@@ -857,6 +882,7 @@ async fn quote_loop(
                 cfg.sc_directional_min,
                 size_factor,
                 cfg.sc_symmetric,
+                tilt,
             )
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
@@ -874,7 +900,6 @@ async fn quote_loop(
         //    nus, invendables sous le minimum 5 parts — mieux vaut ne jamais les
         //    prendre). Les complétions survivent TOUJOURS (le côté qui crashe est
         //    précisément celui qu'un déficit veut acheter moins cher).
-        use crate::engines::spread_capture::endangered_side;
         // Deux horloges : le DRIFT (EMA halflife 25 s) confirme un mouvement
         // installé ; l'OFI (flux d'ordres, fenêtre 5 s — « le plus prédictif du
         // prochain tick ») l'ANTICIPE. Sur un marché aussi rapide, le drift réagit
@@ -900,214 +925,6 @@ async fn quote_loop(
             desired.retain(|b| b.completion || b.side != d);
         }
 
-        // ═══ MODE SKEW — MM incliné (validé utilisateur, test LIVE direct) ═══
-        // Le symétrique gagne quand la fenêtre CROISE ; elle perd gros quand la
-        // fenêtre meurt d'un côté sans croiser. Le skew détecte ce cas et se
-        // blinde du côté fort : plus de taille sur le gagnant probable, zéro
-        // ouverture côté faible, complétion PATIENTE (seulement quand le perdant
-        // est bradé → paire grasse), et SORTIE ÉCLAIR en FAK si retournement.
-        // Deux capteurs : Tokyo (drift+OFI alignés — les moves rapides) OU
-        // momentum du carnet PM (les glissements lents que Binance ne voit pas).
-        pm_hist.push_back((now_ms_books as i64, up_mid));
-        while pm_hist
-            .front()
-            .is_some_and(|(t, _)| now_ms_books as i64 - t > 30_000)
-        {
-            pm_hist.pop_front();
-        }
-        let look_ms = cfg.sc_pm_mom_look_s * 1000;
-        // Base du momentum : l'échantillon le plus récent d'âge ≥ look_s quand
-        // l'historique est plein ; SINON (début de fenêtre) le plus VIEUX
-        // échantillon du même marché dès qu'il a ≥ 5 s. Une fenêtre BTC 5min
-        // peut traverser 10→90¢ en 2-3 s : être aveugle 20 s raterait le move ;
-        // le seuil 0.06 sur 5 s est de facto PLUS strict par seconde, donc pas
-        // de sur-déclenchement au bruit d'ouverture. (pm_hist est vidé au
-        // rollover — jamais de comparaison inter-marchés.)
-        let pm_base = pm_hist
-            .iter()
-            .filter(|(t, _)| now_ms_books as i64 - t >= look_ms)
-            .next_back()
-            .or_else(|| {
-                pm_hist
-                    .front()
-                    .filter(|(t, _)| now_ms_books as i64 - t >= 5_000)
-            })
-            .map(|(_, p)| *p);
-        let pm_mom = pm_base.map(|b| up_mid - b).unwrap_or(0.0);
-        // MARCHÉ TRANCHÉ (incident 23:47, 12 juil.) : quand un côté cote sous
-        // sc_skew_complete_below, le mid du mourant vibre de ±10¢ sur un carnet
-        // vide — TOUT signal pm est du bruit (armement, pull, urgence, exit).
-        // On le met à zéro : il ne reste que la complétion patiente, la chaîne
-        // de fin de fenêtre et le flatten. Tue aussi le spam « PULL PM ».
-        let pm_mom = if bb_up > cfg.sc_skew_complete_below && bb_dn > cfg.sc_skew_complete_below {
-            pm_mom
-        } else {
-            0.0
-        };
-        // Persistance du lean : signe du demi-seuil suivi en continu ; toute
-        // inversion (ou retour au neutre) remet le chrono à zéro.
-        let lean_sign: i8 = if pm_mom >= cfg.sc_pm_mom * 0.5 {
-            1
-        } else if pm_mom <= -cfg.sc_pm_mom * 0.5 {
-            -1
-        } else {
-            0
-        };
-        if lean_sign != pm_lean_sign {
-            pm_lean_sign = lean_sign;
-            pm_lean_since_ms = now_ms_books as i64;
-        }
-        let pm_persisted =
-            lean_sign != 0 && now_ms_books as i64 - pm_lean_since_ms >= cfg.sc_pm_persist_s * 1000;
-        let pm_side = if pm_mom >= cfg.sc_pm_mom && pm_persisted {
-            Some(Side::Up)
-        } else if pm_mom <= -cfg.sc_pm_mom && pm_persisted {
-            Some(Side::Down)
-        } else {
-            None
-        };
-        let tokyo_winner = match (
-            endangered_side(drift_ps, cfg.sc_taker_drift),
-            endangered_side(ofi, cfg.sc_ofi_pull),
-        ) {
-            (Some(a), Some(b)) if a == b => Some(a.opposite()), // même perdant → gagnant
-            _ => None,
-        };
-        if let Some(w) = tokyo_winner {
-            dir_call = Some(w); // compteur de précision (Tokyo seul, sémantique inchangée)
-        }
-        // Armement avec HYSTÉRÉSIS : on arme au seuil plein, on ne désarme que
-        // quand le signal retombe sous la moitié du seuil (anti flip-flop), et
-        // tout désarmement impose un cooldown. À l'armement, gate de prix : un
-        // gagnant au-dessus de SC_OPEN_MAX_PRICE est injouable (accumulation
-        // veto de toute façon) → on n'arme pas à 0.91-0.95 pour rien.
-        skew_armed = match skew_armed {
-            Some(w) if cfg.sc_skew && !paused && !sleeping => {
-                let pm_keep = match w {
-                    Side::Up => pm_mom >= cfg.sc_pm_mom * 0.5,
-                    Side::Down => pm_mom <= -cfg.sc_pm_mom * 0.5,
-                };
-                let tokyo_keep = match (
-                    endangered_side(drift_ps, cfg.sc_taker_drift * 0.5),
-                    endangered_side(ofi, cfg.sc_ofi_pull * 0.5),
-                ) {
-                    (Some(a), Some(b)) if a == b => a.opposite() == w,
-                    _ => false,
-                };
-                if pm_keep || tokyo_keep {
-                    Some(w)
-                } else {
-                    // signal éteint → désarmement + cooldown (sans écraser un
-                    // cooldown plus long posé par la sortie éclair)
-                    skew_cool_until = skew_cool_until.max(now_s + 15);
-                    None
-                }
-            }
-            Some(_) => {
-                skew_cool_until = skew_cool_until.max(now_s + 15);
-                None
-            }
-            None if cfg.sc_skew && !paused && !sleeping && now_s >= skew_cool_until => {
-                // PLANCHER PAR SOURCE (doctrine utilisateur, 13 juil.) :
-                //  · pm-momentum : gagnant ≥ sc_directional_min (0.40) — le
-                //    carnet PM se fait piéger par les rebonds de token mort
-                //    (incident 23:47 : Up 0.04→0.14 → 12 achetés @0.13,
-                //    revendus @0.01). Le favori, jamais le couteau.
-                //  · Tokyo (drift + OFI pleins) : droit d'armer SOUS 0.40 —
-                //    le SEUL achat de perdant autorisé (« Tokyo crie qu'il
-                //    va exploser »).
-                let gate = |w: &Side, floor: f64| {
-                    let bb_w = if *w == Side::Up { bb_up } else { bb_dn };
-                    bb_w >= floor && bb_w <= cfg.sc_open_max_price
-                };
-                tokyo_winner
-                    .filter(|w| gate(w, 0.01))
-                    .or_else(|| pm_side.filter(|w| gate(w, cfg.sc_directional_min)))
-            }
-            None => None,
-        };
-        let skew_winner: Option<Side> = skew_armed;
-        if skew_winner != last_skew_logged {
-            if let Some(w) = skew_winner {
-                let px_w = if w == Side::Up { up_mid } else { down_mid };
-                tracing::info!(
-                    side = w.as_str(),
-                    source = if tokyo_winner.is_some() {
-                        "tokyo"
-                    } else {
-                        "pm-momentum"
-                    },
-                    px_gagnant = format!("{px_w:.2}"),
-                    pm_mom = format!("{pm_mom:+.3}"),
-                    drift = format!("{drift_ps:+.5}"),
-                    "SKEW armé — MM incliné côté fort"
-                );
-            } else if last_skew_logged.is_some() {
-                tracing::info!("SKEW désarmé — retour symétrique");
-            }
-            // FAK d'accumulation : chaque armement autorise UN tir ; le
-            // désarmement annule le tir en attente.
-            accum_fak_pending = skew_winner.is_some();
-            last_skew_logged = skew_winner;
-        }
-        // Pari en cours ? (surplus du gagnant ≤ net_cap) → on ne le complète pas
-        // TANT QUE le perdant n'est pas bradé (la complétion sous
-        // sc_skew_complete_below verrouille la paire grasse, sinon patience).
-        // COLLANT (fenêtre 23:45, 12 juil.) : la patience est portée par
-        // l'INVENTAIRE (bet_side), pas par l'armement qui respire — sinon le
-        // moindre désarmement complète au complément (12 Down @0.70 accumulés,
-        // puis 12 Up @0.28 achetés 10 s après → paire 0.98, pari gaspillé).
-        // Le pari vit jusqu'à : perdant ≤ 0.20 (paire grasse) OU retournement
-        // (sortie éclair) OU résolution (le gagnant paie 1 $).
-        let net_cap = cfg.sc_trend_net_cap.max(cfg.sc_dir_tilt).max(1.0);
-        let held_side = bet_side.or(skew_winner);
-        let hold_dir_bet = held_side.is_some_and(|w| {
-            let surplus = if w == Side::Up {
-                sc.imbalance()
-            } else {
-                -sc.imbalance()
-            };
-            surplus > 1e-9 && surplus <= net_cap + 1e-9
-        });
-        if hold_dir_bet {
-            let w = held_side.unwrap();
-            let loser = w.opposite();
-            let loser_bb = if loser == Side::Up { bb_up } else { bb_dn };
-            if loser_bb > cfg.sc_skew_complete_below {
-                desired.retain(|b| !(b.completion && b.side == loser));
-            }
-        }
-        // Côté faible : AUCUNE ouverture pendant le skew (le blindage est
-        // asymétrique par définition — c'est un pari assumé et borné).
-        if let Some(w) = skew_winner {
-            desired.retain(|b| b.completion || b.side == w);
-        }
-        // PULL PM au DEMI-SEUIL (fenêtre 17:55, 12 juil.) : le skew respirait
-        // autour du seuil (armé +0.08 → désarmé → réarmé +0.16) et CHAQUE trou
-        // rouvrait les ouvertures des deux côtés — les 6 Down nus @0.36 sont
-        // partis dans un de ces trous. Gradation : carnet qui penche (≥ ½ seuil)
-        // → plus d'ouverture du côté mourant ; seuil plein → skew complet.
-        // PERSISTANT (refonte 13 juil.) : sans persistance, le pull musellait le
-        // symétrique sur les fenêtres whipsaw (le lean alternait de camp toutes
-        // les 10-20 s → presque aucun fill d'ouverture de toute la fenêtre).
-        let pm_pull: Option<Side> = if !pm_persisted {
-            None
-        } else if pm_lean_sign > 0 {
-            Some(Side::Down)
-        } else {
-            Some(Side::Up)
-        };
-        if let Some(d) = pm_pull {
-            if last_pm_pull != Some(d) {
-                tracing::info!(
-                    cote_retire = d.as_str(),
-                    pm_mom = format!("{pm_mom:+.3}"),
-                    "PULL PM — le carnet penche : plus d'ouverture du côté mourant"
-                );
-            }
-            desired.retain(|b| b.completion || b.side != d);
-        }
-        last_pm_pull = pm_pull;
         // URGENCE DE COMPLÉTION : le sous-jacent part dans le sens qui renchérit
         // notre déficit → le bid monte à ask−tick (agressif mais toujours maker).
         #[cfg(feature = "live")]
@@ -1119,22 +936,13 @@ async fn quote_loop(
         // compléter sans payer la taxe (profil 0xb27b : complétions maker).
         let endgame = (20..=45).contains(&m.time_remaining_sec());
         for b in desired.iter_mut() {
-            // URGENCE PM (fenêtre 17:55, 12 juil.) : le grind lent est INVISIBLE
-            // pour le drift Binance (0.0000 pendant que Up passait 0.69→0.90) —
-            // la complétion Up est restée clouée à 0.63 pendant 3 min. Le carnet
-            // PM, lui, le voit (pm_mom jusqu'à +0.16) : quand il penche (≥ demi-
-            // seuil) vers le côté qu'on doit acheter, la complétion CHASSE.
-            let pm_for = if b.side == Side::Up { pm_mom } else { -pm_mom };
-            let pm_urgent = pm_persisted
-                && ((b.side == Side::Up && pm_lean_sign > 0)
-                    || (b.side == Side::Down && pm_lean_sign < 0));
             if b.completion
                 && ((!urgency_blocked
-                    && (crate::engines::spread_capture::completion_urgent(
+                    && crate::engines::spread_capture::completion_urgent(
                         b.side,
                         drift_ps,
                         cfg.sc_urgency_drift,
-                    ) || pm_urgent))
+                    ))
                     || endgame)
             {
                 let ask = if b.side == Side::Up { ask_up } else { ask_dn };
@@ -1158,8 +966,7 @@ async fn quote_loop(
                     // Confiance PM : un momentum du carnet nettement au-dessus du
                     // seuil = conviction du marché → payer l'assurance plus cher
                     // est +EV (même logique que la rampe signal du sauvetage).
-                    let pm_ramp =
-                        ((pm_for - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
+
                     let base_pair = cfg.sc_completion_max_pair.min(1.0);
                     let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                         cfg.sc_rescue_max_pair
@@ -1167,7 +974,7 @@ async fn quote_loop(
                         base_pair
                     };
                     let ramped_pair = base_pair
-                        + time_ramp.max(sig_ramp).max(pm_ramp) * (rescue_ceiling - base_pair);
+                        + time_ramp.max(sig_ramp) * (rescue_ceiling - base_pair);
                     let pair_room = (ramped_pair - avg_excess).max(0.0);
                     let aggressive = (((ask - tick_sz).max(b.price)) / tick_sz).floor() * tick_sz;
                     let capped = ((aggressive.min(cfg.sc_completion_max_price).min(pair_room))
@@ -1209,83 +1016,18 @@ async fn quote_loop(
             // `desired_bids` ci-dessus. Seuls les fills récoltés PENDANT cette
             // phase de cancel/reprice seront appliqués après les placements.
             let mut fills: Vec<LiveFill> = Vec::new();
-            // ═══ SORTIE ÉCLAIR : le signal s'est RETOURNÉ contre l'inventaire
-            // skew → on vend TOUT DE SUITE en FAK (perdre un peu maintenant
-            // plutôt que beaucoup à la résolution), puis cooldown 60 s
-            // anti-whipsaw et retour au MM symétrique.
-            if let Some(held) = bet_side {
-                let surplus = if held == Side::Up {
-                    sc.imbalance()
-                } else {
-                    -sc.imbalance()
-                };
-                let flipped = skew_winner == Some(held.opposite())
-                    || (held == Side::Up && pm_mom <= -cfg.sc_pm_mom)
-                    || (held == Side::Down && pm_mom >= cfg.sc_pm_mom);
-                if surplus <= cfg.sc_dust_tol {
-                    bet_side = None; // pari soldé (mergé/flattené) — plus rien à surveiller
-                } else if flipped && enabled {
-                    let held_bal = if held == Side::Up {
-                        paper.state.up_balance
-                    } else {
-                        paper.state.down_balance
-                    };
-                    let bid = if held == Side::Up { bb_up } else { bb_dn };
-                    let sz = surplus.min(held_bal);
-                    if sz > 0.0 && bid > 0.0 {
-                        if let Some((sold, avg)) =
-                            lv.flatten_sell(held == Side::Up, sz, bid, tick_sz).await
-                        {
-                            let fee = 0.07 * avg * (1.0 - avg) * sold;
-                            lv.cash -= fee;
-                            win_taker_fees += fee;
-                            win_purposes.skew_accumulation.sell_notional += avg * sold;
-                            win_purposes.skew_accumulation.taker_fees += fee;
-                            paper.try_sell_with_purpose(
-                                held.as_str(),
-                                avg,
-                                sold,
-                                "taker",
-                                "skew_accumulation",
-                            );
-                            let avg_cost = sc.avg(held);
-                            match held {
-                                Side::Up => {
-                                    sc.shares_up = (sc.shares_up - sold).max(0.0);
-                                    sc.cost_up = (sc.cost_up - avg_cost * sold).max(0.0);
-                                }
-                                Side::Down => {
-                                    sc.shares_dn = (sc.shares_dn - sold).max(0.0);
-                                    sc.cost_dn = (sc.cost_dn - avg_cost * sold).max(0.0);
-                                }
-                            }
-                            tracing::warn!(
-                                side = held.as_str(),
-                                sold = format!("{sold:.2}"),
-                                px = format!("{avg:.3}"),
-                                cout_moyen = format!("{avg_cost:.3}"),
-                                pm_mom = format!("{pm_mom:+.3}"),
-                                "SORTIE ÉCLAIR — retournement contre l'inventaire skew, vendu au marché"
-                            );
-                            skew_cool_until = now_s + 60;
-                            bet_side = None;
-                        }
-                    }
-                }
-            }
-            // le pari devient actif dès qu'un surplus skew existe
-            if bet_side.is_none() && hold_dir_bet {
-                bet_side = skew_winner;
-            }
-            // ═══ FAK D'ACCUMULATION (refonte 13 juil., « la folie utile ») ═══
-            // Le maker passif à bb+tick court derrière un grind et ne se fait
-            // remplir qu'une fois sur trois (fenêtre 1783902600 : Down 55→95,
-            // zéro accumulation remplie). À l'armement, signal PLEIN par
-            // définition → on PAIE l'ask une fois, borné : prix ≤ sc_skew_fak_max,
-            // taille ≤ cap net (restants compris), stop T−60. Le maker continue
-            // ensuite pour le complément éventuel du cap.
-            if accum_fak_pending && cfg.sc_skew_fak && enabled {
-                if let Some(w) = skew_winner {
+            // ═══ FAK D'ACCUMULATION (grand modèle : « la folie utile ») ═══
+            // Signal Tokyo PLEIN (drift + OFI alignés) → on paie l'ask UNE fois
+            // par côté et par rafale (throttle 30 s), borné : prix ≤ fak_max,
+            // cap net (surplus + restants compris), stop T−60. La cotation
+            // inclinée (tilt) continue derrière en maker.
+            // NB grand modèle : plus de sortie éclair — 0xb ne vend JAMAIS ; un
+            // retournement se gère en achetant l'autre côté (rééquilibrage),
+            // borné par le cap d'imbalance et le plafond de paire.
+            if cfg.sc_skew_fak && enabled {
+                if let Some(w) = tokyo_winner {
+                    let throttled = last_fak_side == Some(w)
+                        && now_ms_books as i64 - last_fak_ms < 30_000;
                     let is_up = w == Side::Up;
                     let (ask, ask_sz) = if is_up {
                         (ask_up, ask_up_sz)
@@ -1298,12 +1040,7 @@ async fn quote_loop(
                         -sc.imbalance()
                     };
                     let resting_open = lv.open_exposure(&lrest).side(is_up);
-                    let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
-                        accum_fak_inflight.0
-                    } else {
-                        0.0
-                    };
-                    let cap_room = (net_cap - surplus - resting_open - inflight).floor();
+                    let cap_room = (cfg.sc_trend_net_cap.max(1.0) - surplus - resting_open).floor();
                     let sz = (cfg.sc_base_clip * cfg.sc_skew_mult)
                         .min(cap_room)
                         .min(ask_sz.max(1.0))
@@ -1312,28 +1049,25 @@ async fn quote_loop(
                         .min_order_size
                         .max(1.0)
                         .max((1.0_f64 / ask.max(0.01)).ceil());
-                    if ask > 0.0
+                    if !throttled
+                        && ask > 0.0
                         && ask <= cfg.sc_skew_fak_max
                         && m.time_remaining_sec() > cfg.sc_opening_stop_s
                         && sz >= min_req
                         && ask * sz <= lv.cash
                     {
-                        accum_fak_pending = false;
-                        accum_fak_inflight = (sz, now_ms_books as i64);
+                        last_fak_side = Some(w);
+                        last_fak_ms = now_ms_books as i64;
                         tracing::info!(
                             side = w.as_str(),
                             ask = format!("{ask:.3}"),
                             size = format!("{sz:.0}"),
-                            pm_mom = format!("{pm_mom:+.3}"),
+                            tilt = format!("{tilt:+.2}"),
                             drift = format!("{drift_ps:+.5}"),
-                            "ACCUMULATION taker — on paie l'ask à l'armement (signal plein)"
+                            "ACCUMULATION taker — Tokyo plein, on paie l'ask"
                         );
                         lv.place_insurance_fak(is_up, ask, sz, OrderIntent::SkewAccumulation)
                             .await;
-                    } else if ask > cfg.sc_skew_fak_max
-                        || m.time_remaining_sec() <= cfg.sc_opening_stop_s
-                    {
-                        accum_fak_pending = false; // conditions mortes : on n'attend pas
                     }
                 }
             }
@@ -1349,7 +1083,6 @@ async fn quote_loop(
                     lv.cancel_all().await;
                 }
             } else {
-                let remaining_l_quote = m.time_remaining_sec();
                 // Ouvertures : tailles STRICTEMENT égales des deux côtés (le bump
                 // 1$ asymétrique a créé 95 orphelines le 7 juil.). Fenêtre de
                 // faisabilité : commune ≥ minimums des 2 côtés ET ≤ tailles engine ;
@@ -1469,62 +1202,14 @@ async fn quote_loop(
                     };
                     let is_up = side == Side::Up;
                     let side_ix = if is_up { 0 } else { 1 };
-                    // ═══ SKEW : quote d'ACCUMULATION du côté fort ═══
-                    // Indépendante de l'atomicité des ouvertures (le blindage est
-                    // asymétrique par définition). Taille = clip × mult, bornée
-                    // par le net_cap restant. Maker, post-only, échelle normale.
-                    let mut want_px = want_px;
-                    let mut want_sz = want_sz;
-                    let mut is_comp = is_comp;
-                    let mut skew_acc = false;
-                    if skew_winner == Some(side) && !is_comp {
-                        let surplus = if is_up {
-                            sc.imbalance()
-                        } else {
-                            -sc.imbalance()
-                        };
-                        // Le cap compte AUSSI ce qui est déjà posé au carnet côté
-                        // gagnant : sans ça, 2 niveaux × 12 + un repost = 36 parts
-                        // remplies en 3 s pour un cap de 12 (incident 12 juil.
-                        // 16:50:09, imb=-36).
-                        let resting_open = lv.open_exposure(&lrest).side(is_up);
-                        let inflight = if now_ms_books as i64 - accum_fak_inflight.1 < 10_000 {
-                            accum_fak_inflight.0
-                        } else {
-                            0.0
-                        };
-                        let cap_room = (net_cap - surplus - resting_open - inflight).floor();
-                        let bb_side = if is_up { bb_up } else { bb_dn };
-                        if remaining_l_quote > cfg.sc_opening_stop_s
-                            && cap_room >= min_shares
-                            && bb_side > 0.0
-                            && bb_side <= cfg.sc_open_max_price
-                        {
-                            let cap = if ask > 0.0 {
-                                ask - open_buf
-                            } else {
-                                bb_side + tick_sz
-                            };
-                            let px = (((bb_side + tick_sz).min(cap)) / tick_sz).floor() * tick_sz;
-                            let sz = (cfg.sc_base_clip * cfg.sc_skew_mult).min(cap_room).floor();
-                            let min_req = min_shares.max((1.0_f64 / px.max(0.01)).ceil());
-                            if px >= 0.01 && sz >= min_req && px * sz <= lv.cash {
-                                want_px = Some(px);
-                                want_sz = Some(sz);
-                                is_comp = false;
-                                skew_acc = true;
-                            }
-                        } else {
-                            want_sz = None; // cap atteint / fin de fenêtre : plus d'accumulation
-                        }
-                    }
+                    let want_px = want_px;
+                    let want_sz = want_sz;
+                    let is_comp = is_comp;
                     // ÉCHELLE : complétion = 1 niveau (taille = déficit exact) ;
                     // ouverture = sc_ladder_levels niveaux espacés de
                     // sc_ladder_step_ticks — présence continue au carnet, capte
                     // les dips profonds à meilleur prix (profil vrai MM).
-                    // Accumulation skew = 1 SEUL niveau : chaque niveau supplémentaire
-                    // est une exposition nette additionnelle qui échappe au cap.
-                    let n_levels: u8 = if is_comp || skew_acc {
+                    let n_levels: u8 = if is_comp {
                         1
                     } else {
                         cfg.sc_ladder_levels.clamp(1, 4) as u8
@@ -1622,8 +1307,6 @@ async fn quote_loop(
                                         // propre du CLOB (zéro taxe accidentelle).
                                         let intent = if is_comp {
                                             OrderIntent::Completion
-                                        } else if skew_acc {
-                                            OrderIntent::SkewAccumulation
                                         } else {
                                             OrderIntent::SymmetricOpen
                                         };
@@ -1700,7 +1383,6 @@ async fn quote_loop(
                 cfg.sc_taker_drift,
             );
             if enabled
-                && !hold_dir_bet // pari directionnel en cours → on le laisse courir, pas de complétion
                 && sc.imbalance().abs() >= 5.0
                 && ((10..=20).contains(&remaining_l) || (taker_drift_urgent && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
@@ -1726,12 +1408,7 @@ async fn quote_loop(
                 let time_ramp = ((ramp_s - remaining_l as f64) / ramp_s).clamp(0.0, 1.0);
                 let taker_thr = cfg.sc_taker_drift.max(1e-9);
                 let sig_ramp = ((drift_ps.abs() - taker_thr) / (2.0 * taker_thr)).clamp(0.0, 1.0);
-                // Confiance PM : même composante que la complétion maker — un
-                // carnet qui pousse fort vers le gagnant justifie de payer plus.
-                let pm_for_ins = if is_up { pm_mom } else { -pm_mom };
-                let pm_ramp_ins =
-                    ((pm_for_ins - cfg.sc_pm_mom) / (2.0 * cfg.sc_pm_mom)).clamp(0.0, 1.0);
-                let conf = time_ramp.max(sig_ramp).max(pm_ramp_ins);
+                let conf = time_ramp.max(sig_ramp);
                 let base_pair = cfg.sc_completion_max_pair.min(1.0);
                 let rescue_ceiling = if cfg.sc_allow_loss_rescue {
                     cfg.sc_rescue_max_pair
@@ -1833,7 +1510,6 @@ async fn quote_loop(
                 && remaining_l > 9;
             let endgame_case = (3..=9).contains(&remaining_l) && imb_abs > 0.4;
             if enabled
-                && !hold_dir_bet
                 && (dust_case || endgame_case)
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
@@ -2157,9 +1833,11 @@ async fn quote_loop(
             } else {
                 0.0
             };
-            d.skew_side = skew_winner
-                .map(|w| w.as_str().to_string())
-                .unwrap_or_default();
+            d.skew_side = if tilt.abs() >= 0.1 {
+                format!("{tilt:+.2}")
+            } else {
+                String::new()
+            };
             d.taker_fees_window = win_taker_fees;
             d.dir_wins = dir_wins;
             d.dir_total = dir_total;

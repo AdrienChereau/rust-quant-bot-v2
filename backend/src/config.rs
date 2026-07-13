@@ -243,7 +243,7 @@ impl Config {
             sc_max_clip_usdc: env_or("SC_MAX_CLIP_USDC", 6.0),
             sc_max_capital_per_market: env_or("SC_MAX_CAPITAL_PER_MARKET", 20.0),
             sc_min_seconds: env_or("SC_MIN_SECONDS", 10),
-            sc_clip_interval_s: env_or("SC_CLIP_INTERVAL_S", 15),
+            sc_clip_interval_s: env_or("SC_CLIP_INTERVAL_S", 2), // 0xb : cadence, le volume est le salaire
             sc_gate_margin: env_or("SC_GATE_MARGIN", 0.04),
             sc_min_window_age_s: env_or("SC_MIN_WINDOW_AGE_S", 15),
             sc_completion_reserve: env_or("SC_COMPLETION_RESERVE", 0.5),
@@ -258,7 +258,7 @@ impl Config {
             sc_completion_max_price: env_or("SC_COMPLETION_MAX_PRICE", 0.65),
             sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.02),
             sc_opening_stop_s: env_or("SC_OPENING_STOP_S", 60.0) as i64,
-            sc_open_max_price: env_or("SC_OPEN_MAX_PRICE", 0.75),
+            sc_open_max_price: env_or("SC_OPEN_MAX_PRICE", 0.87), // 0xb charge le favori jusqu'à ~87c
             sc_directional_max: env_or("SC_DIRECTIONAL_MAX", 0.90),
             sc_directional_min: env_or("SC_DIRECTIONAL_MIN", 0.40),
             sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),
@@ -278,7 +278,7 @@ impl Config {
             sc_urgency_drift: env_or("SC_URGENCY_DRIFT", 0.00001),
             sc_taker_drift: env_or("SC_TAKER_DRIFT", 0.000012),
             sc_rescue_max_pair: env_or("SC_RESCUE_MAX_PAIR", 1.23),
-            sc_allow_loss_rescue: env_or("SC_ALLOW_LOSS_RESCUE", false),
+            sc_allow_loss_rescue: env_or("SC_ALLOW_LOSS_RESCUE", true), // doctrine back >1$ (canari : false par env)
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
             sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),
