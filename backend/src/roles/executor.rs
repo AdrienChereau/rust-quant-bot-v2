@@ -715,6 +715,17 @@ async fn quote_loop(
             })
             .map(|(_, p)| *p);
         let pm_mom = pm_base.map(|b| up_mid - b).unwrap_or(0.0);
+        // MARCHÉ TRANCHÉ (incident 23:47, 12 juil.) : quand un côté cote sous
+        // sc_skew_complete_below, le mid du mourant vibre de ±10¢ sur un carnet
+        // vide — TOUT signal pm est du bruit (armement, pull, urgence, exit).
+        // On le met à zéro : il ne reste que la complétion patiente, la chaîne
+        // de fin de fenêtre et le flatten. Tue aussi le spam « PULL PM ».
+        let pm_mom = if bb_up > cfg.sc_skew_complete_below && bb_dn > cfg.sc_skew_complete_below
+        {
+            pm_mom
+        } else {
+            0.0
+        };
         let pm_side = if pm_mom >= cfg.sc_pm_mom {
             Some(Side::Up)
         } else if pm_mom <= -cfg.sc_pm_mom {
@@ -764,9 +775,14 @@ async fn quote_loop(
                 None
             }
             None if cfg.sc_skew && !paused && !sleeping && now_s >= skew_cool_until => {
+                // PLANCHER (incident 23:47, 12 juil.) : un « gagnant » sous
+                // sc_directional_min n'est pas un gagnant, c'est un rebond de
+                // token mort (Up 0.04→0.14 sur carnet vide → 12 achetés @0.13,
+                // revendus @0.01). Le whale accumule le FAVORI (0.40-0.75),
+                // jamais le couteau.
                 tokyo_winner.or(pm_side).filter(|w| {
                     let bb_w = if *w == Side::Up { bb_up } else { bb_dn };
-                    bb_w > 0.0 && bb_w <= cfg.sc_open_max_price
+                    bb_w >= cfg.sc_directional_min && bb_w <= cfg.sc_open_max_price
                 })
             }
             None => None,
@@ -791,13 +807,20 @@ async fn quote_loop(
         // Pari en cours ? (surplus du gagnant ≤ net_cap) → on ne le complète pas
         // TANT QUE le perdant n'est pas bradé (la complétion sous
         // sc_skew_complete_below verrouille la paire grasse, sinon patience).
+        // COLLANT (fenêtre 23:45, 12 juil.) : la patience est portée par
+        // l'INVENTAIRE (bet_side), pas par l'armement qui respire — sinon le
+        // moindre désarmement complète au complément (12 Down @0.70 accumulés,
+        // puis 12 Up @0.28 achetés 10 s après → paire 0.98, pari gaspillé).
+        // Le pari vit jusqu'à : perdant ≤ 0.20 (paire grasse) OU retournement
+        // (sortie éclair) OU résolution (le gagnant paie 1 $).
         let net_cap = cfg.sc_trend_net_cap.max(cfg.sc_dir_tilt).max(1.0);
-        let hold_dir_bet = skew_winner.is_some_and(|w| {
+        let held_side = bet_side.or(skew_winner);
+        let hold_dir_bet = held_side.is_some_and(|w| {
             let surplus = if w == Side::Up { sc.imbalance() } else { -sc.imbalance() };
             surplus > 1e-9 && surplus <= net_cap + 1e-9
         });
         if hold_dir_bet {
-            let w = skew_winner.unwrap();
+            let w = held_side.unwrap();
             let loser = w.opposite();
             let loser_bb = if loser == Side::Up { bb_up } else { bb_dn };
             if loser_bb > cfg.sc_skew_complete_below {
@@ -886,7 +909,15 @@ async fn quote_loop(
                         let side_ix = if b.side == Side::Up { 0 } else { 1 };
                         if (capped - last_aggr_px[side_ix]).abs() > tick_sz / 2.0 {
                             last_aggr_px[side_ix] = capped;
-                            let cause = if endgame { "fin de fenêtre" } else { "drift Tokyo" };
+                            let cause = if endgame {
+                                "fin de fenêtre"
+                            } else if crate::engines::spread_capture::completion_urgent(
+                                b.side, drift_ps, cfg.sc_urgency_drift,
+                            ) {
+                                "drift Tokyo"
+                            } else {
+                                "pm momentum"
+                            };
                             tracing::info!(side = ?b.side, from = b.price, to = capped,
                                 cap_paire = format!("{ramped_pair:.3}"),
                                 drift = format!("{drift_ps:+.4}"), cause, "complétion agressive (maker)");
