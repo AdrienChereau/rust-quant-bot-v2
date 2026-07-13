@@ -277,10 +277,14 @@ pub struct LiveCtx {
     /// Up 5@56¢ fillé, lecture ratée, ordre oublié → fausse complétion à 62¢).
     audit: Vec<AuditOrder>,
     audit_max_age_ms: i64,
-    /// Un invariant d'exécution irréconciliable arrête les nouvelles poses sans
-    /// masquer les positions existantes. Le dashboard reste utilisable pour
-    /// l'intervention manuelle.
+    /// Un invariant d'exécution suspend les nouvelles poses le temps de se
+    /// réconcilier — PAUSE DE SÉCURITÉ, pas une mort définitive (décision
+    /// utilisateur 13 juil. : le halt permanent laissait la position nue sans
+    /// défense pendant les 3 dernières minutes de la fenêtre 15:20). La boucle
+    /// annule/récolte tout pendant la pause ; la reprise est automatique dès
+    /// que l'audit est vide (≥10 s) ou au rollover.
     pub halted_reason: Option<String>,
+    halted_since_ms: i64,
 }
 
 impl LiveCtx {
@@ -341,11 +345,15 @@ impl LiveCtx {
             audit: Vec::new(),
             audit_max_age_ms: audit_max_age_s.max(1) * 1_000,
             halted_reason: None,
+            halted_since_ms: 0,
         })
     }
 
     /// Rollover de fenêtre : annule tout sur l'ancien marché, bascule le WS user.
     pub async fn on_new_market(&mut self, condition_id: &str, up_token: &str, dn_token: &str) {
+        if self.halted_reason.take().is_some() {
+            tracing::warn!("LIVE repris au rollover — pause de sécurité levée (marché neuf)");
+        }
         if !self.condition_id.is_empty() && self.armed {
             if let Err(e) = orders::cancel_market_orders(&self.creds, &self.condition_id).await {
                 tracing::warn!(error = %e, "cancel-market-orders au rollover");
@@ -411,8 +419,25 @@ impl LiveCtx {
     pub fn halt(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         if self.halted_reason.is_none() {
-            tracing::error!(reason = %reason, "LIVE HALTED — invariant d'exécution violé");
+            tracing::error!(reason = %reason,
+                "LIVE en PAUSE DE SÉCURITÉ — invariant violé (annulation générale, reprise auto quand l'audit est vide)");
             self.halted_reason = Some(reason);
+            self.halted_since_ms = chrono::Utc::now().timestamp_millis();
+        }
+    }
+
+    /// Reprise automatique : la pause de sécurité se lève dès que toutes les
+    /// incertitudes sont résolues (audit vide) et qu'au moins 10 s ont passé —
+    /// le balayage/l'audit ont alors récolté ou annulé tout ordre zombie.
+    fn try_resume(&mut self, now_ms: i64) {
+        if self.halted_reason.is_some()
+            && self.audit.is_empty()
+            && now_ms - self.halted_since_ms >= 10_000
+        {
+            tracing::warn!(
+                "LIVE repris — incohérence résorbée (audit vide), retour à la cotation"
+            );
+            self.halted_reason = None;
         }
     }
 
@@ -1088,6 +1113,8 @@ impl LiveCtx {
         }
         audit.retain(|entry| entry.tries != u32::MAX);
         self.audit = audit;
+        // Pause de sécurité : reprise automatique dès que l'audit est vide.
+        self.try_resume(now_ms);
         let t0 = std::time::Instant::now();
         let open = match orders::open_orders(&self.creds, &self.condition_id).await {
             Ok(o) => {

@@ -1285,6 +1285,14 @@ async fn quote_loop(
                                     Some(i) => {
                                         (px - lrest[i].r.price).abs() > 2.0 * tick_sz + 1e-9
                                             && cooled
+                                            // CHASSE MONOTONE (13 juil. 15:21) : une
+                                            // complétion ne redescend JAMAIS — le churn
+                                            // 0,63→0,60 au gré du tilt a créé la course
+                                            // cancel/repose → double transitoire → pause.
+                                            // Redescendre n'a aucune urgence ; rester
+                                            // haut = payer au pire l'escalade déjà
+                                            // consentie.
+                                            && (!is_comp || px > lrest[i].r.price + 1e-9)
                                     }
                                     None => cooled,
                                 };
@@ -1295,7 +1303,6 @@ async fn quote_loop(
                                         let (f, safe) = lv.harvest_and_cancel(&slot.r, is_up).await;
                                         if let Some(f) = f {
                                             harvested.push(f);
-                                            old_was_filled = true;
                                         }
                                         // Cancel non confirmé = fill en vol probable
                                         // (course 02:02 : les DEUX ordres exécutés).
@@ -1303,15 +1310,21 @@ async fn quote_loop(
                                         if safe {
                                             open_side[side_ix] -=
                                                 (slot.r.size - slot.r.matched).max(0.0);
+                                            // REPOSE DIFFÉRÉE (13 juil. 15:21) : même
+                                            // un cancel « sûr » peut rester vivant 1-2 s
+                                            // côté CLOB (ACK ≠ carnet). Le remplaçant
+                                            // part au tick SUIVANT (100 ms), après le
+                                            // drain/réconcile — jamais le même tick.
+                                            side_frozen[side_ix] = true;
                                         } else {
                                             side_frozen[side_ix] = true;
-                                            old_was_filled = true;
                                         }
+                                        old_was_filled = true;
                                     }
                                     if old_was_filled {
-                                        // L'ordre à repricer était DÉJÀ fillé :
-                                        // l'inventaire vient de changer — rien posé
-                                        // ce tick (19:25 le 8 juil. : achat DOUBLE).
+                                        // Cancel émis ce tick (ou ordre déjà fillé) :
+                                        // rien posé ce tick (19:25 le 8 juil. : achat
+                                        // DOUBLE ; 13 juil. 15:21 : course cancel/pose).
                                         continue;
                                     }
                                     // GARDE-FOU EXPOSITION : côté gelé → rien ce
