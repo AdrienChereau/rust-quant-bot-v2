@@ -113,7 +113,14 @@ pub struct Config {
     // Buffer anti-cross ADAPTATIF au σ sur les OUVERTURES (les complétions/FAK gardent le droit de croiser) : bid = ask − (1 + extra)·tick, extra = clamp(⌊(σ−lo)/span⌋, 0, max).
     pub sc_cross_max_extra: f64, // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
     pub sc_ladder_levels: u32, // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
-    pub sc_open_pair_target: f64, // PAIRES D'EXTRÊMES : somme des prix des DEUX ouvertures ≤ ce plafond (défaut 0.98 — 0xb apparie 0.92+0.05 en marché tranché, sa moisson maximale). C'est la SEULE discipline de prix des ouvertures
+    pub sc_open_pair_target: f64, // PAIRES D'EXTRÊMES : somme des prix des DEUX ouvertures ≤ ce plafond (défaut 0.99 — 0xb apparie 0.96+0.02 en marché tranché, sa moisson maximale). C'est la SEULE discipline de prix des ouvertures
+    // ── LE FLOTTEUR (loi 0xb, STRATEGIE.md) : imbalance CIBLE pilotée par le
+    //    grand livre — paire courante > 1$ = compensation (avec le leader),
+    //    < 1$ = convexité (ticket pas cher côté contrarien), Tokyo arbitre. ──
+    pub sc_float_shares: f64, // taille du flotteur (parts) — 0xb mesuré : ~14 % du volume d'un côté (défaut 12 ≈ 2 clips)
+    pub sc_float_dwell_s: i64, // temporisation minimale entre deux changements de cible (anti-churn, défaut 10 s)
+    pub sc_conv_max_price: f64, // ticket de convexité : prix max du côté contrarien (défaut 0.45 — on ne contre pas cher)
+    pub sc_conv_dust: f64, // conversion de fin : sous T−60, si la poussière opposée cote ≤ ce seuil, la cible revient à 0 (défaut 0.06)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_dust_tol: f64, // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
     pub sc_allow_flatten: bool, // ventes de flatten (poussière/fin de fenêtre/coupe anticipée). DÉSACTIVÉ (14 juil., ordre utilisateur : zéro vente, profil 0xb = 100 % achats) : les résidus courent jusqu'à la résolution
@@ -290,7 +297,11 @@ impl Config {
             sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 3.0),
             sc_dust_tol: env_or("SC_DUST_TOL", 1.0),
             sc_allow_flatten: env_or("SC_ALLOW_FLATTEN", false),
-            sc_open_pair_target: env_or("SC_OPEN_PAIR_TARGET", 0.98),
+            sc_open_pair_target: env_or("SC_OPEN_PAIR_TARGET", 0.99), // loi 0xb : 2/3 de son volume en fenêtre décidée à 96-99¢ + 1-3¢
+            sc_float_shares: env_or("SC_FLOAT_SHARES", 12.0),
+            sc_float_dwell_s: env_or("SC_FLOAT_DWELL_S", 10),
+            sc_conv_max_price: env_or("SC_CONV_MAX_PRICE", 0.45),
+            sc_conv_dust: env_or("SC_CONV_DUST", 0.06),
             sc_skew: env_or("SC_SKEW", true),
             sc_skew_mult: env_or("SC_SKEW_MULT", 2.0),
             sc_trend_net_cap: env_or("SC_TREND_NET_CAP", 12.0),

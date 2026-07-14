@@ -367,6 +367,13 @@ async fn quote_loop(
     let mut dir_call: Option<Side> = None;
     let mut dir_wins: u32 = 0;
     let mut dir_total: u32 = 0;
+    // ═══ LE FLOTTEUR (loi 0xb, STRATEGIE.md) : imbalance CIBLE signée pilotée
+    // par le GRAND LIVRE — paire courante > 1$ = compensation (avec le leader),
+    // < 1$ = convexité (ticket pas cher, jamais contre Tokyo). Hystérésis à
+    // 99,5/100,5¢ (flips 0xb mesurés à 100,7¢ médian) + dwell anti-churn.
+    let mut float_sign: i8 = 0; // signe courant de la cible (+1 = surplus Up voulu)
+    let mut float_conv: bool = false; // mode courant (false = compensation)
+    let mut last_float_ms: i64 = 0; // dernier changement de cible (dwell)
 
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
     let mut rest_up: Option<(f64, f64)> = None; // (prix, taille)
@@ -548,6 +555,9 @@ async fn quote_loop(
                     sc.reset_window(); // état blended remis à zéro pour la nouvelle fenêtre
                     last_tilt_sign = 0;
                     tokyo_side_since = (None, 0);
+                    float_sign = 0;
+                    float_conv = false;
+                    last_float_ms = 0;
                     #[cfg(feature = "live")]
                     {
                         last_fak_side = None;
@@ -879,6 +889,7 @@ async fn quote_loop(
             now_ms_books as i64 - tokyo_side_since.1
                 >= (cfg.sc_fak_confirm_s * 1000.0) as i64
         });
+        #[cfg_attr(not(feature = "live"), allow(unused_variables))]
         let fak_trigger: Option<Side> = impulse_winner.or(tokyo_confirmed);
         if let Some(w) = tokyo_winner {
             dir_call = Some(w);
@@ -905,6 +916,94 @@ async fn quote_loop(
             last_tilt_sign = tilt_sign;
         }
 
+        // ═══ LE FLOTTEUR : cible d'imbalance pilotée par le GRAND LIVRE ═══
+        // (loi 0xb, STRATEGIE.md §1) Mesuré sur 56 fenêtres : paire courante
+        // > 1$ → flotteur AVEC le leader (56 % des points, compensation) ;
+        // < 1$ → flotteur libre côté PAS CHER (60 % contrariens, convexité) ;
+        // flips à 100,7¢ médian. Tokyo arbitre : il établit avant le prix,
+        // aligne la compensation plus tôt, et VETO tout ticket contrarien
+        // contre une explosion vue à Binance.
+        let remaining_f = m.time_remaining_sec();
+        {
+            // Leader du prix : bande morte 48-52 (0xb flippe à 47¢ Up médian).
+            let leader: i8 = if bb_up >= 0.52 {
+                1
+            } else if bb_up > 0.0 && bb_up <= 0.48 {
+                -1
+            } else {
+                0
+            };
+            // Mode par hystérésis autour de 1$ (paire courante du grand livre).
+            match sc.pair_cost() {
+                Some(p) if p > 1.005 => float_conv = false,
+                Some(p) if p < 0.995 => float_conv = true,
+                _ => {} // zone neutre ou pas encore de paire : mode conservé
+            }
+            let tokyo_sign: i8 = tilt_sign; // conviction Binance (±0.5 confirmé)
+            let desired_sign: i8 = if !float_conv {
+                // COMPENSATION : avec le leader ; Tokyo prend la main s'il crie
+                // (il voit le renversement avant le carnet) ou si le prix hésite.
+                if tokyo_sign != 0 {
+                    tokyo_sign
+                } else if leader != 0 {
+                    leader
+                } else {
+                    float_sign
+                }
+            } else {
+                // CONVEXITÉ : ticket contrarien SEULEMENT si ce côté est bradé
+                // (≤ conv_max_price) et que Tokyo ne crie pas dans le sens du
+                // leader (jamais contrer une explosion vue à Binance).
+                let contra = -leader;
+                let contra_px = if contra > 0 { bb_up } else { bb_dn };
+                if leader != 0
+                    && contra_px > 0.0
+                    && contra_px <= cfg.sc_conv_max_price
+                    && tokyo_sign != leader
+                {
+                    contra
+                } else if tokyo_sign != 0 {
+                    tokyo_sign
+                } else {
+                    0 // équilibre : l'autre visage de la convexité
+                }
+            };
+            // CONVERSION DE FIN (loi 0xb §1) : sous T−60, si la poussière du
+            // côté opposé au flotteur est bradée, la cible revient à 0 — la
+            // complétion avale la poussière et convertit le flotteur en paires
+            // certaines. Poussière chère → le flotteur court au redeem.
+            let dust_px = if float_sign > 0 { bb_dn } else { bb_up };
+            let convert_now = remaining_f <= 60
+                && float_sign != 0
+                && dust_px > 0.0
+                && dust_px <= cfg.sc_conv_dust;
+            let new_sign: i8 = if convert_now { 0 } else { desired_sign };
+            if new_sign != float_sign
+                && now_ms_books as i64 - last_float_ms >= cfg.sc_float_dwell_s * 1000
+            {
+                tracing::info!(
+                    mode = if convert_now {
+                        "conversion"
+                    } else if float_conv {
+                        "convexité"
+                    } else {
+                        "compensation"
+                    },
+                    cible = new_sign as f64 * cfg.sc_float_shares,
+                    paire = sc
+                        .pair_cost()
+                        .map(|p| format!("{:.3}", p))
+                        .unwrap_or_else(|| "—".into()),
+                    leader = if leader > 0 { "up" } else if leader < 0 { "down" } else { "—" },
+                    tokyo = format!("{tilt:+.2}"),
+                    "FLOTTEUR — nouvelle cible d'inventaire"
+                );
+                float_sign = new_sign;
+                last_float_ms = now_ms_books as i64;
+            }
+        }
+        let target_imb = float_sign as f64 * cfg.sc_float_shares;
+
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
         let desired = if sleeping || !enabled {
             Vec::new()
@@ -922,6 +1021,7 @@ async fn quote_loop(
                 size_factor,
                 cfg.sc_symmetric,
                 tilt,
+                target_imb,
             )
         };
         let tick_sz = if m.tick_size > 0.0 { m.tick_size } else { 0.01 };
@@ -1548,11 +1648,13 @@ async fn quote_loop(
             //    MAINTENANT au marché plutôt que de laisser la jambe partir nue
             //    (« compenser la perte » demandé le 9 juil.). Borné au plafond de
             //    paire : au-delà, résidu accepté (perte bornée).
-            let deficit_side = if sc.imbalance() > 0.0 {
-                Side::Down
-            } else {
-                Side::Up
-            };
+            // L'ÉCART se mesure à la CIBLE du flotteur, pas à zéro (loi 0xb) :
+            // porter le flotteur voulu n'est pas être unijambiste — c'est
+            // l'excédent AU-DELÀ de la cible qui appelle l'assurance. Quand la
+            // cible flippe (leader/Tokyo), l'écart double d'un coup et cette
+            // même chaîne exécute le flip défensif.
+            let dev_imb = sc.imbalance() - target_imb;
+            let deficit_side = if dev_imb > 0.0 { Side::Down } else { Side::Up };
             let taker_drift_urgent = crate::engines::spread_capture::completion_urgent(
                 deficit_side,
                 drift_ps,
@@ -1574,12 +1676,12 @@ async fn quote_loop(
                 // Down @0.085, rien ne tirait).
                 || bb_deficit_ins >= 0.60;
             if enabled
-                && sc.imbalance().abs() >= 5.0
+                && dev_imb.abs() >= 5.0
                 && ((10..=20).contains(&remaining_l)
                     || ((taker_drift_urgent || signal_against_surplus) && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
-                let (is_up, ask, ask_sz) = if sc.imbalance() > 0.0 {
+                let (is_up, ask, ask_sz) = if dev_imb > 0.0 {
                     (false, ask_dn, ask_dn_sz)
                 } else {
                     (true, ask_up, ask_up_sz)
@@ -1669,7 +1771,9 @@ async fn quote_loop(
                     // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
                     // par les minimums relançait la spirale). Sous les minimums →
                     // résidu accepté, perte bornée. Déficit RECALCULÉ après purge.
-                    let sz = ((sc.imbalance().abs().min(ask_sz.max(1.0))) * 100.0).floor() / 100.0;
+                    let sz = (((sc.imbalance() - target_imb).abs().min(ask_sz.max(1.0))) * 100.0)
+                        .floor()
+                        / 100.0;
                     // FAK = exécution immédiate : le minimum de 5 parts ne
                     // s'applique QU'AUX ordres restants (prouvé 9-10 juil. :
                     // vente FAK de 0,56 part). Un déficit SOUS-MINIMUM (fill
@@ -2001,14 +2105,17 @@ async fn quote_loop(
         // complète à −4,3¢ d'edge médian, jusqu'à >1$ la paire). Frais taker inclus,
         // pas de rebate sur ce fill.
         let remaining = m.time_remaining_sec();
-        if !live_mode && enabled && (10..=45).contains(&remaining) && sc.imbalance().abs() >= 5.0 {
-            let (side, ask, ask_sz) = if sc.imbalance() > 0.0 {
+        // L'écart se mesure à la CIBLE du flotteur (loi 0xb) — le résidu voulu
+        // court au redeem, seul l'excédent au-delà s'assure.
+        let dev_paper = sc.imbalance() - target_imb;
+        if !live_mode && enabled && (10..=45).contains(&remaining) && dev_paper.abs() >= 5.0 {
+            let (side, ask, ask_sz) = if dev_paper > 0.0 {
                 (Side::Down, ask_dn, ask_dn_sz)
             } else {
                 (Side::Up, ask_up, ask_up_sz)
             };
             if ask > 0.0 && ask <= 0.99 {
-                let deficit = sc.imbalance().abs();
+                let deficit = dev_paper.abs();
                 let fill = deficit.min(ask_sz.max(1.0)).floor();
                 let px_eff = ask + 0.07 * ask * (1.0 - ask); // fee_eq taker par part
                 if fill >= 1.0 && paper.try_buy(side.as_str(), px_eff, fill, "taker") {
@@ -2081,7 +2188,14 @@ async fn quote_loop(
             } else {
                 0.0
             };
-            d.skew_side = if tilt.abs() >= 0.1 {
+            // Flotteur (cible signée + mode) et tilt Binance, pour le dashboard.
+            d.skew_side = if float_sign != 0 {
+                format!(
+                    "{}{:+.0} · tilt {tilt:+.2}",
+                    if float_conv { "conv " } else { "comp " },
+                    target_imb
+                )
+            } else if tilt.abs() >= 0.1 {
                 format!("{tilt:+.2}")
             } else {
                 String::new()

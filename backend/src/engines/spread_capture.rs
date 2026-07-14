@@ -351,10 +351,12 @@ impl SpreadCaptureEngine {
         size_factor: f64,
         symmetric: bool,
         tilt: f64,
+        target_imb: f64,
     ) -> Vec<BidQuote> {
         if symmetric {
             return self.desired_bids_symmetric(
                 best_bid_up, best_bid_dn, remaining_s, now_s, tick, size_factor, tilt,
+                target_imb,
             );
         }
         let c = &self.cfg;
@@ -446,6 +448,7 @@ impl SpreadCaptureEngine {
         tick: f64,
         size_factor: f64,
         tilt: f64,
+        target_imb: f64,
     ) -> Vec<BidQuote> {
         let c = &self.cfg;
         let mut out = Vec::new();
@@ -453,15 +456,24 @@ impl SpreadCaptureEngine {
             return out;
         }
         let tick = if tick > 0.0 { tick } else { 0.01 };
-        // Cible DOUCE ≈ 1,00 : on vise le volume (paire au plus près de 1$),
-        // pas la marge par merge. Le hard cap (completion_max_pair) n'est
-        // appliqué qu'aux escalades, côté executor.
-        let pair_target = c.completion_max_pair.min(1.0);
+        // Paire SOUPLE (loi 0xb, STRATEGIE.md §1) : la complétion ordinaire va
+        // jusqu'à completion_max_pair (défaut 1.02 — médiane 0xb 100,5¢).
+        // L'inventaire plein prime sur la marge par paire ; les escalades
+        // au-delà restent gouvernées par la rampe de sauvetage (executor).
+        let pair_target = c.completion_max_pair.min(1.05);
         let tilt = tilt.clamp(-1.0, 1.0);
         for side in [Side::Up, Side::Down] {
             let (my, other, bb, bb_other) = match side {
                 Side::Up => (self.shares_up, self.shares_dn, best_bid_up, best_bid_dn),
                 Side::Down => (self.shares_dn, self.shares_up, best_bid_dn, best_bid_up),
+            };
+            // LE FLOTTEUR (loi 0xb) : le moteur ne vise plus la symétrie mais
+            // une imbalance CIBLE signée (+ = surplus Up voulu). Déficit et
+            // surplus deviennent relatifs à cette cible — toute la mécanique
+            // existante (complétion, retraits, room) travaille vers T.
+            let t_side = match side {
+                Side::Up => target_imb,
+                Side::Down => -target_imb,
             };
             if bb <= 0.0 {
                 continue; // carnet vide de ce côté : rien à améliorer
@@ -477,7 +489,7 @@ impl SpreadCaptureEngine {
             if last.map_or(false, |t| now_s - t < c.clip_interval_s) {
                 continue;
             }
-            let deficit = other - my;
+            let deficit = other + t_side - my;
             if deficit > c.dust_tol {
                 // ── CÔTÉ DÉFICITAIRE : complétion, taille = TOUT le déficit ──
                 // Posée au COMPLÉMENT (paire ≤ pair_target) — chasser le touch
@@ -517,7 +529,10 @@ impl SpreadCaptureEngine {
             // ── OUVERTURE CONTINUE (équilibré OU côté excédentaire) ──
             // Grand modèle 0xb : l'excédent ne COUPE plus la quote, il la met en
             // RETRAIT. Le seul mutisme autorisé = le cap dur d'imbalance.
-            let surplus = (my - other).max(0.0);
+            // Le surplus est RELATIF à la cible : porter le flotteur voulu ne
+            // met pas le côté favori en retrait (cap absolu effectif =
+            // max_imbalance + |T|, T étant borné par SC_FLOAT_SHARES).
+            let surplus = (my - other - t_side).max(0.0);
             if WINDOW_SECS - remaining_s < c.min_window_age_s {
                 continue;
             }
@@ -822,10 +837,10 @@ mod tests {
     fn no_directional_without_confirmed_trend() {
         let mut e = eng();
         // tendance non confirmee -> zero directionnel, mais la completion vit.
-        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, None, 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, None, 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!(q.is_empty());
         e.on_fill(Side::Up, 0.60, 12.0, 0);
-        let q = e.desired_bids(0.48, 0.30, 0.60, 200, 100, None, 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.30, 0.60, 200, 100, None, 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert_eq!(q.len(), 1);
         assert!(q[0].completion && q[0].side == Side::Down);
     }
@@ -835,7 +850,7 @@ mod tests {
         let e = eng();
         // drift dit Down mais le marche price Down a 33c (< 40c) -> pas de pari
         // sur le couteau qui tombe ; et pas de directionnel Up (tendance Down).
-        let q = e.desired_bids(0.65, 0.33, 0.35, 200, 0, Some(false), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.65, 0.33, 0.35, 200, 0, Some(false), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!(q.iter().all(|b| b.completion), "{q:?}");
     }
 
@@ -913,7 +928,7 @@ mod tests {
     fn symmetric_balanced_quotes_both_sides_pair_guaranteed() {
         let e = eng();
         // marché 60/40 : bb_up 0.58, bb_dn 0.38 → bids 0.59 et 0.39, somme < pair_target
-        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0, 0.0, 0.0);
         assert_eq!(q.len(), 2, "{q:?}");
         let pu = q.iter().find(|b| b.side == Side::Up).unwrap().price;
         let pd = q.iter().find(|b| b.side == Side::Down).unwrap().price;
@@ -925,7 +940,7 @@ mod tests {
     fn symmetric_after_fill_only_completion_on_other_side() {
         let mut e = eng();
         e.on_fill(Side::Up, 0.60, 10.0, 0); // fill Up 60c
-        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.58, 0.38, 200, 100, 0.01, 1.0, 0.0, 0.0);
         // COTATION CONTINUE : complétion Down ≤ 0.995-0.60 = 0.395, ET le côté
         // excédentaire Up reste au carnet — en RETRAIT (surplus 10 → 2 ticks
         // sous le contact 0.59) et taille bornée par le cap d'imbalance.
@@ -943,7 +958,7 @@ mod tests {
     fn symmetric_tight_market_never_pays_pair_above_target() {
         let e = eng();
         // marché serré 50/50 : bb 0.49 des deux côtés → bids capés pour somme ≤ 0.995
-        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let sum: f64 = q.iter().map(|b| b.price).sum();
         assert!(q.len() == 2 && sum <= 0.995 + 1e-9, "{q:?} somme={sum}");
     }
@@ -957,7 +972,7 @@ mod tests {
         // le touch (8 juil. : paires à 1,11-1,29$, merges tous perdants) —
         // elle se pose au COMPLÉMENT (pair_target − avg_up) et attend le
         // retour. L'escalade appartient à l'urgence Tokyo / assurance FAK.
-        let q = e.desired_bids_symmetric(0.15, 0.80, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.15, 0.80, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert!(comp.side == Side::Down);
         let pair_target = e.cfg.completion_max_pair.min(0.999);
@@ -972,12 +987,12 @@ mod tests {
         // marché tranché ~82/18 : la jambe Down ~0.82 > 0.75 se tait, mais la
         // cotation CONTINUE garde le côté bon marché au carnet (plus de règle
         // « les deux ou aucune » — présence 0xb).
-        let q = e.desired_bids_symmetric(0.17, 0.81, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.17, 0.81, 200, 100, 0.01, 1.0, 0.0, 0.0);
         assert_eq!(q.len(), 1, "seul le côté bon marché quote: {q:?}");
         assert_eq!(q[0].side, Side::Up);
         assert!(q[0].price <= 0.185 + 1e-9, "discipline de paire: {}", q[0].price);
         // marché équilibré 55/45 : les deux ouvertures passent.
-        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0, 0.0);
+        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0, 0.0, 0.0);
         assert_eq!(q2.iter().filter(|b| !b.completion).count(), 2, "{q2:?}");
     }
 
@@ -987,7 +1002,7 @@ mod tests {
         e.cfg.completion_max_price = 0.99;
         // Fill impair (10 juil. : 5,995453/6) → déficit fractionnaire.
         e.on_fill(Side::Up, 0.56, 5.995453, 0);
-        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let comp = q.iter().find(|b| b.completion && b.side == Side::Down).expect("complétion");
         // Déficit fractionnaire 5,99 + aspiration (clip 10) = 15,99, à 2
         // DÉCIMALES — l'arrondi entier fabriquait de la poussière garantie.
@@ -999,14 +1014,14 @@ mod tests {
         let mut e = eng();
         // Lot impair (10 juil. : fill 5,992221 → résidu 0,99 Up après merges).
         e.on_fill(Side::Up, 0.55, 0.99, 0);
-        let q = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.54, 0.44, 200, 100, 0.01, 1.0, 0.0, 0.0);
         // Les DEUX ouvertures reprennent (pas de complétion 0,99 impossible,
         // pas de blocage) — le flatten de fin de fenêtre nettoiera le résidu.
         assert_eq!(q.iter().filter(|b| !b.completion).count(), 2, "{q:?}");
         assert!(q.iter().all(|b| !b.completion));
         // Au-delà de la poussière (déficit 6) : la complétion reprend la main.
         e.on_fill(Side::Up, 0.55, 6.0, 1);
-        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 200, 0.01, 1.0, 0.0);
+        let q2 = e.desired_bids_symmetric(0.54, 0.44, 200, 200, 0.01, 1.0, 0.0, 0.0);
         assert!(q2.iter().any(|b| b.completion && b.side == Side::Down), "{q2:?}");
     }
 
@@ -1015,11 +1030,11 @@ mod tests {
         let mut e = eng();
         e.cfg.opening_stop_s = 60; // spec : plus d'ouvertures sous 60 s restantes
         // Équilibré → l'ouverture serait désirée… mais il reste 50 s : rien.
-        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 100, 0.01, 1.0, 0.0, 0.0);
         assert!(q.is_empty(), "pas d'ouverture en fin de fenêtre: {q:?}");
         // Déficit Down → la complétion, elle, continue jusqu'au bout.
         e.on_fill(Side::Up, 0.50, 10.0, 0);
-        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 200, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.50, 0.48, 50, 200, 0.01, 1.0, 0.0, 0.0);
         assert_eq!(q.len(), 1, "{q:?}");
         assert!(q[0].completion && q[0].side == Side::Down);
     }
@@ -1030,7 +1045,7 @@ mod tests {
         e.cfg.completion_max_price = 0.99;
         e.cfg.max_clip = 10.0; // clip d'ouverture — ne doit PAS tronquer la complétion
         e.on_fill(Side::Up, 0.60, 12.0, 0); // déficit Down = 12 > max_clip
-        let q = e.desired_bids_symmetric(0.55, 0.30, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.55, 0.30, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         // Tout le déficit (12 > max_clip 10 : jamais tronqué) + l'aspiration.
         assert!((comp.size - 22.0).abs() < 1e-9, "déficit + aspiration: {}", comp.size);
@@ -1043,7 +1058,7 @@ mod tests {
         e.on_fill(Side::Up, 0.30, 10.0, 0); // jambe excédentaire payée 30c
         // complément ≈ 0.999−0.30 = 0.699 mais le touch Down est à 40c :
         // on quote bb+tick (41c) — moins cher que le complément = paire 71c.
-        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert!(comp.side == Side::Down);
         assert!((comp.price - 0.41).abs() < 1e-9, "au touch: {}", comp.price);
@@ -1054,7 +1069,7 @@ mod tests {
         let mut e = eng();
         // budget de fenêtre déjà consommé par l'ouverture
         e.on_fill(Side::Up, 0.80, 24.0, 0); // 19.2$ déployés sur cap 20$
-        let q = e.desired_bids_symmetric(0.75, 0.20, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.75, 0.20, 200, 100, 0.01, 1.0, 0.0, 0.0);
         let comp: Vec<_> = q.iter().filter(|b| b.completion).collect();
         assert_eq!(comp.len(), 1, "la complétion passe malgré le budget: {q:?}");
     }
@@ -1063,7 +1078,7 @@ mod tests {
     fn symmetric_opening_never_orphan() {
         let e = eng();
         // Down inquotable (carnet vide de ce côté) → AUCUNE ouverture (pas de pari déguisé)
-        let q = e.desired_bids_symmetric(0.97, 0.0, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.97, 0.0, 200, 100, 0.01, 1.0, 0.0, 0.0);
         assert!(q.iter().all(|b| b.completion), "{q:?}");
         assert!(q.is_empty());
     }
@@ -1072,7 +1087,7 @@ mod tests {
     fn tilt_favors_side_at_contact_and_bigger() {
         let e = eng();
         // tilt +1 (Up favori) : Up au contact, clip ×tilt_mult ; Down en retrait.
-        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 1.0);
+        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 1.0, 0.0);
         let up = q.iter().find(|b| b.side == Side::Up).expect("up quote");
         let dn = q.iter().find(|b| b.side == Side::Down).expect("down quote (présence continue)");
         assert!(up.size > dn.size, "favori plus gros: {q:?}");
@@ -1085,11 +1100,11 @@ mod tests {
         e.cfg.completion_max_price = 0.99;
         // PARI DÉLIBÉRÉ (surplus 16 > 1,5 × clip 10) + tilt fort → PATIENCE.
         e.on_fill(Side::Up, 0.60, 16.0, 0);
-        let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0);
+        let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert!(comp.price <= e.cfg.patient_below + 1e-9, "patiente: {}", comp.price);
         // tilt neutre : complément (rotation) même sur gros surplus.
-        let q2 = e.desired_bids_symmetric(0.55, 0.38, 200, 200, 0.01, 1.0, 0.0);
+        let q2 = e.desired_bids_symmetric(0.55, 0.38, 200, 200, 0.01, 1.0, 0.0, 0.0);
         let comp2 = q2.iter().find(|b| b.completion).expect("complétion");
         assert!(comp2.price > e.cfg.patient_below + 1e-9, "complément: {}", comp2.price);
     }
@@ -1102,7 +1117,7 @@ mod tests {
         let mut e = eng();
         e.cfg.completion_max_price = 0.99;
         e.on_fill(Side::Up, 0.60, 10.0, 0);
-        let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0);
+        let q = e.desired_bids_symmetric(0.55, 0.38, 200, 100, 0.01, 1.0, 1.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert!(comp.price > e.cfg.patient_below + 1e-9, "rotation au complément: {}", comp.price);
     }
@@ -1112,11 +1127,78 @@ mod tests {
         let mut e = eng();
         e.cfg.max_imbalance = 12.0;
         e.on_fill(Side::Up, 0.50, 12.0, 0); // surplus = cap
-        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 0.0);
+        let q = e.desired_bids_symmetric(0.49, 0.49, 200, 100, 0.01, 1.0, 0.0, 0.0);
         assert!(
             q.iter().all(|b| b.side != Side::Up || b.completion),
             "cap dur atteint → le surplus se tait: {q:?}"
         );
+    }
+
+    // ── LE FLOTTEUR (loi 0xb) : cible d'imbalance signée ──
+    #[test]
+    fn float_target_creates_completion_toward_target() {
+        // Inventaire équilibré + cible +12 → le côté Up porte un DÉFICIT de 12
+        // (établissement du flotteur par la complétion, au touch, aspiration
+        // comprise) ; le côté Down passe en retrait (surplus relatif 12).
+        let mut e = eng();
+        e.on_fill(Side::Up, 0.50, 10.0, 0);
+        e.on_fill(Side::Down, 0.48, 10.0, 0);
+        let q = e.desired_bids_symmetric(0.50, 0.48, 200, 100, 0.01, 1.0, 0.0, 12.0);
+        let up = q.iter().find(|b| b.side == Side::Up).expect("bid Up");
+        assert!(up.completion, "la cible fabrique un déficit Up: {q:?}");
+        assert!(
+            (up.size - (12.0 + e.cfg.base_clip)).abs() < 1.0,
+            "taille = déficit(12) + aspiration(clip): {q:?}"
+        );
+        let dn = q.iter().find(|b| b.side == Side::Down).expect("bid Down");
+        assert!(!dn.completion, "Down reste une ouverture en retrait: {q:?}");
+        assert!(dn.price < 0.48, "Down en retrait sous le contact: {q:?}");
+    }
+
+    #[test]
+    fn float_target_reached_is_not_rebalanced() {
+        // Flotteur atteint (+12 exactement) : AUCUNE complétion ne le rase —
+        // les deux côtés cotent en ouverture (le résidu voulu court au redeem).
+        let mut e = eng();
+        e.on_fill(Side::Up, 0.55, 22.0, 0);
+        e.on_fill(Side::Down, 0.40, 10.0, 0);
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0, 12.0);
+        assert!(
+            q.iter().all(|b| !b.completion),
+            "cible atteinte → pas de complétion: {q:?}"
+        );
+    }
+
+    #[test]
+    fn float_flip_doubles_the_deficit() {
+        // Flotteur +12 porté, la cible FLIPPE à −12 : le déficit Down = 24
+        // (le flip défensif passe par la même complétion, en tranches côté
+        // executor).
+        let mut e = eng();
+        e.on_fill(Side::Up, 0.55, 22.0, 0);
+        e.on_fill(Side::Down, 0.40, 10.0, 0);
+        let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0, -12.0);
+        let dn = q.iter().find(|b| b.side == Side::Down).expect("bid Down");
+        assert!(dn.completion);
+        assert!(
+            (dn.size - (24.0 + e.cfg.base_clip)).abs() < 1.0,
+            "déficit du flip = 2×flotteur: {q:?}"
+        );
+    }
+
+    #[test]
+    fn soft_pair_allows_ordinary_completion_above_one_dollar() {
+        // Paire souple (loi 0xb, médiane 100,5¢) : complétion ordinaire
+        // autorisée jusqu'à completion_max_pair (1.02) — l'ancien clamp à 1.00
+        // refusait le touch dès que l'excédent coûtait cher.
+        let mut e = eng();
+        e.cfg.completion_max_pair = 1.02;
+        e.cfg.completion_max_price = 0.99;
+        e.on_fill(Side::Up, 0.62, 10.0, 0); // excédent Up à 62¢
+        let q = e.desired_bids_symmetric(0.62, 0.38, 200, 100, 0.01, 1.0, 0.0, 0.0);
+        let dn = q.iter().find(|b| b.side == Side::Down && b.completion).expect("complétion Down");
+        // cap = 1.02 − 0.62 = 0.40 → le touch (0.39) passe, paire 1.01 assumée
+        assert!(dn.price >= 0.39 - 1e-9, "touch autorisé sous paire 1.02: {q:?}");
     }
 
     // ── v8 MAKER : desired_bids ──
@@ -1124,7 +1206,7 @@ mod tests {
     fn maker_directional_on_trend_side_only() {
         let e = eng();
         // tendance Up, fenetre agee, fair large -> bid directionnel Up seulement.
-        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.50, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].side, Side::Up);
         assert!(!q[0].completion);
@@ -1136,10 +1218,10 @@ mod tests {
     fn maker_directional_capped_by_fair_and_absolute() {
         let e = eng();
         // fair 0.50 -> cap 0.46 < bb+tick 0.49 -> bid a 0.46.
-        let q = e.desired_bids(0.48, 0.0, 0.50, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.0, 0.50, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!((q[0].price - 0.46).abs() < 1e-9, "px={}", q[0].price);
         // borne absolue 0.90 meme si fair tres haute.
-        let q = e.desired_bids(0.95, 0.0, 0.99, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.95, 0.0, 0.99, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!(q.is_empty() || q[0].price <= 0.90 + 1e-9);
     }
 
@@ -1147,7 +1229,7 @@ mod tests {
     fn maker_completion_targets_deficit_and_caps() {
         let mut e = eng();
         e.on_fill(Side::Up, 0.60, 12.0, 0); // long Up -> completion Down
-        let q = e.desired_bids(0.40, 0.30, 0.70, 200, 100, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.40, 0.30, 0.70, 200, 100, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         let comp: Vec<_> = q.iter().filter(|b| b.completion).collect();
         assert_eq!(comp.len(), 1);
         assert_eq!(comp[0].side, Side::Down);
@@ -1159,9 +1241,9 @@ mod tests {
     #[test]
     fn maker_size_factor_circuit_breaker() {
         let e = eng();
-        let full = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
-        let quarter = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.25, false, 0.0);
-        let zero = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.0, false, 0.0);
+        let full = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
+        let quarter = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.25, false, 0.0, 0.0);
+        let zero = e.desired_bids(0.48, 0.0, 0.60, 200, 0, Some(true), 0.01, 0.90, 0.40, 0.0, false, 0.0, 0.0);
         assert!(quarter[0].size <= (full[0].size * 0.25).ceil());
         assert!(zero.is_empty());
     }
@@ -1171,10 +1253,10 @@ mod tests {
         let mut e = eng();
         e.on_fill(Side::Up, 0.49, 10.0, 100);
         // 5 s apres : cooldown directionnel actif -> pas de bid Up.
-        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 105, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 105, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!(q.iter().all(|b| b.side != Side::Up));
         // 20 s apres : de nouveau quote.
-        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 120, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0);
+        let q = e.desired_bids(0.48, 0.0, 0.60, 200, 120, Some(true), 0.01, 0.90, 0.40, 1.0, false, 0.0, 0.0);
         assert!(q.iter().any(|b| b.side == Side::Up));
     }
 
