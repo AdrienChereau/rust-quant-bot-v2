@@ -116,6 +116,7 @@ pub struct Config {
     pub sc_open_pair_target: f64, // PAIRES D'EXTRÊMES : somme des prix des DEUX ouvertures ≤ ce plafond (défaut 0.98 — 0xb apparie 0.92+0.05 en marché tranché, sa moisson maximale). C'est la SEULE discipline de prix des ouvertures
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_dust_tol: f64, // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
+    pub sc_allow_flatten: bool, // ventes de flatten (poussière/fin de fenêtre/coupe anticipée). DÉSACTIVÉ (14 juil., ordre utilisateur : zéro vente, profil 0xb = 100 % achats) : les résidus courent jusqu'à la résolution
     // ── MODE SKEW (MM incliné) : quand un signal désigne le gagnant probable,
     //    on se blinde du côté fort et on retire le côté faible ; retournement =
     //    SORTIE ÉCLAIR en FAK. Le symétrique reste le régime par défaut. ──
@@ -288,6 +289,7 @@ impl Config {
             sc_ladder_levels: env_or("SC_LADDER_LEVELS", 3.0) as u32, // GRILLE PROFONDE : ses fills couvrent 0.05→0.95 — présence à plusieurs niveaux
             sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 3.0),
             sc_dust_tol: env_or("SC_DUST_TOL", 1.0),
+            sc_allow_flatten: env_or("SC_ALLOW_FLATTEN", false),
             sc_open_pair_target: env_or("SC_OPEN_PAIR_TARGET", 0.98),
             sc_skew: env_or("SC_SKEW", true),
             sc_skew_mult: env_or("SC_SKEW_MULT", 2.0),

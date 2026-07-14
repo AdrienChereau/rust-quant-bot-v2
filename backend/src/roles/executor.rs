@@ -1398,14 +1398,22 @@ async fn quote_loop(
                                             // On ne déplace une ouverture que si elle
                                             // devient DANGEREUSE (au-dessus de la
                                             // cible = plafond de paire violé) ou si
-                                            // elle est sortie de la grille.
-                                            let grid_span = (cfg.sc_ladder_levels as f64
-                                                * cfg.sc_ladder_step_ticks
-                                                + 4.0)
-                                                * tick_sz;
+                                            // le touch l'a distancée. La tolérance de
+                                            // 13 ticks (grille entière) a cloué les
+                                            // bids Down à 0.74/0.76 pendant tout un
+                                            // grind 0.76→0.98 (00:40 le 14 juil. :
+                                            // 2 min 46 sans un ordre déplacé, zéro
+                                            // fill sur la phase décidée). 0xb suit le
+                                            // touch marche par marche — chaque niveau
+                                            // chasse dès que SA cible s'éloigne de
+                                            // plus d'un pas d'échelle (+1 tick de
+                                            // jitter), le cooldown 4 s garde la file
+                                            // sur les oscillations courtes.
+                                            let chase_span =
+                                                (cfg.sc_ladder_step_ticks + 1.0) * tick_sz;
                                             cooled
                                                 && (resting > px + 1e-9
-                                                    || px - resting > grid_span)
+                                                    || px - resting > chase_span)
                                         }
                                     }
                                     None => cooled,
@@ -1675,10 +1683,17 @@ async fn quote_loop(
                             "sauvetage différé : cancel non confirmé du même côté (fill en vol probable)"
                         );
                     } else if sz + 1e-9 >= min_req && (ask + fee_per_share) * sz <= lv.cash {
-                        let cause = if taker_drift_urgent && remaining_l > 20 {
-                            "drift fort"
-                        } else {
+                        // Le label reflète le VRAI déclencheur (00:40:43 le
+                        // 14 juil. : « fin de fenêtre » loggé à rem=256 alors
+                        // que c'était l'urgence prix).
+                        let cause = if (10..=20).contains(&remaining_l) {
                             "fin de fenêtre"
+                        } else if taker_drift_urgent {
+                            "drift fort"
+                        } else if bb_deficit_ins >= 0.60 {
+                            "urgence prix (le marché a voté)"
+                        } else {
+                            "tilt/Tokyo contre le surplus"
                         };
                         let pair_now = all_in_ask + avg_excess_ins;
                         tracing::info!(
@@ -1737,7 +1752,12 @@ async fn quote_loop(
                 bb_side > 0.0 && bb_side < 0.50
             };
             let early_cut = (10..=15).contains(&remaining_l) && imb_abs > 0.4 && losing_residual;
+            // ORDRE UTILISATEUR (14 juil.) : ZÉRO VENTE (0xb = 100 % achats).
+            // Les résidus — poussière comprise — courent jusqu'à la résolution :
+            // le gagnant paie au redeem, le perdant expire. SC_ALLOW_FLATTEN=true
+            // pour réactiver.
             if enabled
+                && cfg.sc_allow_flatten
                 && (dust_case || endgame_case || early_cut)
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
             {
