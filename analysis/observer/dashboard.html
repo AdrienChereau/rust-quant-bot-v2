@@ -18,7 +18,7 @@ header{display:flex;justify-content:space-between;align-items:center;padding:14p
 main{padding:14px 20px;display:grid;gap:14px}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .ph{font-size:12px;color:var(--mut);margin-bottom:8px;text-transform:uppercase;letter-spacing:.04em}
-.grid2{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
+.grid2{display:grid;grid-template-columns:1fr;gap:14px}
 @media(max-width:1000px){.grid2{grid-template-columns:1fr}}
 .livegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
 .card{background:#0f1116;border-radius:8px;padding:8px 10px}
@@ -66,12 +66,6 @@ canvas{width:100%;display:block}
     <canvas id="imb" height="90"></canvas>
     <div class="ph" style="margin-top:12px">Derniers fills</div>
     <div class="feed" id="feed"></div>
-  </div>
-  <div class="panel">
-    <div class="ph">Coût de paire par fenêtre (¢) · vert = &lt; 100¢</div>
-    <canvas id="pc" height="110"></canvas>
-    <div class="ph" style="margin-top:12px">PnL trading cumulé ($, hors rebates)</div>
-    <canvas id="cum" height="110"></canvas>
   </div>
 </div>
 <div class="panel">
@@ -187,26 +181,6 @@ async function tick(){
         <td>${w.pair_cost?f(w.pair_cost*100,1)+'¢':'–'}</td><td>${w.imb_max>0?'+':''}${w.imb_max}</td>
         <td>${w.imb_final>0?'+':''}${w.imb_final}</td><td>${f(w.merged,0)}</td><td class="pos">${f(w.rebate_est||0,2)}</td>
         <td class="${cls}">${w.pnl_trading==null?'…':(w.pnl_trading>=0?'+':'')+f(w.pnl_trading,2)}</td></tr>`}).join('');
-    // paire par fenêtre (60 dernières)
-    let [x,w2,h2]=ctx('pc');
-    const wsc=ws.slice(-60);
-    if(wsc.length){const bw=Math.min(34,(w2-40)/wsc.length-4);
-      const vals=wsc.map(q=>q.pair_cost*100||0);const mx=Math.max(...vals,110);
-      x.strokeStyle='#555';x.setLineDash([3,3]);const y100=h2-12-(100/mx)*(h2-22);
-      x.beginPath();x.moveTo(30,y100);x.lineTo(w2-6,y100);x.stroke();x.setLineDash([]);
-      x.fillStyle='#8a919c';x.font='10px monospace';x.fillText('100',4,y100+3);
-      wsc.forEach((q,i)=>{const v=q.pair_cost*100||0;const bh=(v/mx)*(h2-22);
-        x.fillStyle=v>0&&v<100?'#4caf6a':'#e2604a';
-        x.fillRect(30+i*(bw+4),h2-12-bh,bw,bh);});}
-    // cumul PnL
-    [x,w2,h2]=ctx('cum');
-    if(pnls.length>0){let acc=0;const pts=pnls.map(v=>acc+=v);
-      const mn=Math.min(...pts,0),mx=Math.max(...pts,1);
-      const X=i=>30+(i/(Math.max(pts.length-1,1)))*(w2-40), Y=v=>h2-14-((v-mn)/(mx-mn||1))*(h2-24);
-      x.strokeStyle='#555';x.setLineDash([3,3]);x.beginPath();x.moveTo(30,Y(0));x.lineTo(w2-6,Y(0));x.stroke();x.setLineDash([]);
-      x.strokeStyle=pts[pts.length-1]>=0?'#4caf6a':'#e2604a';x.lineWidth=2;x.beginPath();
-      pts.forEach((v,i)=>{i?x.lineTo(X(i),Y(v)):x.moveTo(X(i),Y(v))});x.stroke();
-      x.fillStyle='#8a919c';x.font='10px monospace';x.fillText(f(mx,0),2,Y(mx)+8);x.fillText(f(mn,0),2,Y(mn));}
   }
 }
 tick();setInterval(tick,5000);
