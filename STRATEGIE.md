@@ -34,43 +34,45 @@ Cotation bilatérale continue en maker, **achats uniquement** :
 Rôle économique : transformer « avoir tort » en une perte de 1-4¢ par paire au lieu
 d'une jambe nue, et produire le volume.
 
-### Étage 2 — LE FLOTTEUR (l'unique position, pilotée par le GRAND LIVRE)
+### Étage 2 — LE FLOTTEUR : TOUJOURS du côté GAGNANT (doctrine ferme)
 
 Le bot vise en permanence une **imbalance cible** `T` (signée, en parts) au lieu de
 la symétrie. Tout le moteur (complétion, retraits, room, assurance) travaille vers
 `imbalance = T` et non plus vers zéro.
 
-**La direction de T n'est pas une prévision : c'est le coût de paire courant qui la
-décide** (découverte utilisateur, validée sur 1 976 points de mesure) :
+**Règle utilisateur, non négociable : on a plus du côté gagnant que du côté
+perdant, tout le temps.** La direction de T = le gagnant du moment :
 
-| Coût de paire courant | Mode | Position du flotteur | Mesure 0xb |
-|---|---|---|---|
-| **> 100,5¢** | **COMPENSATION** | AVEC le leader du prix — le gagnant rembourse les paires sous l'eau | aligné 56 % des points |
-| **< 99,5¢** | **CONVEXITÉ** | libre côté PAS CHER (contre ou équilibre) — ticket de loterie financé par le profit des paires, jackpot au reverse | contrarien 60 % des points |
-| 99,5-100,5¢ | hystérésis | on garde le mode courant | flips à 100,7¢ médian |
+1. **Tokyo d'abord** (tilt confirmé ±0,5) — il voit le renversement 1-3 s avant le
+   carnet, il établit avant le prix et flippe avant le recroisement.
+2. **Le leader du prix ensuite** (côté > 52¢, bande morte 48-52 — 0xb flippe à
+   47¢ Up médian).
+3. Prix hésitant et Tokyo muet → on garde le camp courant (pas de churn).
 
 - **Taille** : `SC_FLOAT_SHARES` (~15 % du volume d'un côté ; 0xb : 138 parts
   médianes pour ~950/côté = 14 %).
-- **Établissement tôt** : 0xb à t médian 50 s, leader à 55¢ (p25-p75 : 40-65¢).
-- **Leader** = le côté au-dessus de ~52¢ (bande morte 48-52). Avant que le prix ne
-  se décide, **Tokyo établit** (notre avance de 1-3 s sur le carnet — c'est notre
-  seul vrai edge, cf. §4).
-- **Flip = geste défensif, jamais un second pari** : changement de mode au passage
-  des 100¢ ou recroisement du leader, avec temporisation (dwell) anti-churn.
+- **Établissement tôt** : 0xb à t médian 50 s, leader à 55¢.
+- **Flip = geste défensif, jamais un second pari** : le camp change quand le
+  GAGNANT change (Tokyo ou recroisement), avec temporisation (dwell) anti-churn.
   Mesuré : les fenêtres avec flip ne rapportent pas plus (−6$ vs −3$) — le flip
   limite les dégâts, il ne cherche pas le gain.
-- **Ticket de convexité borné** : contrarien seulement si ce côté cote
-  ≤ `SC_CONV_MAX_PRICE` (~0,45) — on n'achète pas un contre cher — et JAMAIS
-  contre une explosion que Tokyo voit (veto).
+- La paire chère n'excuse rien : quand nos paires sont sous l'eau, le flotteur
+  gagnant est aussi ce qui les rembourse (le mode « compensation » mesuré chez
+  0xb, aligné 56 % des points quand sa paire dépasse 1$).
+
+**Ce qu'on ne copie PAS de 0xb : son mode « convexité »** (mesuré : flotteur
+contrarien 60 % des points quand ses paires gagnent — un ticket de loterie sur le
+côté pas cher). C'est un luxe financé par ses rebates, que nous n'avons pas, et il
+contredit la règle « plus de gagnant, tout le temps ». Chez nous : jamais de
+flotteur côté perdant.
 
 ### Fin de fenêtre — LA CONVERSION
 
 Quand la poussière du côté opposé au flotteur cote ≤ `SC_CONV_DUST` (~5-6¢) dans la
 dernière minute : **T revient à 0** — la complétion avale la poussière et convertit
 le flotteur en paires certaines (95¢ probables + 3¢ = 1,00$ garanti). Si la
-poussière est plus chère, le flotteur court au redeem. Résidu final : la queue de
-la dernière vague, idéalement côté poussière (0xb : résidu côté perdant dans 65 %
-des cas, 56 parts médianes — des tickets à 1-2¢, pas des positions).
+poussière est plus chère, le flotteur (gagnant) court au redeem. On vise 0, jamais
+l'autre bord : à aucun moment on ne détient plus de perdant que de gagnant.
 
 ---
 
@@ -80,11 +82,12 @@ des cas, 56 parts médianes — des tickets à 1-2¢, pas des positions).
   volume d'un côté ; établi à **t=50 s** médian, leader à **55¢**.
 - Flips (±40 croisés) : 0 flip 39 % / 1 flip 50 % / ≥2 11 % ; moment médian
   **t=171 s** ; prix Up au flip **47¢** ; paire courante au flip **100,7¢**.
-- Alignement du flotteur : **56 %** avec le leader quand paire > 1$ ;
-  **40 %** (donc 60 % contrarien) quand paire < 1$. C'est LA règle.
+- Alignement du flotteur 0xb : **56 %** avec le leader quand paire > 1$ ;
+  **40 %** (donc 60 % contrarien) quand paire < 1$ — son grand livre pilote sa
+  direction. NOUS ne copions que la moitié gagnante (cf. étage 2).
 - Coût de paire médian **100,5¢** (p25-p75 : 97,8-103,4).
-- « Précision directionnelle » du flotteur : **48 %** — ce n'est PAS un pari : la
-  moitié des flotteurs sont délibérément contrariens (mode convexité).
+- « Précision directionnelle » du flotteur 0xb : **48 %** — ce n'est pas un pari
+  chez lui : la moitié de ses flotteurs sont délibérément contrariens.
 - PnL trading 0xb sur l'échantillon : **−294$ / 56 fenêtres** (+25$ quand aligné
   juste, −34$ quand faux ; 46 % de fenêtres vertes). L'échantillon précédent de
   19 fenêtres : +599$. Vérité : **son trading oscille autour de zéro ; son profit
@@ -108,9 +111,7 @@ Ce que 0xb décide en regardant son propre carnet, nous le décidons avec Binanc
 
 - **Établissement** : si Tokyo crie avant que le prix ait choisi (50/50), le
   flotteur s'établit sur l'appel Tokyo, pas sur le leader.
-- **Compensation** : Tokyo peut aligner le flotteur PLUS TÔT que le recroisement.
-- **Convexité** : jamais de ticket contrarien contre une explosion vue à Binance
-  (veto tilt).
+- **Flip** : Tokyo retourne le flotteur PLUS TÔT que le recroisement du prix.
 - Le chemin chaud (impulsion, FAK d'accumulation, assurance sans délai) reste
   intact — il sert le flotteur au lieu de la symétrie.
 
@@ -123,14 +124,20 @@ impressions. Revue à ~50 fenêtres jouées.
 
 1. **ZÉRO VENTE** — flatten/coupe/sortie éclair inclus. Se couper avant la fin =
    acheter l'autre côté (conversion), jamais vendre.
-2. Achat du perdant < 0,40 comme PARI : uniquement Tokyo qui crie. (Le ticket de
-   convexité est borné et vétoté par Tokyo.)
-3. Jamais unijambiste **par rapport à la cible** : l'écart au-delà de T porte
-   toujours son assurance ; un achat qui réduit l'écart n'attend jamais.
-4. Tailles : GTC ≥ 5 parts, FAK entier (notionnel 2 décimales), LOT_SIZE 2 déc.
-5. Les fills WS se comptent en `size_matched` absolu par ordre (jamais les
+2. Achat du perdant < 0,40 comme PARI : uniquement Tokyo qui crie. Jamais de
+   flotteur côté perdant.
+3. **JAMAIS UNIJAMBISTE — la règle tient, intégralement** : le côté déficitaire
+   porte toujours un achat exécutable, et un achat qui réduit l'écart n'attend
+   jamais. Ce qui a changé avec le flotteur : l'écart se mesure à la CIBLE
+   (détenir le surplus gagnant VOULU n'est pas être unijambiste — être en manque
+   du côté gagnant, si). Toute la chaîne d'assurance (impulsion, urgence prix,
+   borne EV, tranches) est intacte.
+4. **Plus de gagnant que de perdant, tout le temps** : le flotteur suit le
+   gagnant du moment ; la conversion de fin vise 0, jamais l'autre bord.
+5. Tailles : GTC ≥ 5 parts, FAK entier (notionnel 2 décimales), LOT_SIZE 2 déc.
+6. Les fills WS se comptent en `size_matched` absolu par ordre (jamais les
    montants des events trade).
-6. Jamais de `rm` sur les états/logs.
+7. Jamais de `rm` sur les états/logs.
 
 ## 6. Mapping configuration
 
@@ -138,7 +145,6 @@ impressions. Revue à ~50 fenêtres jouées.
 |---|---|---|
 | `SC_FLOAT_SHARES` | 12 | taille du flotteur (parts) — ~2 clips |
 | `SC_FLOAT_DWELL_S` | 10 | temporisation entre deux changements de cible (anti-churn) |
-| `SC_CONV_MAX_PRICE` | 0.45 | prix max du côté contrarien (ticket de convexité) |
 | `SC_CONV_DUST` | 0.06 | seuil poussière de la conversion de fin (T→0 sous T−60) |
 | `SC_OPEN_PAIR_TARGET` | 0.99 | somme des paires d'ouverture (extrêmes ouverts) |
 | `SC_COMPLETION_MAX_PAIR` | 1.02 | plafond de la complétion ordinaire (paire souple) |

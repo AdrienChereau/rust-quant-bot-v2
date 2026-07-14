@@ -367,12 +367,10 @@ async fn quote_loop(
     let mut dir_call: Option<Side> = None;
     let mut dir_wins: u32 = 0;
     let mut dir_total: u32 = 0;
-    // ═══ LE FLOTTEUR (loi 0xb, STRATEGIE.md) : imbalance CIBLE signée pilotée
-    // par le GRAND LIVRE — paire courante > 1$ = compensation (avec le leader),
-    // < 1$ = convexité (ticket pas cher, jamais contre Tokyo). Hystérésis à
-    // 99,5/100,5¢ (flips 0xb mesurés à 100,7¢ médian) + dwell anti-churn.
+    // ═══ LE FLOTTEUR (STRATEGIE.md) : imbalance CIBLE signée, TOUJOURS du
+    // côté GAGNANT (doctrine ferme) — Tokyo d'abord, leader du prix ensuite.
+    // Dwell anti-churn entre deux changements de cible.
     let mut float_sign: i8 = 0; // signe courant de la cible (+1 = surplus Up voulu)
-    let mut float_conv: bool = false; // mode courant (false = compensation)
     let mut last_float_ms: i64 = 0; // dernier changement de cible (dwell)
 
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
@@ -556,7 +554,6 @@ async fn quote_loop(
                     last_tilt_sign = 0;
                     tokyo_side_since = (None, 0);
                     float_sign = 0;
-                    float_conv = false;
                     last_float_ms = 0;
                     #[cfg(feature = "live")]
                     {
@@ -916,13 +913,13 @@ async fn quote_loop(
             last_tilt_sign = tilt_sign;
         }
 
-        // ═══ LE FLOTTEUR : cible d'imbalance pilotée par le GRAND LIVRE ═══
-        // (loi 0xb, STRATEGIE.md §1) Mesuré sur 56 fenêtres : paire courante
-        // > 1$ → flotteur AVEC le leader (56 % des points, compensation) ;
-        // < 1$ → flotteur libre côté PAS CHER (60 % contrariens, convexité) ;
-        // flips à 100,7¢ médian. Tokyo arbitre : il établit avant le prix,
-        // aligne la compensation plus tôt, et VETO tout ticket contrarien
-        // contre une explosion vue à Binance.
+        // ═══ LE FLOTTEUR : TOUJOURS du côté GAGNANT (doctrine ferme) ═══
+        // (STRATEGIE.md §1) « On doit avoir plus du côté gagnant que du côté
+        // perdant, tout le temps. » Le flotteur suit le gagnant du moment —
+        // Tokyo d'abord (il voit le renversement 1-3 s avant le carnet), le
+        // leader du prix ensuite — paire chère ou pas. Le mode contrarien de
+        // 0xb (ticket pas cher quand ses paires gagnent) N'EST PAS copié :
+        // c'est un luxe payé par ses rebates, que nous n'avons pas.
         let remaining_f = m.time_remaining_sec();
         {
             // Leader du prix : bande morte 48-52 (0xb flippe à 47¢ Up médian).
@@ -933,45 +930,21 @@ async fn quote_loop(
             } else {
                 0
             };
-            // Mode par hystérésis autour de 1$ (paire courante du grand livre).
-            match sc.pair_cost() {
-                Some(p) if p > 1.005 => float_conv = false,
-                Some(p) if p < 0.995 => float_conv = true,
-                _ => {} // zone neutre ou pas encore de paire : mode conservé
-            }
             let tokyo_sign: i8 = tilt_sign; // conviction Binance (±0.5 confirmé)
-            let desired_sign: i8 = if !float_conv {
-                // COMPENSATION : avec le leader ; Tokyo prend la main s'il crie
-                // (il voit le renversement avant le carnet) ou si le prix hésite.
-                if tokyo_sign != 0 {
-                    tokyo_sign
-                } else if leader != 0 {
-                    leader
-                } else {
-                    float_sign
-                }
+            // AVEC le gagnant, toujours : Tokyo prend la main s'il crie, sinon
+            // le leader du prix ; si le prix hésite (48-52), on garde le camp.
+            let desired_sign: i8 = if tokyo_sign != 0 {
+                tokyo_sign
+            } else if leader != 0 {
+                leader
             } else {
-                // CONVEXITÉ : ticket contrarien SEULEMENT si ce côté est bradé
-                // (≤ conv_max_price) et que Tokyo ne crie pas dans le sens du
-                // leader (jamais contrer une explosion vue à Binance).
-                let contra = -leader;
-                let contra_px = if contra > 0 { bb_up } else { bb_dn };
-                if leader != 0
-                    && contra_px > 0.0
-                    && contra_px <= cfg.sc_conv_max_price
-                    && tokyo_sign != leader
-                {
-                    contra
-                } else if tokyo_sign != 0 {
-                    tokyo_sign
-                } else {
-                    0 // équilibre : l'autre visage de la convexité
-                }
+                float_sign
             };
             // CONVERSION DE FIN (loi 0xb §1) : sous T−60, si la poussière du
             // côté opposé au flotteur est bradée, la cible revient à 0 — la
             // complétion avale la poussière et convertit le flotteur en paires
-            // certaines. Poussière chère → le flotteur court au redeem.
+            // certaines (jamais plus de perdant que de gagnant : on vise 0, pas
+            // l'autre bord). Poussière chère → le flotteur court au redeem.
             let dust_px = if float_sign > 0 { bb_dn } else { bb_up };
             let convert_now = remaining_f <= 60
                 && float_sign != 0
@@ -982,13 +955,7 @@ async fn quote_loop(
                 && now_ms_books as i64 - last_float_ms >= cfg.sc_float_dwell_s * 1000
             {
                 tracing::info!(
-                    mode = if convert_now {
-                        "conversion"
-                    } else if float_conv {
-                        "convexité"
-                    } else {
-                        "compensation"
-                    },
+                    mode = if convert_now { "conversion" } else { "gagnant" },
                     cible = new_sign as f64 * cfg.sc_float_shares,
                     paire = sc
                         .pair_cost()
@@ -2188,13 +2155,9 @@ async fn quote_loop(
             } else {
                 0.0
             };
-            // Flotteur (cible signée + mode) et tilt Binance, pour le dashboard.
+            // Flotteur (cible signée côté gagnant) et tilt Binance, pour le dashboard.
             d.skew_side = if float_sign != 0 {
-                format!(
-                    "{}{:+.0} · tilt {tilt:+.2}",
-                    if float_conv { "conv " } else { "comp " },
-                    target_imb
-                )
+                format!("cible {target_imb:+.0} · tilt {tilt:+.2}")
             } else if tilt.abs() >= 0.1 {
                 format!("{tilt:+.2}")
             } else {
