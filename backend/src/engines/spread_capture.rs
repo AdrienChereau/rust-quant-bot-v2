@@ -66,6 +66,10 @@ pub struct SpreadCaptureConfig {
     /// Tilt fort contre le côté déficitaire → sa complétion devient PATIENTE :
     /// bid plafonné à ce prix (paire grasse) au lieu du complément.
     pub patient_below: f64,
+    /// PAIRES D'EXTRÊMES (14 juil.) : somme des prix des deux OUVERTURES ≤ ce
+    /// plafond — l'unique discipline de prix des ouvertures. En marché tranché,
+    /// 0xb apparie 0.92 + 0.05 = 0.97 : sa moisson maximale, notre abstention.
+    pub open_pair_target: f64,
 }
 
 /// Durée d'une fenêtre (marchés 5 min uniquement).
@@ -495,9 +499,16 @@ impl SpreadCaptureEngine {
                     cap = cap.min(c.patient_below);
                 }
                 let price = ((bb + tick).min(cap) / tick).floor() * tick;
+                // ASPIRATION 0xb (14 juil.) : la complétion achète UN CLIP
+                // D'AVANCE en plus du déficit — il stocke le mourant à tous les
+                // prix AVANT d'avoir le gagnant en face (33 fills < 10¢ mesurés
+                // dans une seule fenêtre). L'inventaire précède le besoin ; le
+                // sur-achat borné (≤ 1 clip) flippe l'imbalance → l'autre côté
+                // complète → rotation continue. Prix inchangé : min(touch,
+                // complément[, patience]) — au touch quand le côté tombe.
                 // COMPLÉTIONS à 2 décimales (LOT_SIZE_SCALE) — l'arrondi entier
                 // fabriquait de la poussière à chaque lot impair (10 juil.).
-                let size = (deficit * size_factor * 100.0).floor() / 100.0;
+                let size = ((deficit + c.base_clip) * size_factor * 100.0).floor() / 100.0;
                 if price >= 0.01 && size >= 1.0 {
                     out.push(BidQuote { side, price, size, completion: true });
                 }
@@ -529,8 +540,12 @@ impl SpreadCaptureEngine {
             } else if tilt_for <= -0.5 {
                 retreat = (retreat + 2.0).min(4.0);
             }
-            // Discipline de paire : notre prix ≤ pair_target − (bb_autre + tick).
-            let pair_cap = pair_target - (bb_other + tick);
+            // PAIRES D'EXTRÊMES : la SEULE discipline de prix des ouvertures est
+            // la somme de la paire ≤ open_pair_target (0.98). En marché tranché,
+            // les deux bouts quotent (0.90 et 0.05) → paires ≤ 0.95-0.98, risque
+            // quasi nul, volume maximal — la phase que 0xb moissonne à 4 fills/s
+            // pendant que l'ancien veto 0.87 nous mettait en abstention.
+            let pair_cap = c.open_pair_target.min(pair_target) - (bb_other + tick);
             let price = (((bb + tick - retreat * tick).min(pair_cap)) / tick).floor() * tick;
             if price < 0.01 {
                 continue;
@@ -548,7 +563,8 @@ impl SpreadCaptureEngine {
             } else {
                 1.0 + 0.5 * tilt_for
             };
-            let mut size = (c.base_clip * scale).min(room);
+            let mut size = (c.base_clip * scale).max((1.05 / price.max(0.01)).ceil());
+            size = size.min(room);
             size = size.min(c.max_clip_usdc / price.max(0.01));
             // Le budget de fenêtre ne bride que l'OUVERTURE — jamais la
             // complétion (sinon budget épuisé = jambe nue garantie).
@@ -640,6 +656,7 @@ mod tests {
             dust_tol: 1.0,
             tilt_mult: 2.0,
             patient_below: 0.20,
+            open_pair_target: 0.98,
         }
     }
 
@@ -915,7 +932,8 @@ mod tests {
         let comp = q.iter().find(|b| b.completion).expect("complétion");
         assert_eq!(comp.side, Side::Down);
         assert!(comp.price <= 0.395 + 1e-9, "px={}", comp.price);
-        assert!((comp.size - 10.0).abs() < 3.0); // vise le déficit
+        // ASPIRATION : déficit (10) + un clip d'avance (base_clip 10) = 20.
+        assert!((comp.size - 20.0).abs() < 3.0, "déficit + aspiration: {}", comp.size);
         let open = q.iter().find(|b| !b.completion).expect("le surplus quote encore");
         assert_eq!(open.side, Side::Up);
         assert!(open.price < 0.59 - 1e-9, "en retrait du contact: {}", open.price);
@@ -971,8 +989,9 @@ mod tests {
         e.on_fill(Side::Up, 0.56, 5.995453, 0);
         let q = e.desired_bids_symmetric(0.55, 0.40, 200, 100, 0.01, 1.0, 0.0);
         let comp = q.iter().find(|b| b.completion && b.side == Side::Down).expect("complétion");
-        // 5,99 (2 décimales), PAS 5 (entier) — sinon 0,99 de poussière garantie.
-        assert!((comp.size - 5.99).abs() < 1e-9, "complète le déficit entier: {}", comp.size);
+        // Déficit fractionnaire 5,99 + aspiration (clip 10) = 15,99, à 2
+        // DÉCIMALES — l'arrondi entier fabriquait de la poussière garantie.
+        assert!((comp.size - 15.99).abs() < 1e-9, "déficit exact + aspiration: {}", comp.size);
     }
 
     #[test]
@@ -1013,7 +1032,8 @@ mod tests {
         e.on_fill(Side::Up, 0.60, 12.0, 0); // déficit Down = 12 > max_clip
         let q = e.desired_bids_symmetric(0.55, 0.30, 200, 100, 0.01, 1.0, 0.0);
         let comp = q.iter().find(|b| b.completion).expect("complétion");
-        assert!((comp.size - 12.0).abs() < 1e-9, "tout le déficit: {}", comp.size);
+        // Tout le déficit (12 > max_clip 10 : jamais tronqué) + l'aspiration.
+        assert!((comp.size - 22.0).abs() < 1e-9, "déficit + aspiration: {}", comp.size);
     }
 
     #[test]

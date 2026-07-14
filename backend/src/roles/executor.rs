@@ -290,6 +290,7 @@ async fn quote_loop(
         dust_tol: cfg.sc_dust_tol,
         tilt_mult: cfg.sc_skew_mult,
         patient_below: cfg.sc_skew_complete_below,
+        open_pair_target: cfg.sc_open_pair_target,
     });
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash,
@@ -1380,16 +1381,32 @@ async fn quote_loop(
                                     >= 4_000;
                                 let reprice = match cur {
                                     Some(i) => {
-                                        (px - lrest[i].r.price).abs() > 2.0 * tick_sz + 1e-9
-                                            && cooled
+                                        let resting = lrest[i].r.price;
+                                        if is_comp {
                                             // CHASSE MONOTONE (13 juil. 15:21) : une
                                             // complétion ne redescend JAMAIS — le churn
-                                            // 0,63→0,60 au gré du tilt a créé la course
-                                            // cancel/repose → double transitoire → pause.
-                                            // Redescendre n'a aucune urgence ; rester
-                                            // haut = payer au pire l'escalade déjà
-                                            // consentie.
-                                            && (!is_comp || px > lrest[i].r.price + 1e-9)
+                                            // au gré du tilt créait la course cancel/
+                                            // repose → double transitoire → pause.
+                                            (px - resting).abs() > 2.0 * tick_sz + 1e-9
+                                                && cooled
+                                                && px > resting + 1e-9
+                                        } else {
+                                            // FILE PRÉSERVÉE (14 juil., 0xb) : chaque
+                                            // reprice = retour en FIN de file. Ses
+                                            // ordres restent et vieillissent → servis
+                                            // les premiers (270 fills/fenêtre vs 10).
+                                            // On ne déplace une ouverture que si elle
+                                            // devient DANGEREUSE (au-dessus de la
+                                            // cible = plafond de paire violé) ou si
+                                            // elle est sortie de la grille.
+                                            let grid_span = (cfg.sc_ladder_levels as f64
+                                                * cfg.sc_ladder_step_ticks
+                                                + 4.0)
+                                                * tick_sz;
+                                            cooled
+                                                && (resting > px + 1e-9
+                                                    || px - resting > grid_span)
+                                        }
                                     }
                                     None => cooled,
                                 };

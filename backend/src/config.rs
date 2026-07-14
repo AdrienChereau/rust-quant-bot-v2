@@ -113,6 +113,7 @@ pub struct Config {
     // Buffer anti-cross ADAPTATIF au σ sur les OUVERTURES (les complétions/FAK gardent le droit de croiser) : bid = ask − (1 + extra)·tick, extra = clamp(⌊(σ−lo)/span⌋, 0, max).
     pub sc_cross_max_extra: f64, // ticks max ajoutés en pic de volatilité (défaut 2 → jusqu'à ask−3)
     pub sc_ladder_levels: u32, // ÉCHELLE d'ouverture : nombre de niveaux de prix par côté (défaut 2 — vrai MM échelonné)
+    pub sc_open_pair_target: f64, // PAIRES D'EXTRÊMES : somme des prix des DEUX ouvertures ≤ ce plafond (défaut 0.98 — 0xb apparie 0.92+0.05 en marché tranché, sa moisson maximale). C'est la SEULE discipline de prix des ouvertures
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_dust_tol: f64, // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
     // ── MODE SKEW (MM incliné) : quand un signal désigne le gagnant probable,
@@ -259,8 +260,8 @@ impl Config {
             sc_pullback_s: env_or("SC_PULLBACK_S", 5),
             sc_completion_max_price: env_or("SC_COMPLETION_MAX_PRICE", 0.65),
             sc_completion_max_pair: env_or("SC_COMPLETION_MAX_PAIR", 1.02),
-            sc_opening_stop_s: env_or("SC_OPENING_STOP_S", 60.0) as i64,
-            sc_open_max_price: env_or("SC_OPEN_MAX_PRICE", 0.87), // 0xb charge le favori jusqu'à ~87c
+            sc_opening_stop_s: env_or("SC_OPENING_STOP_S", 15.0) as i64, // ENDGAME ACTIF : la minute 3-4 est le PIC de 0xb (258 fills/min mesurés), pas une zone morte
+            sc_open_max_price: env_or("SC_OPEN_MAX_PRICE", 0.99), // PAIRES D'EXTRÊMES (14 juil.) : plus de veto par côté — la discipline porte sur la SOMME de la paire (sc_open_pair_target)
             sc_directional_max: env_or("SC_DIRECTIONAL_MAX", 0.90),
             sc_directional_min: env_or("SC_DIRECTIONAL_MIN", 0.40),
             sc_trend_confirm_s: env_or("SC_TREND_CONFIRM_S", 20),
@@ -284,9 +285,10 @@ impl Config {
             sc_rescue_ramp_s: env_or("SC_RESCUE_RAMP_S", 120.0),
             sc_dir_tilt: env_or("SC_DIR_TILT", 6.0),
             sc_cross_max_extra: env_or("SC_CROSS_MAX_EXTRA", 2.0),
-            sc_ladder_levels: env_or("SC_LADDER_LEVELS", 2.0) as u32,
-            sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 2.0),
+            sc_ladder_levels: env_or("SC_LADDER_LEVELS", 3.0) as u32, // GRILLE PROFONDE : ses fills couvrent 0.05→0.95 — présence à plusieurs niveaux
+            sc_ladder_step_ticks: env_or("SC_LADDER_STEP_TICKS", 3.0),
             sc_dust_tol: env_or("SC_DUST_TOL", 1.0),
+            sc_open_pair_target: env_or("SC_OPEN_PAIR_TARGET", 0.98),
             sc_skew: env_or("SC_SKEW", true),
             sc_skew_mult: env_or("SC_SKEW_MULT", 2.0),
             sc_trend_net_cap: env_or("SC_TREND_NET_CAP", 12.0),
