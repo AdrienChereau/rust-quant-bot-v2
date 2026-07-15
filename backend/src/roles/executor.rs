@@ -374,13 +374,16 @@ async fn quote_loop(
     let mut last_float_ms: i64 = 0; // dernier changement de cible (dwell)
     // DISJONCTEUR DE FENÊTRE HACHÉE (15 juil., fenêtre 00:00 : collée au
     // strike à 10$ près, le leader PM a flippé 5× en 2 min → on a acheté
-    // chaque sommet en « urgence prix », −25$). Au N-ième retournement du
-    // leader dans la fenêtre, le directionnel se coupe (cible 0, urgence prix
-    // OFF) et on sauve les meubles : quoting symétrique, complétions maker,
-    // merges et assurance de fin de fenêtre continuent. Tokyo garde son rôle :
-    // blinder les creux (contact ×2, FAK signal plein) — pas de voir les 10$.
+    // chaque sommet en « urgence prix », −25$). FENÊTRE GLISSANTE : N
+    // retournements du leader dans les sc_chop_window_s dernières secondes →
+    // directionnel coupé (cible 0, urgence prix OFF), on sauve les meubles :
+    // quoting symétrique, complétions maker, merges et assurance de fin de
+    // fenêtre continuent. Les retournements VIEILLISSENT : zigzag apaisé =
+    // directionnel réarmé. Tokyo garde son rôle : blinder les creux (contact
+    // ×2, FAK signal plein) — pas de voir les 10$.
     let mut prev_leader: i8 = 0;
-    let mut leader_flips: u32 = 0;
+    let mut leader_flip_ts: Vec<i64> = Vec::new();
+    let mut was_chopped: bool = false;
 
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
     let mut rest_up: Option<(f64, f64)> = None; // (prix, taille)
@@ -565,7 +568,8 @@ async fn quote_loop(
                     float_sign = 0;
                     last_float_ms = 0;
                     prev_leader = 0;
-                    leader_flips = 0;
+                    leader_flip_ts.clear();
+                    was_chopped = false;
                     #[cfg(feature = "live")]
                     {
                         last_fak_side = None;
@@ -932,6 +936,7 @@ async fn quote_loop(
         // 0xb (ticket pas cher quand ses paires gagnent) N'EST PAS copié :
         // c'est un luxe payé par ses rebates, que nous n'avons pas.
         let remaining_f = m.time_remaining_sec();
+        let chopped;
         {
             // Leader du prix : bande morte 48-52 (0xb flippe à 47¢ Up médian).
             let leader: i8 = if bb_up >= 0.52 {
@@ -941,20 +946,30 @@ async fn quote_loop(
             } else {
                 0
             };
-            // Compteur de zigzag : un retournement = le leader change de camp.
+            // Zigzag en FENÊTRE GLISSANTE : un retournement = le leader change
+            // de camp ; seuls ceux des sc_chop_window_s dernières secondes
+            // comptent — le calme réarme le directionnel.
             if leader != 0 {
                 if prev_leader != 0 && leader != prev_leader {
-                    leader_flips += 1;
-                    if leader_flips == cfg.sc_chop_flips {
-                        tracing::warn!(
-                            flips = leader_flips,
-                            "FENÊTRE HACHÉE — directionnel coupé (cible 0, urgence prix OFF), on sauve les meubles"
-                        );
-                    }
+                    leader_flip_ts.push(now_ms_books as i64);
                 }
                 prev_leader = leader;
             }
-            let chopped = leader_flips >= cfg.sc_chop_flips;
+            leader_flip_ts
+                .retain(|t| now_ms_books as i64 - *t <= cfg.sc_chop_window_s * 1000);
+            chopped = leader_flip_ts.len() >= cfg.sc_chop_flips as usize;
+            if chopped != was_chopped {
+                if chopped {
+                    tracing::warn!(
+                        flips = leader_flip_ts.len(),
+                        fenetre_s = cfg.sc_chop_window_s,
+                        "FENÊTRE HACHÉE — directionnel coupé (cible 0, urgence prix OFF), on sauve les meubles"
+                    );
+                } else {
+                    tracing::info!("zigzag apaisé — directionnel réarmé");
+                }
+                was_chopped = chopped;
+            }
             let tokyo_sign: i8 = tilt_sign; // conviction Binance (±0.5 confirmé)
             // AVEC le gagnant, toujours : Tokyo prend la main s'il crie, sinon
             // le leader du prix ; si le prix hésite (48-52), on garde le camp.
@@ -1677,7 +1692,7 @@ async fn quote_loop(
                 // (collée au strike, un carnet à 0.65 n'a rien voté : on a payé
                 // chaque sommet 5× le 15 juil. 00:03-00:04) — les déclencheurs
                 // Tokyo et la fin de fenêtre restent.
-                || (leader_flips < cfg.sc_chop_flips && bb_deficit_ins >= 0.60);
+                || (!chopped && bb_deficit_ins >= 0.60);
             if enabled
                 && dev_imb.abs() >= 5.0
                 && ((10..=20).contains(&remaining_l)

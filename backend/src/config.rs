@@ -119,7 +119,8 @@ pub struct Config {
     pub sc_float_shares: f64, // taille du flotteur (parts) — 0xb mesuré : ~14 % du volume d'un côté (défaut 12 ≈ 2 clips)
     pub sc_float_dwell_s: i64, // temporisation minimale entre deux changements de cible (anti-churn, défaut 10 s)
     pub sc_conv_dust: f64, // conversion de fin : sous T−60, si la poussière opposée cote ≤ ce seuil, la cible revient à 0 (défaut 0.06)
-    pub sc_chop_flips: u32, // DISJONCTEUR fenêtre hachée : au N-ième retournement du leader PM dans la fenêtre, directionnel coupé (cible 0 + urgence prix OFF) — on sauve les meubles (défaut 3)
+    pub sc_chop_flips: u32, // DISJONCTEUR fenêtre hachée : N retournements du leader PM dans la fenêtre GLISSANTE → directionnel coupé (cible 0 + urgence prix OFF), réarmé quand les retournements vieillissent (défaut 3)
+    pub sc_chop_window_s: i64, // largeur de la fenêtre glissante du disjoncteur (défaut 120 s — « 3 retournements dans les 2 dernières minutes »)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
     pub sc_dust_tol: f64, // résidu ≤ ce seuil (parts) = poussière : ne bloque pas les ouvertures, nettoyé par le flatten (défaut 1.0)
     pub sc_allow_flatten: bool, // ventes de flatten (poussière/fin de fenêtre/coupe anticipée). DÉSACTIVÉ (14 juil., ordre utilisateur : zéro vente, profil 0xb = 100 % achats) : les résidus courent jusqu'à la résolution
@@ -301,6 +302,7 @@ impl Config {
             sc_float_dwell_s: env_or("SC_FLOAT_DWELL_S", 10),
             sc_conv_dust: env_or("SC_CONV_DUST", 0.06),
             sc_chop_flips: env_or("SC_CHOP_FLIPS", 3),
+            sc_chop_window_s: env_or("SC_CHOP_WINDOW_S", 120),
             sc_skew: env_or("SC_SKEW", true),
             sc_skew_mult: env_or("SC_SKEW_MULT", 2.0),
             sc_trend_net_cap: env_or("SC_TREND_NET_CAP", 12.0),
