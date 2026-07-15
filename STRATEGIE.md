@@ -16,9 +16,19 @@ Cotation bilatérale continue en maker, **achats uniquement** :
 - **Zéro vente, jamais** (`SC_ALLOW_FLATTEN=false`). Poussière comprise. Les résidus
   courent jusqu'à la résolution : le gagnant paie au redeem, le perdant expire.
   0xb mesuré : 100 % d'achats sur 2 383 fills.
-- Grille d'ouverture échelonnée qui **suit le touch marche par marche** (chasse dès
-  1 pas d'échelle + 1 tick d'écart, cooldown 4 s pour préserver la file sur les
-  oscillations courtes).
+- Grille d'ouverture **ASYMÉTRIQUE** (« soit accumuler la montée, soit poser du
+  retournement — jamais les deux », 15 juil.) : côté GAGNANT (le flotteur), UN
+  seul niveau au contact qui suit le touch marche par marche (chasse dès 1 pas
+  + 1 tick, cooldown 4 s, file préservée) — les étages profonds sous un côté qui
+  monte sont un attrape-couteau (fills en cascade 0.77→0.69 mesurés). Les
+  niveaux profonds n'existent que côté PERDANT : ce sont les ordres de
+  retournement/appariement. Sans flotteur (cible 0) : grille symétrique, la
+  ferme à oscillation.
+- **Un ordre de retournement rempli se GARDE** : l'assurance taker exige que le
+  côté nu vaille ≥ `SC_INSURE_MIN_USDC` (3$) de coût réel — 5 Up @0.19 (0,95$ de
+  risque max) ne méritent pas un FAK Down @0.81 (paire 1,00 + taxe, et
+  l'explosion du 15 juil. 12:12 aurait payé ces Up +3,30$). En dessous du
+  plancher : la position court, la complétion maker la marie au complément.
 - **Extrêmes ouverts** : paires d'ouverture jusqu'à `SC_OPEN_PAIR_TARGET=0.99`
   (0xb fait les 2/3 de son volume de fenêtre décidée à 96-99¢ + 1-3¢).
 - **Merge en continu** pour recycler le capital (0xb : 3-4 merges/fenêtre, capital
@@ -166,6 +176,7 @@ impressions. Revue à ~50 fenêtres jouées.
 | `SC_FLOAT_SHARES` | 12 | PLAFOND absolu du flotteur (parts) |
 | `SC_FLOAT_DWELL_S` | 10 | temporisation entre deux changements de cible (anti-churn) |
 | `SC_CONV_DUST` | 0.06 | seuil poussière de la conversion de fin (T→0 sous T−60) |
+| `SC_INSURE_MIN_USDC` | 3.0 | plancher de valeur du côté nu pour mériter l'assurance taker |
 | `SC_CHOP_FLIPS` | 3 | fenêtre hachée : retournements du leader dans la fenêtre glissante |
 | `SC_CHOP_WINDOW_S` | 120 | largeur de la fenêtre glissante du disjoncteur (réarmement auto) |
 | `SC_OPEN_PAIR_TARGET` | 0.99 | somme des paires d'ouverture (extrêmes ouverts) |

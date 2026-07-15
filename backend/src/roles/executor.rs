@@ -1456,6 +1456,18 @@ async fn quote_loop(
                     let n_levels: u8 = if is_comp {
                         let total = want_sz.unwrap_or(0.0);
                         ((total / min_shares.max(1.0)).floor() as u8).clamp(1, 3)
+                    } else if float_sign != 0 && is_up == (float_sign > 0) {
+                        // « SOIT accumuler la montée, SOIT poser du retournement,
+                        // JAMAIS les deux » (15 juil.) : côté GAGNANT (le
+                        // flotteur), UN seul niveau au contact — on suit la
+                        // montée et les micro-creux, file préservée. Les étages
+                        // profonds sous un côté qui monte sont un attrape-
+                        // couteau : celui qui mange le 70 pendant que ça cote 80
+                        // mange le 67 et le 64 dans la même seconde (fills en
+                        // cascade 0.77→0.75→0.73→0.69 mesurés le 15 juil.).
+                        // Les ordres profonds n'existent que côté PERDANT :
+                        // ce sont les ordres de retournement/appariement.
+                        1
                     } else {
                         cfg.sc_ladder_levels.clamp(1, 4) as u8
                     };
@@ -1689,6 +1701,14 @@ async fn quote_loop(
                 0.0 // combler vers la cible ÉLOIGNERAIT de 0 : pari → maker seul
             };
             let deficit_side = if dev_imb > 0.0 { Side::Down } else { Side::Up };
+            // PLANCHER DE VALEUR (15 juil., 12:10 : 5 Up @0.19 = 0,95$ de
+            // risque, insta-hedgés par 5 Down @0.81 → paire 1,00 + taxe ; puis
+            // l'explosion aurait payé ces Up +3,30$). L'assurance taker ne
+            // protège que de l'ARGENT réel : un côté nu qui vaut moins que le
+            // plancher est un ordre de retournement rempli — il se GARDE
+            // (perte bornée à des centimes), la complétion maker le mariera.
+            let naked_side = deficit_side.opposite();
+            let naked_value = insurable * sc.avg(naked_side);
             let taker_drift_urgent = crate::engines::spread_capture::completion_urgent(
                 deficit_side,
                 drift_ps,
@@ -1714,6 +1734,7 @@ async fn quote_loop(
                 || (!chopped && bb_deficit_ins >= 0.60);
             if enabled
                 && insurable >= 5.0
+                && naked_value >= cfg.sc_insure_min_usdc
                 && ((10..=20).contains(&remaining_l)
                     || ((taker_drift_urgent || signal_against_surplus) && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
@@ -2157,7 +2178,16 @@ async fn quote_loop(
         } else {
             0.0
         };
-        if !live_mode && enabled && (10..=45).contains(&remaining) && insurable_paper >= 5.0 {
+        // Plancher de valeur : un côté nu à quelques centimes se garde
+        // (ordre de retournement rempli), il ne se hedge pas au prix fort.
+        let naked_value_paper = insurable_paper
+            * sc.avg(if dev_paper > 0.0 { Side::Up } else { Side::Down });
+        if !live_mode
+            && enabled
+            && (10..=45).contains(&remaining)
+            && insurable_paper >= 5.0
+            && naked_value_paper >= cfg.sc_insure_min_usdc
+        {
             let (side, ask, ask_sz) = if dev_paper > 0.0 {
                 (Side::Down, ask_dn, ask_dn_sz)
             } else {

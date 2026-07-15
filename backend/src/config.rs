@@ -120,6 +120,7 @@ pub struct Config {
     pub sc_float_pct: f64, // taille du flotteur = pct × volume moyen d'un côté sur la fenêtre (0xb mesuré : ~14 %) — ±12 fixe dès la 1re minute = 80-100 % du livre, la violence du 15 juil. (défaut 0.15)
     pub sc_float_dwell_s: i64, // temporisation minimale entre deux changements de cible (anti-churn, défaut 10 s)
     pub sc_conv_dust: f64, // conversion de fin : sous T−60, si la poussière opposée cote ≤ ce seuil, la cible revient à 0 (défaut 0.06)
+    pub sc_insure_min_usdc: f64, // PLANCHER DE VALEUR de l'assurance taker : le côté nu doit valoir ≥ ce montant (parts × coût moyen) pour mériter un FAK — en dessous c'est un ordre de retournement rempli, il se GARDE (défaut 3.0)
     pub sc_chop_flips: u32, // DISJONCTEUR fenêtre hachée : N retournements du leader PM dans la fenêtre GLISSANTE → directionnel coupé (cible 0 + urgence prix OFF), réarmé quand les retournements vieillissent (défaut 3)
     pub sc_chop_window_s: i64, // largeur de la fenêtre glissante du disjoncteur (défaut 120 s — « 3 retournements dans les 2 dernières minutes »)
     pub sc_ladder_step_ticks: f64, // écart (en ticks) entre deux niveaux de l'échelle (défaut 2)
@@ -303,6 +304,7 @@ impl Config {
             sc_float_pct: env_or("SC_FLOAT_PCT", 0.15),
             sc_float_dwell_s: env_or("SC_FLOAT_DWELL_S", 10),
             sc_conv_dust: env_or("SC_CONV_DUST", 0.06),
+            sc_insure_min_usdc: env_or("SC_INSURE_MIN_USDC", 3.0),
             sc_chop_flips: env_or("SC_CHOP_FLIPS", 3),
             sc_chop_window_s: env_or("SC_CHOP_WINDOW_S", 120),
             sc_skew: env_or("SC_SKEW", true),
