@@ -142,6 +142,12 @@ impressions. Revue à ~50 fenêtres jouées.
    (détenir le surplus gagnant VOULU n'est pas être unijambiste — être en manque
    du côté gagnant, si). Toute la chaîne d'assurance (impulsion, urgence prix,
    borne EV, tranches) est intacte.
+   **Et la frontière pari/assurance est ABSOLUE** (15 juil. 00:35, −8$) : le
+   taker n'a le droit que de RÉDUIRE |imbalance| vers 0. CONSTRUIRE ou
+   maintenir le flotteur (s'éloigner de 0 vers la cible) = un pari → maker
+   uniquement, dans les creux — c'est le rôle de Tokyo. Le sauvetage qui
+   achetait 21 Down @0.79-0.80 au sommet pour « atteindre la cible » −12
+   fabriquait des paires >1$ en boucle contre sa propre aspiration.
 4. **Plus de gagnant que de perdant, tout le temps** : le flotteur suit le
    gagnant du moment ; la conversion de fin vise 0, jamais l'autre bord.
 5. Tailles : GTC ≥ 5 parts, FAK entier (notionnel 2 décimales), LOT_SIZE 2 déc.

@@ -1665,10 +1665,19 @@ async fn quote_loop(
             //    paire : au-delà, résidu accepté (perte bornée).
             // L'ÉCART se mesure à la CIBLE du flotteur, pas à zéro (loi 0xb) :
             // porter le flotteur voulu n'est pas être unijambiste — c'est
-            // l'excédent AU-DELÀ de la cible qui appelle l'assurance. Quand la
-            // cible flippe (leader/Tokyo), l'écart double d'un coup et cette
-            // même chaîne exécute le flip défensif.
+            // l'excédent AU-DELÀ de la cible qui appelle l'assurance.
+            // DOCTRINE (15 juil., fenêtre 00:35, −8$) : un achat qui AUGMENTE
+            // l'exposition est un PARI → maker uniquement (les creux, rôle de
+            // Tokyo) ; le taker n'a le droit que de RÉDUIRE |imbalance| vers 0.
+            // Le sauvetage à imb −1.67 / cible −12 achetait 10 Down @0.79-0.80
+            // au sommet pour CONSTRUIRE le flotteur — puis Up a gagné. La part
+            // assurable = le chemin de |imb| vers 0, jamais au travers.
             let dev_imb = sc.imbalance() - target_imb;
+            let insurable = if dev_imb.signum() == sc.imbalance().signum() {
+                dev_imb.abs().min(sc.imbalance().abs())
+            } else {
+                0.0 // combler vers la cible ÉLOIGNERAIT de 0 : pari → maker seul
+            };
             let deficit_side = if dev_imb > 0.0 { Side::Down } else { Side::Up };
             let taker_drift_urgent = crate::engines::spread_capture::completion_urgent(
                 deficit_side,
@@ -1694,7 +1703,7 @@ async fn quote_loop(
                 // Tokyo et la fin de fenêtre restent.
                 || (!chopped && bb_deficit_ins >= 0.60);
             if enabled
-                && dev_imb.abs() >= 5.0
+                && insurable >= 5.0
                 && ((10..=20).contains(&remaining_l)
                     || ((taker_drift_urgent || signal_against_surplus) && remaining_l > 20))
                 && now_ms_books as i64 - last_insurance_ms >= 3_000
@@ -1786,10 +1795,16 @@ async fn quote_loop(
                             i += 1;
                         }
                     }
-                    // Assurance : JAMAIS plus que le déficit (le sur-achat forcé
-                    // par les minimums relançait la spirale). Sous les minimums →
-                    // résidu accepté, perte bornée. Déficit RECALCULÉ après purge.
-                    let sz = (((sc.imbalance() - target_imb).abs().min(ask_sz.max(1.0))) * 100.0)
+                    // Assurance : JAMAIS plus que la part ASSURABLE (réduction de
+                    // |imb| vers 0 — pas de sur-achat, pas de traversée vers
+                    // l'autre bord). Recalculée après purge (fills en vol).
+                    let dev_p = sc.imbalance() - target_imb;
+                    let insurable_p = if dev_p.signum() == sc.imbalance().signum() {
+                        dev_p.abs().min(sc.imbalance().abs())
+                    } else {
+                        0.0
+                    };
+                    let sz = ((insurable_p.min(ask_sz.max(1.0))) * 100.0)
                         .floor()
                         / 100.0;
                     // FAK = exécution immédiate : le minimum de 5 parts ne
@@ -2124,16 +2139,22 @@ async fn quote_loop(
         // pas de rebate sur ce fill.
         let remaining = m.time_remaining_sec();
         // L'écart se mesure à la CIBLE du flotteur (loi 0xb) — le résidu voulu
-        // court au redeem, seul l'excédent au-delà s'assure.
+        // court au redeem, seul l'excédent au-delà s'assure. Et le taker ne
+        // fait que RÉDUIRE |imb| vers 0 (jamais construire le flotteur).
         let dev_paper = sc.imbalance() - target_imb;
-        if !live_mode && enabled && (10..=45).contains(&remaining) && dev_paper.abs() >= 5.0 {
+        let insurable_paper = if dev_paper.signum() == sc.imbalance().signum() {
+            dev_paper.abs().min(sc.imbalance().abs())
+        } else {
+            0.0
+        };
+        if !live_mode && enabled && (10..=45).contains(&remaining) && insurable_paper >= 5.0 {
             let (side, ask, ask_sz) = if dev_paper > 0.0 {
                 (Side::Down, ask_dn, ask_dn_sz)
             } else {
                 (Side::Up, ask_up, ask_up_sz)
             };
             if ask > 0.0 && ask <= 0.99 {
-                let deficit = dev_paper.abs();
+                let deficit = insurable_paper;
                 let fill = deficit.min(ask_sz.max(1.0)).floor();
                 let px_eff = ask + 0.07 * ask * (1.0 - ask); // fee_eq taker par part
                 if fill >= 1.0 && paper.try_buy(side.as_str(), px_eff, fill, "taker") {
