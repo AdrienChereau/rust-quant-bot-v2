@@ -372,6 +372,15 @@ async fn quote_loop(
     // Dwell anti-churn entre deux changements de cible.
     let mut float_sign: i8 = 0; // signe courant de la cible (+1 = surplus Up voulu)
     let mut last_float_ms: i64 = 0; // dernier changement de cible (dwell)
+    // DISJONCTEUR DE FENÊTRE HACHÉE (15 juil., fenêtre 00:00 : collée au
+    // strike à 10$ près, le leader PM a flippé 5× en 2 min → on a acheté
+    // chaque sommet en « urgence prix », −25$). Au N-ième retournement du
+    // leader dans la fenêtre, le directionnel se coupe (cible 0, urgence prix
+    // OFF) et on sauve les meubles : quoting symétrique, complétions maker,
+    // merges et assurance de fin de fenêtre continuent. Tokyo garde son rôle :
+    // blinder les creux (contact ×2, FAK signal plein) — pas de voir les 10$.
+    let mut prev_leader: i8 = 0;
+    let mut leader_flips: u32 = 0;
 
     // v8 MAKER : bids restants + stats de fenêtre + disjoncteur de séries perdantes.
     let mut rest_up: Option<(f64, f64)> = None; // (prix, taille)
@@ -555,6 +564,8 @@ async fn quote_loop(
                     tokyo_side_since = (None, 0);
                     float_sign = 0;
                     last_float_ms = 0;
+                    prev_leader = 0;
+                    leader_flips = 0;
                     #[cfg(feature = "live")]
                     {
                         last_fak_side = None;
@@ -930,10 +941,26 @@ async fn quote_loop(
             } else {
                 0
             };
+            // Compteur de zigzag : un retournement = le leader change de camp.
+            if leader != 0 {
+                if prev_leader != 0 && leader != prev_leader {
+                    leader_flips += 1;
+                    if leader_flips == cfg.sc_chop_flips {
+                        tracing::warn!(
+                            flips = leader_flips,
+                            "FENÊTRE HACHÉE — directionnel coupé (cible 0, urgence prix OFF), on sauve les meubles"
+                        );
+                    }
+                }
+                prev_leader = leader;
+            }
+            let chopped = leader_flips >= cfg.sc_chop_flips;
             let tokyo_sign: i8 = tilt_sign; // conviction Binance (±0.5 confirmé)
             // AVEC le gagnant, toujours : Tokyo prend la main s'il crie, sinon
             // le leader du prix ; si le prix hésite (48-52), on garde le camp.
-            let desired_sign: i8 = if tokyo_sign != 0 {
+            let desired_sign: i8 = if chopped {
+                0 // fenêtre hachée : plus de camp, on farme l'oscillation
+            } else if tokyo_sign != 0 {
                 tokyo_sign
             } else if leader != 0 {
                 leader
@@ -955,7 +982,13 @@ async fn quote_loop(
                 && now_ms_books as i64 - last_float_ms >= cfg.sc_float_dwell_s * 1000
             {
                 tracing::info!(
-                    mode = if convert_now { "conversion" } else { "gagnant" },
+                    mode = if convert_now {
+                        "conversion"
+                    } else if chopped {
+                        "haché — coupé"
+                    } else {
+                        "gagnant"
+                    },
                     cible = new_sign as f64 * cfg.sc_float_shares,
                     paire = sc
                         .pair_cost()
@@ -1640,8 +1673,11 @@ async fn quote_loop(
             } || tokyo_slow == Some(deficit_side)
                 // URGENCE PRIX : le côté à acheter est le favori ≥ 0.60 — le
                 // marché a voté, pas besoin de Binance (19:31 : tilt 0.42,
-                // Down @0.085, rien ne tirait).
-                || bb_deficit_ins >= 0.60;
+                // Down @0.085, rien ne tirait). DÉSARMÉE en fenêtre hachée
+                // (collée au strike, un carnet à 0.65 n'a rien voté : on a payé
+                // chaque sommet 5× le 15 juil. 00:03-00:04) — les déclencheurs
+                // Tokyo et la fin de fenêtre restent.
+                || (leader_flips < cfg.sc_chop_flips && bb_deficit_ins >= 0.60);
             if enabled
                 && dev_imb.abs() >= 5.0
                 && ((10..=20).contains(&remaining_l)

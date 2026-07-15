@@ -59,6 +59,14 @@ perdant, tout le temps.** La direction de T = le gagnant du moment :
 - La paire chère n'excuse rien : quand nos paires sont sous l'eau, le flotteur
   gagnant est aussi ce qui les rembourse (le mode « compensation » mesuré chez
   0xb, aligné 56 % des points quand sa paire dépasse 1$).
+- **DISJONCTEUR DE FENÊTRE HACHÉE** (`SC_CHOP_FLIPS`, défaut 3) : collée au
+  strike (±10$), une fenêtre n'a PAS de gagnant — le leader PM flippe au moindre
+  frémissement et Tokyo ne voit pas des écarts de 10$ (son rôle reste de blinder
+  les creux). Au 3e retournement du leader dans la fenêtre : cible → 0 et
+  « urgence prix » désarmée pour le reste de la fenêtre — on sauve les meubles :
+  quoting symétrique (farmer l'oscillation, le meilleur régime du châssis),
+  complétions maker, merges et assurance de fin de fenêtre continuent.
+  (15 juil. 00:00 : 5 flips en 2 min, chaque sommet payé en FAK ≥ 0.69, −25$.)
 
 **Ce qu'on ne copie PAS de 0xb : son mode « convexité »** (mesuré : flotteur
 contrarien 60 % des points quand ses paires gagnent — un ticket de loterie sur le
@@ -146,6 +154,7 @@ impressions. Revue à ~50 fenêtres jouées.
 | `SC_FLOAT_SHARES` | 12 | taille du flotteur (parts) — ~2 clips |
 | `SC_FLOAT_DWELL_S` | 10 | temporisation entre deux changements de cible (anti-churn) |
 | `SC_CONV_DUST` | 0.06 | seuil poussière de la conversion de fin (T→0 sous T−60) |
+| `SC_CHOP_FLIPS` | 3 | fenêtre hachée : retournements du leader avant coupure du directionnel |
 | `SC_OPEN_PAIR_TARGET` | 0.99 | somme des paires d'ouverture (extrêmes ouverts) |
 | `SC_COMPLETION_MAX_PAIR` | 1.02 | plafond de la complétion ordinaire (paire souple) |
 | `SC_MAX_IMBALANCE` | 30 | cap DUR de l'écart au-delà de la cible |
