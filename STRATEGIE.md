@@ -49,8 +49,11 @@ perdant, tout le temps.** La direction de T = le gagnant du moment :
    47¢ Up médian).
 3. Prix hésitant et Tokyo muet → on garde le camp courant (pas de churn).
 
-- **Taille** : `SC_FLOAT_SHARES` (~15 % du volume d'un côté ; 0xb : 138 parts
-  médianes pour ~950/côté = 14 %).
+- **Taille : PROPORTIONNELLE** — `SC_FLOAT_PCT` (15 %) × volume moyen d'un côté
+  sur la fenêtre, plafonnée à `SC_FLOAT_SHARES` (12). 0xb flotte à ~14 % de son
+  volume (138 parts pour ~950/côté) — un RATIO, pas une constante : ±12 fixe dès
+  la première minute = 80-100 % du livre (la violence du 15 juil.). La cible
+  grandit avec la fenêtre : ~0 au départ, pleine taille quand le livre est gros.
 - **Établissement tôt** : 0xb à t médian 50 s, leader à 55¢.
 - **Flip = geste défensif, jamais un second pari** : le camp change quand le
   GAGNANT change (Tokyo ou recroisement), avec temporisation (dwell) anti-churn.
@@ -159,7 +162,8 @@ impressions. Revue à ~50 fenêtres jouées.
 
 | Env | Défaut | Rôle |
 |---|---|---|
-| `SC_FLOAT_SHARES` | 12 | taille du flotteur (parts) — ~2 clips |
+| `SC_FLOAT_PCT` | 0.15 | flotteur = 15 % du volume moyen d'un côté (ratio 0xb mesuré) |
+| `SC_FLOAT_SHARES` | 12 | PLAFOND absolu du flotteur (parts) |
 | `SC_FLOAT_DWELL_S` | 10 | temporisation entre deux changements de cible (anti-churn) |
 | `SC_CONV_DUST` | 0.06 | seuil poussière de la conversion de fin (T→0 sous T−60) |
 | `SC_CHOP_FLIPS` | 3 | fenêtre hachée : retournements du leader dans la fenêtre glissante |

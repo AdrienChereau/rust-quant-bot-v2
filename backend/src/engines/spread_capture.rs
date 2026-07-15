@@ -149,6 +149,8 @@ pub struct SpreadCaptureEngine {
     pub cost_up: f64,
     pub shares_dn: f64,
     pub cost_dn: f64,
+    vol_up: f64, // volume CUMULÉ acheté par côté sur la fenêtre (jamais décrémenté)
+    vol_dn: f64,
     last_clip_up: Option<i64>, // horodatage (s) du dernier clip par côté
     last_clip_dn: Option<i64>,
 }
@@ -161,6 +163,8 @@ impl SpreadCaptureEngine {
             cost_up: 0.0,
             shares_dn: 0.0,
             cost_dn: 0.0,
+            vol_up: 0.0,
+            vol_dn: 0.0,
             last_clip_up: None,
             last_clip_dn: None,
         }
@@ -189,6 +193,8 @@ impl SpreadCaptureEngine {
         self.cost_up = 0.0;
         self.shares_dn = 0.0;
         self.cost_dn = 0.0;
+        self.vol_up = 0.0;
+        self.vol_dn = 0.0;
         self.last_clip_up = None;
         self.last_clip_dn = None;
     }
@@ -631,14 +637,23 @@ impl SpreadCaptureEngine {
             Side::Up => {
                 self.shares_up += size;
                 self.cost_up += size * price;
+                self.vol_up += size;
                 self.last_clip_up = Some(now_s);
             }
             Side::Down => {
                 self.shares_dn += size;
                 self.cost_dn += size * price;
+                self.vol_dn += size;
                 self.last_clip_dn = Some(now_s);
             }
         }
+    }
+
+    /// Volume CUMULÉ d'un côté moyen sur la fenêtre (les merges ne le
+    /// décrémentent pas) — l'assiette du flotteur proportionnel : 0xb flotte à
+    /// ~14 % de son volume par côté, pas à un nombre fixe de parts.
+    pub fn side_volume(&self) -> f64 {
+        (self.vol_up + self.vol_dn) / 2.0
     }
 }
 

@@ -1004,7 +1004,11 @@ async fn quote_loop(
                     } else {
                         "gagnant"
                     },
-                    cible = new_sign as f64 * cfg.sc_float_shares,
+                    cible = format!(
+                        "{:+.1}",
+                        new_sign as f64
+                            * (cfg.sc_float_pct * sc.side_volume()).min(cfg.sc_float_shares)
+                    ),
                     paire = sc
                         .pair_cost()
                         .map(|p| format!("{:.3}", p))
@@ -1017,7 +1021,13 @@ async fn quote_loop(
                 last_float_ms = now_ms_books as i64;
             }
         }
-        let target_imb = float_sign as f64 * cfg.sc_float_shares;
+        // Flotteur PROPORTIONNEL (correction utilisateur, 15 juil.) : 0xb
+        // flotte à ~14 % de son volume par côté — un ratio, pas une constante.
+        // ±12 fixe dès la 1re minute = 80-100 % du livre → la cible grandit
+        // AVEC la fenêtre : 15 % du volume moyen d'un côté, plafonné au cap
+        // absolu (sc_float_shares) pour borner le risque.
+        let target_imb =
+            float_sign as f64 * (cfg.sc_float_pct * sc.side_volume()).min(cfg.sc_float_shares);
 
         // 1) Quotes désirées → reprice discipline (> 1 tick d'écart = replace).
         let desired = if sleeping || !enabled {

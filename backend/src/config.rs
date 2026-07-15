@@ -116,7 +116,8 @@ pub struct Config {
     pub sc_open_pair_target: f64, // PAIRES D'EXTRÊMES : somme des prix des DEUX ouvertures ≤ ce plafond (défaut 0.99 — 0xb apparie 0.96+0.02 en marché tranché, sa moisson maximale). C'est la SEULE discipline de prix des ouvertures
     // ── LE FLOTTEUR (STRATEGIE.md) : imbalance CIBLE signée, TOUJOURS du côté
     //    GAGNANT (doctrine ferme) — Tokyo d'abord, leader du prix ensuite. ──
-    pub sc_float_shares: f64, // taille du flotteur (parts) — 0xb mesuré : ~14 % du volume d'un côté (défaut 12 ≈ 2 clips)
+    pub sc_float_shares: f64, // PLAFOND du flotteur (parts) — la cible est proportionnelle (sc_float_pct), ceci borne le risque absolu (défaut 12 ≈ 2 clips)
+    pub sc_float_pct: f64, // taille du flotteur = pct × volume moyen d'un côté sur la fenêtre (0xb mesuré : ~14 %) — ±12 fixe dès la 1re minute = 80-100 % du livre, la violence du 15 juil. (défaut 0.15)
     pub sc_float_dwell_s: i64, // temporisation minimale entre deux changements de cible (anti-churn, défaut 10 s)
     pub sc_conv_dust: f64, // conversion de fin : sous T−60, si la poussière opposée cote ≤ ce seuil, la cible revient à 0 (défaut 0.06)
     pub sc_chop_flips: u32, // DISJONCTEUR fenêtre hachée : N retournements du leader PM dans la fenêtre GLISSANTE → directionnel coupé (cible 0 + urgence prix OFF), réarmé quand les retournements vieillissent (défaut 3)
@@ -299,6 +300,7 @@ impl Config {
             sc_allow_flatten: env_or("SC_ALLOW_FLATTEN", false),
             sc_open_pair_target: env_or("SC_OPEN_PAIR_TARGET", 0.99), // loi 0xb : 2/3 de son volume en fenêtre décidée à 96-99¢ + 1-3¢
             sc_float_shares: env_or("SC_FLOAT_SHARES", 12.0),
+            sc_float_pct: env_or("SC_FLOAT_PCT", 0.15),
             sc_float_dwell_s: env_or("SC_FLOAT_DWELL_S", 10),
             sc_conv_dust: env_or("SC_CONV_DUST", 0.06),
             sc_chop_flips: env_or("SC_CHOP_FLIPS", 3),
