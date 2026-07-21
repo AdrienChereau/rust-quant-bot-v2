@@ -1,0 +1,14 @@
+/Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/deps/libserde-655e674ccd5f78dd.rmeta: /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/build/serde-f29ed9bf9fe820da/out/private.rs
+
+/Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/deps/libserde-655e674ccd5f78dd.rlib: /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/build/serde-f29ed9bf9fe820da/out/private.rs
+
+/Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/deps/serde-655e674ccd5f78dd.d: /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/build/serde-f29ed9bf9fe820da/out/private.rs
+
+/Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/Adrien/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/build/serde-f29ed9bf9fe820da/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/Adrien/Documents/ia/Poly/rust-quant-bot-v2/target/debug/build/serde-f29ed9bf9fe820da/out

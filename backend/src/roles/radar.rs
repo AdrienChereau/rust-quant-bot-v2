@@ -78,6 +78,7 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
         let obi = engine.calculate_obi(&update.book);
         let micro = update.book.calculate_micro_price().unwrap_or(0.0);
         let maybe_kill = engine.tick(update.ts_ms, &update.book);
+        let radar_velocity = engine.last_velocity();
 
         // Tick signal complet → Dublin (drift/σ/OFI made in Tokyo).
         if micro > 0.0 {
@@ -112,7 +113,10 @@ pub async fn run(cfg: Config, transport: Arc<dyn SignalTransport>, dash: Shared)
                 drift: drift_eng.per_sec(),
                 ofi: ofi_eng.value_norm(),
                 obi,
-                velocity: maybe_kill.is_some() as u8 as f64, // 1.0 = KILL armé ce tick (la vélocité brute reste interne au RadarEngine)
+                // Vélocité BRUTE ($ /1 s de micro-price) — le KILL a son propre
+                // canal ; l'ancien drapeau 0/1 rendait aveugle le seuil de
+                // vélocité des consommateurs aval (le-grinder, 21 juil.).
+                velocity: radar_velocity,
                 impulse,
             };
             if let Err(e) = transport.send_signal(Signal::Tick(t)).await {

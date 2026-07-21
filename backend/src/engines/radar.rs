@@ -12,6 +12,11 @@ pub struct RadarEngine {
     obi_depth_levels: usize,
     obi_threshold: f64,
     velocity_threshold: f64,
+    /// Dernière vélocité brute calculée ($ de déplacement du micro-price sur la
+    /// fenêtre lookback) — exposée pour le WireTick (fix 21 juil. : le champ
+    /// vélocité du paquet était un drapeau 0/1, la garde aval comparait son
+    /// seuil 45 $/s à un zéro permanent).
+    last_velocity: f64,
 }
 
 impl RadarEngine {
@@ -22,6 +27,7 @@ impl RadarEngine {
             obi_depth_levels,
             obi_threshold,
             velocity_threshold,
+            last_velocity: 0.0,
         }
     }
 
@@ -57,12 +63,18 @@ impl RadarEngine {
 
         let (_, oldest_price) = *self.history.front()?;
         let velocity = current_micro_price - oldest_price;
+        self.last_velocity = velocity;
         let obi = self.calculate_obi(book);
 
         if obi.abs() >= self.obi_threshold && velocity.abs() >= self.velocity_threshold {
             return Some(Signal::Kill);
         }
         None
+    }
+
+    /// Vélocité brute du dernier tick ($ sur la fenêtre lookback).
+    pub fn last_velocity(&self) -> f64 {
+        self.last_velocity
     }
 }
 
