@@ -14,8 +14,15 @@ Sorties (servies par http.server 8710) :
 """
 import json, subprocess, time, collections, os
 
-W = "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82"
-BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "observer", "data")
+# Cible et dossier paramétrables : OBS_WALLET / OBS_DIR permettent de lancer
+# plusieurs observatoires en parallèle (0xb sur observer/ :8710, 0xAAAAA sur
+# observer_aaaaa/ :8711, …) sans collision de données.
+W = os.environ.get("OBS_WALLET", "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82").lower()
+BASE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.environ.get("OBS_DIR", "observer"),
+    "data",
+)
 os.makedirs(BASE, exist_ok=True)
 DAYS = float(os.environ.get("OBS_DAYS", "7"))
 
