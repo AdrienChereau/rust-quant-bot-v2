@@ -1,0 +1,131 @@
+scan de 573 fenêtres (48 h)
+  ... 0/573
+  [schéma trade] ['asset', 'bio', 'conditionId', 'eventSlug', 'icon', 'name', 'outcome', 'outcomeIndex', 'price', 'profileImage', 'profileImageOptimized', 'proxyWallet', 'pseudonym', 'side', 'size', 'slug', 'timestamp', 'title', 'transactionHash']
+  ... 100/573
+  ... 200/573
+  ... 300/573
+  ... 400/573
+  ... 500/573
+
+=== RÉSULTAT : 36 fenêtres MARTELÉES (retournement tardif ≥ 18.0$) sur 573 scannées ===
+dont PRÉ-POSITIONNÉES par ≥1 wallet (150.0$+ du côté gagnant ≤ 0.45) : 19
+
+20/07 17:35 UTC · marteau 18.8$ à t+297s · gagnant Down 🐋
+   0x940063e9… coût 1300$ (3183 parts avg 0.41, 3 fills, t+151-279s) → profit +1883$
+   0xce25e214… coût 258$ (604 parts avg 0.43, 9 fills, t+153-238s) → profit +346$
+   0x0484e640… coût 237$ (600 parts avg 0.39, 7 fills, t+147-282s) → profit +363$
+   0xb55fa129… coût 194$ (434 parts avg 0.45, 2 fills, t+153-265s) → profit +240$
+
+20/07 18:55 UTC · marteau 31.8$ à t+287s · gagnant Up 🐋
+   0x723ddc06… coût 1551$ (5324 parts avg 0.29, 4 fills, t+276-277s) → profit +3773$
+
+21/07 00:50 UTC · marteau 43.0$ à t+294s · gagnant Up 🐋
+   0x98ad6e5e… coût 150$ (417 parts avg 0.36, 1 fills, t+249-249s) → profit +267$
+
+21/07 01:30 UTC · marteau 32.9$ à t+298s · gagnant Up 🐋
+   0x251c1a28… coût 180$ (720 parts avg 0.25, 6 fills, t+175-259s) → profit +540$
+
+21/07 03:20 UTC · marteau 43.6$ à t+294s · gagnant Up
+
+21/07 03:40 UTC · marteau 43.8$ à t+293s · gagnant Up 🐋
+   0x565ca592… coût 303$ (1493 parts avg 0.2, 3 fills, t+280-282s) → profit +1189$
+
+21/07 04:50 UTC · marteau 26.0$ à t+293s · gagnant Down
+
+21/07 05:10 UTC · marteau 25.1$ à t+290s · gagnant Up
+
+21/07 05:25 UTC · marteau 31.0$ à t+294s · gagnant Down
+
+21/07 06:55 UTC · marteau 28.5$ à t+293s · gagnant Up
+
+21/07 08:20 UTC · marteau 30.0$ à t+284s · gagnant Up
+
+21/07 10:40 UTC · marteau 21.4$ à t+279s · gagnant Down 🐋
+   0xc1fd69a2… coût 400$ (2391 parts avg 0.17, 2 fills, t+276-276s) → profit +1991$
+
+21/07 11:55 UTC · marteau 22.7$ à t+297s · gagnant Up
+
+21/07 12:20 UTC · marteau 26.0$ à t+294s · gagnant Up 🐋
+   0x9412cdfc… coût 168$ (613 parts avg 0.27, 13 fills, t+282-285s) → profit +445$
+
+21/07 15:55 UTC · marteau 23.5$ à t+297s · gagnant Down 🐋
+   0x32ed2e54… coût 291$ (931 parts avg 0.31, 4 fills, t+255-262s) → profit +639$
+   0x3725d52f… coût 264$ (775 parts avg 0.34, 3 fills, t+255-261s) → profit +511$
+   0xf1a437dc… coût 200$ (480 parts avg 0.42, 1 fills, t+283-283s) → profit +280$
+
+21/07 18:00 UTC · marteau 22.0$ à t+289s · gagnant Up 🐋
+   0x940063e9… coût 600$ (4234 parts avg 0.14, 3 fills, t+214-216s) → profit +3634$
+
+22/07 00:40 UTC · marteau 32.4$ à t+289s · gagnant Up
+
+22/07 00:45 UTC · marteau 20.0$ à t+298s · gagnant Down
+
+22/07 00:55 UTC · marteau 28.2$ à t+292s · gagnant Down
+
+22/07 01:00 UTC · marteau 23.9$ à t+290s · gagnant Up
+
+22/07 01:25 UTC · marteau 52.4$ à t+296s · gagnant Down
+
+22/07 01:55 UTC · marteau 23.1$ à t+293s · gagnant Up
+
+22/07 03:25 UTC · marteau 36.9$ à t+293s · gagnant Down
+
+22/07 04:15 UTC · marteau 32.5$ à t+290s · gagnant Down 🐋
+   0x433f62d1… coût 328$ (860 parts avg 0.38, 2 fills, t+261-274s) → profit +533$
+   0x91aab8d0… coût 241$ (590 parts avg 0.41, 2 fills, t+252-270s) → profit +349$
+
+22/07 04:25 UTC · marteau 36.3$ à t+294s · gagnant Down 🐋
+   0x0cadd243… coût 250$ (1551 parts avg 0.16, 2 fills, t+279-279s) → profit +1301$
+   0x7d5f7a2f… coût 193$ (1666 parts avg 0.12, 2 fills, t+276-277s) → profit +1473$
+
+22/07 04:30 UTC · marteau 54.0$ à t+292s · gagnant Up 🐋
+   0x0cadd243… coût 250$ (597 parts avg 0.42, 1 fills, t+271-271s) → profit +347$
+
+22/07 07:00 UTC · marteau 27.7$ à t+291s · gagnant Down 🐋
+   0x98ad6e5e… coût 250$ (686 parts avg 0.36, 1 fills, t+264-264s) → profit +436$
+   0x1f12b590… coût 250$ (896 parts avg 0.28, 2 fills, t+264-264s) → profit +646$
+   0xb0a53552… coût 250$ (1690 parts avg 0.15, 2 fills, t+264-264s) → profit +1440$
+   0x4615a438… coût 250$ (591 parts avg 0.42, 1 fills, t+264-264s) → profit +341$
+   0x0cadd243… coût 250$ (1002 parts avg 0.25, 1 fills, t+264-264s) → profit +752$
+   0x2c02a009… coût 250$ (1226 parts avg 0.2, 1 fills, t+264-264s) → profit +976$
+   0x0cb03848… coût 183$ (504 parts avg 0.36, 4 fills, t+207-243s) → profit +321$
+
+22/07 07:05 UTC · marteau 33.6$ à t+288s · gagnant Up 🐋
+   0x565ca592… coût 1686$ (6181 parts avg 0.27, 6 fills, t+235-238s) → profit +4495$
+   0x32ec676a… coût 167$ (453 parts avg 0.37, 3 fills, t+238-240s) → profit +286$
+
+22/07 07:15 UTC · marteau 51.6$ à t+290s · gagnant Up 🐋
+   0x0cadd243… coût 232$ (807 parts avg 0.29, 2 fills, t+252-259s) → profit +575$
+   0x98ad6e5e… coût 154$ (397 parts avg 0.39, 2 fills, t+252-259s) → profit +244$
+
+22/07 08:50 UTC · marteau 29.0$ à t+299s · gagnant Up
+
+22/07 11:30 UTC · marteau 24.0$ à t+296s · gagnant Down
+
+22/07 12:20 UTC · marteau 19.3$ à t+296s · gagnant Down
+
+22/07 13:45 UTC · marteau 26.3$ à t+277s · gagnant Up 🐋
+   0x251c1a28… coût 184$ (1100 parts avg 0.17, 11 fills, t+238-280s) → profit +916$
+
+22/07 14:40 UTC · marteau 50.4$ à t+299s · gagnant Down 🐋
+   0xb55fa129… coût 172$ (446 parts avg 0.39, 3 fills, t+202-279s) → profit +274$
+
+22/07 15:15 UTC · marteau 20.1$ à t+282s · gagnant Up 🐋
+   0xce25e214… coût 192$ (492 parts avg 0.39, 11 fills, t+234-267s) → profit +300$
+
+22/07 15:55 UTC · marteau 34.4$ à t+277s · gagnant Up 🐋
+   0xf3531b23… coût 219$ (640 parts avg 0.34, 4 fills, t+252-279s) → profit +421$
+   0x1b58d3de… coût 216$ (819 parts avg 0.26, 7 fills, t+246-273s) → profit +602$
+   0x8cc6d0d2… coût 174$ (693 parts avg 0.25, 9 fills, t+256-277s) → profit +519$
+
+=== RÉCIDIVISTES ===
+0x565ca59275f81991bd9877d7fa8404c5ecf6519e : 2 fenêtres, coût total 1989$, profit total +5684$
+0x940063e955bbd7e9f44bd05dc750d3f0f2826ec0 : 2 fenêtres, coût total 1900$, profit total +5517$
+0x723ddc068e53830c4431d490e7b0cbd5cdfc3a40 : 1 fenêtres, coût total 1551$, profit total +3773$
+0x0cadd243b61a15fd47c49b57f0a64797ded1c7d5 : 4 fenêtres, coût total 982$, profit total +2975$
+0xc1fd69a2282879ebac4cf8133558c7f3595e7197 : 1 fenêtres, coût total 400$, profit total +1991$
+0x7d5f7a2f56f8aa188281f9cfc3697467e7aaf568 : 1 fenêtres, coût total 193$, profit total +1473$
+0x251c1a283703beed41590b0875a8dcb8ddd1541f : 2 fenêtres, coût total 364$, profit total +1456$
+0xb0a53552fcdae573e0992e1f916e4361396a3c21 : 1 fenêtres, coût total 250$, profit total +1440$
+0x2c02a009a60ea0e868f77fba65d6fcf73ff3b48d : 1 fenêtres, coût total 250$, profit total +976$
+0x98ad6e5ebaf33d5627294f521fe33d42fa005bd0 : 3 fenêtres, coût total 554$, profit total +947$
